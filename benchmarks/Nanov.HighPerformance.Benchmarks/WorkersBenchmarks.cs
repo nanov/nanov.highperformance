@@ -1,6 +1,7 @@
 namespace Nanov.HighPerformance.Benchmarks;
 
 using System;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -79,6 +80,23 @@ public readonly struct AsyncRefSumHandler : IAsyncWorkerHandler<RefMsg> {
 		return HandleAsyncAwaiter();
 	}
 	private async ValueTask HandleAsyncAwaiter() => await Task.Yield();
+
+	public void OnError(Exception error) { }
+	public ValueTask OnCompletedAsync(Exception? error) => default;
+}
+
+// Same as AsyncRefSumHandler, but the async tail uses PoolingAsyncValueTaskMethodBuilder, which
+// reuses the per-item state-machine box instead of allocating one per suspended call — driving the
+// truly-async per-item allocation toward zero. The recommended pattern for hot async handlers.
+public readonly struct PooledAsyncRefHandler : IAsyncWorkerHandler<RefMsg> {
+	private readonly Box _box;
+	public PooledAsyncRefHandler(Box box) => _box = box;
+	public ValueTask HandleAsync(RefMsg item, CancellationToken cancellationToken) {
+		_box.Sum += item.Key;
+		return HandleAsyncAwaiter();
+	}
+	[AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+	private static async ValueTask HandleAsyncAwaiter() => await Task.Yield();
 
 	public void OnError(Exception error) { }
 	public ValueTask OnCompletedAsync(Exception? error) => default;
@@ -363,6 +381,24 @@ public class AsyncRefBenchmarks {
 	public long AsyncSpWorker_Ref() {
 		var box = new Box();
 		using var w = new AsyncSpWorker<RefMsg, AsyncRefSumHandler>(new AsyncRefSumHandler(box), Capacity);
+		w.Start();
+
+		var msg = Ref;
+		for (var i = 0; i < ItemCount; i++)
+			w.Dispatch(msg);
+
+		w.TryComplete();
+		w.Completion.GetAwaiter().GetResult();
+		return box.Sum;
+	}
+
+	// Same worker + workload, but the handler's async tail pools its state machine
+	// ([AsyncMethodBuilder(PoolingAsyncValueTaskMethodBuilder)]) — should report ~0 per-item allocation
+	// vs AsyncSpWorker_Ref. Allocation is measured deterministically, so this delta is reliable.
+	[Benchmark]
+	public long AsyncSpWorker_Ref_Pooled() {
+		var box = new Box();
+		using var w = new AsyncSpWorker<RefMsg, PooledAsyncRefHandler>(new PooledAsyncRefHandler(box), Capacity);
 		w.Start();
 
 		var msg = Ref;

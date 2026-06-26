@@ -47,6 +47,15 @@ mutable handler state in struct fields, or behind a reference the struct capture
 
 All four are strictly single-consumer / FIFO with one item in flight.
 
+The async loop runs with `ExecutionContext` flow **suppressed** — an `AsyncLocal` / `Activity.Current`
+set on the thread that calls `Start` does **not** flow into the handler. That's deliberate: items are
+decoupled from the start-time context, so per-item context (trace ids, etc.) belongs *in the item*,
+not in ambient state.
+
+**Hot async handlers:** the per-item box a genuinely-suspending handler allocates can be pooled to ~0
+with `[AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]` on the suspending method —
+e.g. `AsyncSpWorker_Ref` measures 103 KB/op vs 1.5 KB/op for the pooled variant in the benchmark.
+
 ### Handler interface
 
 Every handler has three members; `OnError` is **always synchronous** (even on the async workers):

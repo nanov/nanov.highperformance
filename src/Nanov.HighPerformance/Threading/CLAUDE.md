@@ -64,6 +64,15 @@ full write-up lives in the `SpRingCore<T>` XML doc.
     the `HandleScope` **synchronously before any await** (ref struct can't cross await); `Dispose`
     `SignalStop()`s, `_loopTask?.Wait()`s, then `_core.Dispose()`. (We removed the old dedicated-thread
     async workers and their `_processDoneEvt` rendezvous — don't reintroduce them.)
+  - *EC suppression:* `Start` wraps the `Task.Run` in `ExecutionContext.SuppressFlow()` so the loop
+    runs with a clean EC — the start-caller's `AsyncLocal`/`Activity.Current` is captured once at
+    `Start` and would otherwise wrongly wrap *every* handler invocation. Items are decoupled; per-item
+    context belongs in the item, not ambient state. Keep the suppression.
+- **Handler pooling (the real per-item async alloc).** A genuinely-suspending handler boxes its own
+  per-item state machine — the dominant per-item allocation on the truly-async path. It's the
+  consumer's code, so it's guidance, not a library change: handlers should put
+  `[AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]` on the suspending method
+  (benchmark: 103 KB/op → 1.5 KB/op). The benchmark's `PooledAsyncRefHandler` demonstrates it.
 - **The empty-wait must stay allocation-free.** `WaitForItemAsync` is **non-`async`** on purpose: it
   returns a struct `ValueTask<bool>` (completed-true item available / completed-false stop-or-drained
   / the `AsyncAutoResetEvent`'s pending wait, result `true` = "woke" → the loop re-checks). The

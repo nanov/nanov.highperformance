@@ -45,7 +45,22 @@ public sealed class AsyncValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 	/// </summary>
 	public void Start(CancellationToken ct = default) {
 		_core.Start(ct);
-		_loopTask = Task.Run(RunLoopAsync);
+		// Run the consume loop with ExecutionContext flow suppressed. The loop is decoupled
+		// infrastructure: an AsyncLocal / Activity.Current set by the caller of Start must NOT flow
+		// across the queue into the handler (per-item context belongs in the item), and a clean EC keeps
+		// the loop's awaits cheap. ConfigureAwait(false) only drops the SynchronizationContext, not EC.
+		var suppressed = false;
+		if (!ExecutionContext.IsFlowSuppressed()) {
+			ExecutionContext.SuppressFlow();
+			suppressed = true;
+		}
+
+		try {
+			_loopTask = Task.Run(RunLoopAsync);
+		}
+		finally {
+			if (suppressed) ExecutionContext.RestoreFlow();
+		}
 	}
 
 	/// <summary>
