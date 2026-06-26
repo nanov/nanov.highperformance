@@ -40,6 +40,12 @@ full write-up lives in the `SpRingCore<T>` XML doc.
   `AdvanceHead`/`TryEnqueue`/`TryDequeue`) are `[AggressiveInlining]`; the parking loops
   (`WaitForSpaceSlow`/`WaitForItemSlow`) are `[NoInlining]`. Keep the hot path inlined and the cold
   park out of line.
+- **Cache-line-padded indices.** `_head` (consumer) and `_tail` (producer) live in a
+  `PaddedIndices` struct (`_idx.Head` / `_idx.Tail`) 128 bytes apart, so the two cores don't
+  false-share a line every item. `PaddedIndices` is a **non-generic** top-level struct on purpose —
+  generic types can't have `[StructLayout(LayoutKind.Explicit)]`. Don't fold the indices back into
+  plain adjacent fields. (Local laptop benchmarks were too noisy — error > mean — to quantify the
+  win; it's the standard Disruptor technique, correct and harmless, kept on that basis.)
 - **Hard stop drops, soft complete drains.** `TryClaim` rechecks `_stop` *after* the wait loop even
   when the ring is non-empty — that's what makes cancel/dispose drop queued items. Don't remove it
   (regression we already fixed once).

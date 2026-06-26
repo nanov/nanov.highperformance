@@ -4,6 +4,7 @@ using System;
 using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 
 /// <summary>
@@ -22,15 +23,15 @@ using System.Threading;
 ///   </para>
 ///   <para>
 ///     SIGNALING INVARIANT (strict SPSC). Exactly one producer thread reserves+commits slots; the
-///     single dedicated worker thread is the only consumer and the only writer of <c>_head</c>. The
+///     single dedicated worker thread is the only consumer and the only writer of <c>_idx.Head</c>. The
 ///     wake events use edge-triggered <c>Set()</c> (only on the empty→non-empty / full→non-full
 ///     transition) paired with a non-atomic <c>Wait();Reset()</c>. This is correct ONLY under SPSC:
-///     while the consumer is parked, <c>_head</c> does not advance, so only the first item past
-///     <c>_head</c> satisfies <c>_head == tail</c> and fires the lone <c>Set</c> — no second signal a
+///     while the consumer is parked, <c>_idx.Head</c> does not advance, so only the first item past
+///     <c>_idx.Head</c> satisfies <c>_idx.Head == tail</c> and fires the lone <c>Set</c> — no second signal a
 ///     <c>Reset()</c> could lose. <see cref="ManualResetEventSlim" /> is latching (order-insensitive),
-///     and the <c>while (_head == Volatile.Read(ref _tail))</c> recheck acquire-reads <c>_tail</c>
+///     and the <c>while (_idx.Head == Volatile.Read(ref _idx.Tail))</c> recheck acquire-reads <c>_idx.Tail</c>
 ///     published with release before the <c>Set</c>. Shutdown rides the separate <c>volatile _stop</c>,
-///     re-checked before every park. WARNING: a second producer, or advancing <c>_head</c> off the
+///     re-checked before every park. WARNING: a second producer, or advancing <c>_idx.Head</c> off the
 ///     worker thread, breaks this and hangs silently.
 ///   </para>
 /// </summary>
@@ -53,9 +54,11 @@ internal sealed class SpRingCore<T> : IDisposable {
 	private CancellationToken _ct;
 	private CancellationTokenRegistration _ctRegistration;
 	private bool _disposed;
-	private int _head; // consumer index (worker thread)
 	private volatile bool _stop; // hard stop (Dispose / cancel) — drop remaining
-	private int _tail; // producer index (dispatching thread)
+	// Consumer index (Head) and producer index (Tail) on separate cache lines: each is written every
+	// item by a different core, so co-locating them ping-pongs the line. 128-byte stride covers Apple
+	// Silicon's 128-byte cache lines as well as x64's 64-byte ones.
+	private PaddedIndices _idx;
 #if DEBUG
 	private int _producing; // 0/1 — debug-only re-entrancy flag for the producer overlap guard
 #endif
@@ -82,7 +85,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 	}
 
 	internal Task Completion => _completionTcs.Task;
-	internal int QueuedApprox => _tail - _head;
+	internal int QueuedApprox => _idx.Tail - _idx.Head;
 	internal int Capacity => _buffer.Length;
 	internal CancellationToken CancellationToken => _ct;
 
@@ -159,23 +162,23 @@ internal sealed class SpRingCore<T> : IDisposable {
 			return false;
 		}
 
-		if (_tail - Volatile.Read(ref _head) == _buffer.Length && !WaitForSpaceSlow()) {
+		if (_idx.Tail - Volatile.Read(ref _idx.Head) == _buffer.Length && !WaitForSpaceSlow()) {
 			tail = 0;
 			return false;
 		}
 
-		tail = _tail;
+		tail = _idx.Tail;
 		return true;
 	}
 
 	/// <summary>Publish the slot at <paramref name="tail" /> and edge-signal the consumer.</summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	internal void CommitTail(int tail) {
-		Volatile.Write(ref _tail, tail + 1);
+		Volatile.Write(ref _idx.Tail, tail + 1);
 		// Edge-triggered: signal only on the empty→non-empty transition (latching event; the consumer's
-		// post-Reset recheck re-reads _tail, so this lone Set cannot be lost). See SIGNALING INVARIANT.
+		// post-Reset recheck re-reads _idx.Tail, so this lone Set cannot be lost). See SIGNALING INVARIANT.
 		// The signal branch only runs on the (rare) edge, so the async-mode check is off the hot path.
-		if (Volatile.Read(ref _head) == tail) {
+		if (Volatile.Read(ref _idx.Head) == tail) {
 			if (_itemReadyAsync is null)
 				_itemEvt.Set();
 			else
@@ -229,7 +232,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 	/// </summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	internal bool TryClaim(out int head) {
-		if (_head == Volatile.Read(ref _tail) && !WaitForItemSlow()) {
+		if (_idx.Head == Volatile.Read(ref _idx.Tail) && !WaitForItemSlow()) {
 			head = 0;
 			return false;
 		}
@@ -241,17 +244,17 @@ internal sealed class SpRingCore<T> : IDisposable {
 			return false;
 		}
 
-		head = _head;
+		head = _idx.Head;
 		return true;
 	}
 
 	/// <summary>Release the slot at <paramref name="head" /> and edge-signal a blocked producer.</summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	internal void AdvanceHead(int head) {
-		Volatile.Write(ref _head, head + 1);
+		Volatile.Write(ref _idx.Head, head + 1);
 		// Edge-triggered space signal, mirror of CommitTail: wake a blocked producer only on the
 		// full→non-full transition. Safe under SPSC (single producer). See SIGNALING INVARIANT.
-		if (Volatile.Read(ref _tail) - head == _buffer.Length)
+		if (Volatile.Read(ref _idx.Tail) - head == _buffer.Length)
 			_spaceEvt.Set();
 	}
 
@@ -279,12 +282,12 @@ internal sealed class SpRingCore<T> : IDisposable {
 	/// </summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	internal bool TryClaimNow(out int head) {
-		if (_head == Volatile.Read(ref _tail) || _stop) {
+		if (_idx.Head == Volatile.Read(ref _idx.Tail) || _stop) {
 			head = 0;
 			return false;
 		}
 
-		head = _head;
+		head = _idx.Head;
 		return true;
 	}
 
@@ -316,7 +319,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 	/// </summary>
 	internal ValueTask<bool> WaitForItemAsync() {
 		if (_stop) return new ValueTask<bool>(false);
-		if (_head != Volatile.Read(ref _tail)) return new ValueTask<bool>(true);
+		if (_idx.Head != Volatile.Read(ref _idx.Tail)) return new ValueTask<bool>(true);
 		if (_completed) return new ValueTask<bool>(false);
 		return _itemReadyAsync!.WaitAsync();
 	}
@@ -325,7 +328,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 	[MethodImpl(MethodImplOptions.NoInlining)]
 	private bool WaitForSpaceSlow() {
 		var spins = 0;
-		while (_tail - Volatile.Read(ref _head) == _buffer.Length) {
+		while (_idx.Tail - Volatile.Read(ref _idx.Head) == _buffer.Length) {
 			if (_stop || _completed) return false;
 			if (spins++ < SpinThreshold) {
 				Thread.SpinWait(10);
@@ -344,7 +347,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 	[MethodImpl(MethodImplOptions.NoInlining)]
 	private bool WaitForItemSlow() {
 		var spins = 0;
-		while (_head == Volatile.Read(ref _tail)) {
+		while (_idx.Head == Volatile.Read(ref _idx.Tail)) {
 			if (_stop || _completed) return false;
 			if (spins++ < SpinThreshold) {
 				Thread.SpinWait(10);
@@ -358,4 +361,16 @@ internal sealed class SpRingCore<T> : IDisposable {
 
 		return true;
 	}
+}
+
+/// <summary>
+///   Cache-line-separated SPSC ring indices. Non-generic on purpose — generic types can't have
+///   explicit layout. The consumer-written <see cref="Head" /> and producer-written <see cref="Tail" />
+///   sit 128 bytes apart (one full cache line on Apple Silicon, two on x64) so the two cores don't
+///   ping-pong a shared line every item.
+/// </summary>
+[StructLayout(LayoutKind.Explicit, Size = 384)]
+internal struct PaddedIndices {
+	[FieldOffset(128)] public int Head;
+	[FieldOffset(256)] public int Tail;
 }
