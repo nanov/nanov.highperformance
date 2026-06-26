@@ -18,13 +18,15 @@ using Nanov.HighPerformance.Threading.Internal;
 public sealed class AsyncSpscWorker<T, THandler> : IDisposable, ISpscWorkerQueue
 	where THandler : struct, IAsyncSpscHandler<T> {
 	private readonly SpscRingCore<T> _core;
-	private readonly Action _onProcessComplete;
-	private readonly ManualResetEventSlim _processDoneEvt = new(false);
 	private THandler _handler; // mutable struct — calls go through this field so state persists
+	// Created lazily the FIRST time a handler actually completes asynchronously. A worker whose
+	// HandleAsync always completes synchronously never allocates either of these. Only ever touched
+	// on the worker thread (so the ??= needs no synchronization).
+	private ManualResetEventSlim? _processDoneEvt;
+	private Action? _onProcessComplete;
 
 	public AsyncSpscWorker(THandler handler, int capacity, string? threadName = null) {
 		_handler = handler;
-		_onProcessComplete = () => _processDoneEvt.Set(); // cached delegate, one-time alloc
 		_core = new SpscRingCore<T>(capacity, threadName ?? $"AsyncSpscWorker<{typeof(T).Name}>", RunLoop);
 	}
 
@@ -68,10 +70,12 @@ public sealed class AsyncSpscWorker<T, THandler> : IDisposable, ISpscWorkerQueue
 					var awaiter = vt.GetAwaiter();
 					if (!awaiter.IsCompleted) {
 						// 1:1 rendezvous: exactly one continuation Set() per item, consumed by this Wait();
-						// the Reset() restores the unsignaled precondition for the next item.
-						awaiter.UnsafeOnCompleted(_onProcessComplete);
-						_processDoneEvt.Wait();
-						_processDoneEvt.Reset();
+						// the Reset() restores the unsignaled precondition for the next item. Event +
+						// continuation are created lazily here, only on the first truly-async completion.
+						var evt = _processDoneEvt ??= new ManualResetEventSlim(false);
+						awaiter.UnsafeOnCompleted(_onProcessComplete ??= evt.Set);
+						evt.Wait();
+						evt.Reset();
 					}
 
 					awaiter.GetResult();
@@ -89,9 +93,10 @@ public sealed class AsyncSpscWorker<T, THandler> : IDisposable, ISpscWorkerQueue
 				var vt = _handler.OnCompletedAsync(ex);
 				var aw = vt.GetAwaiter();
 				if (!aw.IsCompleted) {
-					aw.UnsafeOnCompleted(_onProcessComplete);
-					_processDoneEvt.Wait();
-					_processDoneEvt.Reset();
+					var evt = _processDoneEvt ??= new ManualResetEventSlim(false);
+					aw.UnsafeOnCompleted(_onProcessComplete ??= evt.Set);
+					evt.Wait();
+					evt.Reset();
 				}
 
 				aw.GetResult();
@@ -107,6 +112,6 @@ public sealed class AsyncSpscWorker<T, THandler> : IDisposable, ISpscWorkerQueue
 
 	public void Dispose() {
 		_core.Dispose();
-		_processDoneEvt.Dispose();
+		_processDoneEvt?.Dispose();
 	}
 }

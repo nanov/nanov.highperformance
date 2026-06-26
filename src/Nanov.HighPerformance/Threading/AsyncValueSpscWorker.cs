@@ -22,13 +22,15 @@ public sealed class AsyncValueSpscWorker<T, THandler> : IDisposable, ISpscWorker
 	where T : struct
 	where THandler : struct, IAsyncValueSpscHandler<T> {
 	private readonly SpscRingCore<T> _core;
-	private readonly Action _onProcessComplete;
-	private readonly ManualResetEventSlim _processDoneEvt = new(false);
 	private THandler _handler; // mutable struct — calls go through this field so state persists
+	// Created lazily the FIRST time a handler actually completes asynchronously. A worker whose
+	// HandleAsync always completes synchronously never allocates either of these. Only ever touched
+	// on the worker thread (so the ??= needs no synchronization).
+	private ManualResetEventSlim? _processDoneEvt;
+	private Action? _onProcessComplete;
 
 	public AsyncValueSpscWorker(THandler handler, int capacity, string? threadName = null) {
 		_handler = handler;
-		_onProcessComplete = () => _processDoneEvt.Set();
 		_core = new SpscRingCore<T>(capacity, threadName ?? $"AsyncValueSpscWorker<{typeof(T).Name}>", RunLoop);
 	}
 
@@ -76,9 +78,11 @@ public sealed class AsyncValueSpscWorker<T, THandler> : IDisposable, ISpscWorker
 					var vt = _handler.HandleAsync(ref scope, _core.CancellationToken);
 					var awaiter = vt.GetAwaiter();
 					if (!awaiter.IsCompleted) {
-						awaiter.UnsafeOnCompleted(_onProcessComplete);
-						_processDoneEvt.Wait();
-						_processDoneEvt.Reset();
+						// Event + continuation created lazily, only on the first truly-async completion.
+						var evt = _processDoneEvt ??= new ManualResetEventSlim(false);
+						awaiter.UnsafeOnCompleted(_onProcessComplete ??= evt.Set);
+						evt.Wait();
+						evt.Reset();
 					}
 
 					awaiter.GetResult();
@@ -99,9 +103,10 @@ public sealed class AsyncValueSpscWorker<T, THandler> : IDisposable, ISpscWorker
 				var vt = _handler.OnCompletedAsync(ex);
 				var aw = vt.GetAwaiter();
 				if (!aw.IsCompleted) {
-					aw.UnsafeOnCompleted(_onProcessComplete);
-					_processDoneEvt.Wait();
-					_processDoneEvt.Reset();
+					var evt = _processDoneEvt ??= new ManualResetEventSlim(false);
+					aw.UnsafeOnCompleted(_onProcessComplete ??= evt.Set);
+					evt.Wait();
+					evt.Reset();
 				}
 
 				aw.GetResult();
@@ -117,6 +122,6 @@ public sealed class AsyncValueSpscWorker<T, THandler> : IDisposable, ISpscWorker
 
 	public void Dispose() {
 		_core.Dispose();
-		_processDoneEvt.Dispose();
+		_processDoneEvt?.Dispose();
 	}
 }
