@@ -82,6 +82,10 @@ full write-up lives in the `SpRingCore<T>` XML doc.
   empty wait — don't. The only per-loop allocation left is `RunLoopAsync`'s one-time box; per-item
   handler state-machine boxing (when the handler genuinely suspends) is inherent to async and the
   channel pays it too.
+  - The lock in `AsyncAutoResetEvent` is on the **cold** path (only when the ring is empty). A
+    lock-free rewrite (Idle/Signaled/Waiting CAS state machine) was attempted and **reverted** — it
+    caused a lost-wakeup hang in the suite. Keep the lock; the marginal cold-path gain isn't worth a
+    hang-prone primitive.
 
 ## DEBUG-only producer overlap guard
 
