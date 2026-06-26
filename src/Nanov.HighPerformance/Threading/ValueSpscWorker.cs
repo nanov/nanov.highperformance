@@ -15,7 +15,7 @@ using System;
 /// }
 ///   </code>
 ///   Single-producer / single-consumer, zero per-message allocation. The dedicated worker thread
-///   invokes <typeparamref name="THandler" />'s <c>Handle(ref ConsumeScope&lt;T&gt;)</c> per slot —
+///   invokes <typeparamref name="THandler" />'s <c>Handle(ref HandleScope&lt;T&gt;)</c> per slot —
 ///   devirtualized (struct handler), no virtual dispatch per item. Backpressure, completion,
 ///   cancellation and Dispose semantics mirror <see cref="SpscWorker{T, THandler}" />.
 /// </summary>

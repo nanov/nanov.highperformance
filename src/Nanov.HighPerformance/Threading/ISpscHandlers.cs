@@ -55,15 +55,15 @@ public interface IAsyncSpscHandler<in T> {
 
 /// <summary>
 ///   Synchronous, zero-copy scope-based handler for <see cref="ValueSpscWorker{T, THandler}" />.
-///   Receives a <see cref="ConsumeScope{T}" /> by ref: read the slot via
-///   <see cref="ConsumeScope{T}.Event" />, optionally call <see cref="ConsumeScope{T}.Release" /> to
+///   Receives a <see cref="HandleScope{T}" /> by ref: read the slot via
+///   <see cref="HandleScope{T}.Event" />, optionally call <see cref="HandleScope{T}.Release" /> to
 ///   free it for the producer early, then do the rest of the work. If you don't release, the worker
 ///   loop auto-releases when <see cref="Handle" /> returns. Implement as a <see langword="struct" />
 ///   for the same devirtualization benefit as <see cref="ISpscHandler{T}" />.
 /// </summary>
 public interface IValueSpscHandler<T> where T : struct {
 	/// <summary>Process one slot. Invoked in FIFO order on the worker thread.</summary>
-	void Handle(ref ConsumeScope<T> scope);
+	void Handle(ref HandleScope<T> scope);
 
 	/// <summary>Invoked synchronously when <see cref="Handle" /> throws. See <see cref="ISpscHandler{T}.OnError" />.</summary>
 	void OnError(Exception error);
@@ -76,11 +76,11 @@ public interface IValueSpscHandler<T> where T : struct {
 ///   Asynchronous, zero-copy scope-based handler for <see cref="AsyncValueSpscWorker{T, THandler}" />.
 ///   <para>
 ///     <see cref="HandleAsync" /> must NOT be declared <c>async</c> — a ref struct scope can't cross
-///     an <c>await</c>. Do the sync slot read + <see cref="ConsumeScope{T}.Release" /> in the method
+///     an <c>await</c>. Do the sync slot read + <see cref="HandleScope{T}.Release" /> in the method
 ///     body, then return a <see cref="ValueTask" /> from a nested <c>async</c> helper:
 ///   </para>
 ///   <code>
-/// public ValueTask HandleAsync(ref ConsumeScope&lt;T&gt; scope, CancellationToken ct) {
+/// public ValueTask HandleAsync(ref HandleScope&lt;T&gt; scope, CancellationToken ct) {
 ///     ref var slot = ref scope.Event();
 ///     var a = slot.A; var b = slot.B;
 ///     scope.Release();                 // producer can reuse the slot now
@@ -90,7 +90,7 @@ public interface IValueSpscHandler<T> where T : struct {
 /// </summary>
 public interface IAsyncValueSpscHandler<T> where T : struct {
 	/// <summary>Process one slot. Invoked in FIFO order on the worker thread. Must not be <c>async</c> (see remarks).</summary>
-	ValueTask HandleAsync(ref ConsumeScope<T> scope, CancellationToken cancellationToken);
+	ValueTask HandleAsync(ref HandleScope<T> scope, CancellationToken cancellationToken);
 
 	/// <summary>Invoked synchronously when <see cref="HandleAsync" /> faults. See <see cref="ISpscHandler{T}.OnError" />.</summary>
 	void OnError(Exception error);

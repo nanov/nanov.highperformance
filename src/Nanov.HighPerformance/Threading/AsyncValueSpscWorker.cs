@@ -7,7 +7,7 @@ using System.Threading.Tasks;
 /// <summary>
 ///   Async twin of <see cref="ValueSpscWorker{T, THandler}" />. Same scope-based publish/consume
 ///   APIs — <see cref="ValueSpscWorkerBase{T}.Publish" /> returns a <see cref="PublishScope{T}" />,
-///   the handler's <c>HandleAsync</c> receives a <see cref="ConsumeScope{T}" /> by ref — but the
+///   the handler's <c>HandleAsync</c> receives a <see cref="HandleScope{T}" /> by ref — but the
 ///   handler can return a <see cref="ValueTask" /> for in-flight async work (see
 ///   <see cref="IAsyncValueSpscHandler{T}" /> for the required non-<c>async</c> read-then-release shape).
 ///   <para>

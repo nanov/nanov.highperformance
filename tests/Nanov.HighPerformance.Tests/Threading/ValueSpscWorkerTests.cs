@@ -446,12 +446,12 @@ public class ValueSpscWorkerTests {
 
 		public RecordingHandler(RecordingState state) => _state = state;
 
-		public void Handle(ref ConsumeScope<int> scope) {
+		public void Handle(ref HandleScope<int> scope) {
 			ref var slot = ref scope.Event();
 			var value = slot;
 			if (_state.ReleaseEarly) scope.Release();
 			_state.Hook?.Invoke(new HookArg(value,
-				_state.ReleaseEarly ? ConsumeScopeState.Released : ConsumeScopeState.Held));
+				_state.ReleaseEarly ? HandleScopeState.Released : HandleScopeState.Held));
 			if (_state.ThrowOnProcess) throw new InvalidOperationException("bang");
 			lock (_state.Processed) _state.Processed.Add(value);
 		}
@@ -506,10 +506,10 @@ public class ValueSpscWorkerTests {
 		public void Dispose() => _worker.Dispose();
 	}
 
-	private enum ConsumeScopeState {
+	private enum HandleScopeState {
 		Held,
 		Released
 	}
 
-	private sealed record HookArg(int Value, ConsumeScopeState State);
+	private sealed record HookArg(int Value, HandleScopeState State);
 }

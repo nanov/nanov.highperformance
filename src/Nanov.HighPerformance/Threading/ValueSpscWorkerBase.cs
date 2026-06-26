@@ -14,12 +14,12 @@ using System.Threading.Tasks;
 ///   <see langword="struct" /> handler directly, devirtualized — no virtual dispatch per item);
 ///   the base only exposes the non-virtual <see cref="TryDequeue" /> / completion helpers it uses.
 ///   The base is intentionally not generic in the handler type so the public
-///   <see cref="PublishScope{T}" /> / <see cref="ConsumeScope{T}" /> stay free of the handler
+///   <see cref="PublishScope{T}" /> / <see cref="HandleScope{T}" /> stay free of the handler
 ///   parameter.
 ///   <para>
 ///     SIGNALING INVARIANT (strict SPSC). Exactly one producer thread calls <see cref="Publish" />
 ///     (and disposes the returned <see cref="PublishScope{T}" />); the single dedicated worker thread is
-///     the only consumer and the only writer of <c>_head</c> — note <see cref="ConsumeScope{T}.Release" />
+///     the only consumer and the only writer of <c>_head</c> — note <see cref="HandleScope{T}.Release" />
 ///     (which advances <c>_head</c>) is always called on the worker thread, synchronously, before the
 ///     async subclass returns its <c>ValueTask</c>, NOT on a ThreadPool continuation. The wake events use
 ///     edge-triggered <c>Set()</c> (only on the empty→non-empty / full→non-full transition) paired with a
@@ -33,7 +33,7 @@ using System.Threading.Tasks;
 ///     handler releasing from a ThreadPool continuation), breaks this and hangs silently.
 ///   </para>
 /// </summary>
-public abstract class ValueSpscWorkerBase<T> : IDisposable, IWorkerQueue where T : struct {
+public abstract class ValueSpscWorkerBase<T> : IDisposable, ISpscWorkerQueue where T : struct {
 	private protected const int SpinThreshold = 200;
 
 	internal readonly T[] _buffer;
@@ -156,10 +156,10 @@ public abstract class ValueSpscWorkerBase<T> : IDisposable, IWorkerQueue where T
 	/// <summary>
 	///   Wait for and claim the next slot. Returns false (and a closed-ish default scope) when the
 	///   worker should exit — hard stop, or soft complete with the ring drained. Otherwise blocks
-	///   (spin then park) until an item is available and returns its <see cref="ConsumeScope{T}" />.
+	///   (spin then park) until an item is available and returns its <see cref="HandleScope{T}" />.
 	///   Non-virtual — called from the subclass loop, no per-item virtual dispatch.
 	/// </summary>
-	protected bool TryDequeue(out ConsumeScope<T> scope) {
+	protected bool TryDequeue(out HandleScope<T> scope) {
 		var spins = 0;
 		while (_head == Volatile.Read(ref _tail)) {
 			if (_stop || _completed) {
@@ -177,7 +177,14 @@ public abstract class ValueSpscWorkerBase<T> : IDisposable, IWorkerQueue where T
 			spins = 0;
 		}
 
-		scope = new ConsumeScope<T>(this, _head);
+		// Hard stop drops items still in the ring (mirrors the original outer `while (!_stop)` guard).
+		// Soft complete (_completed) is NOT checked here — it drains what's queued, exiting above once empty.
+		if (_stop) {
+			scope = default;
+			return false;
+		}
+
+		scope = new HandleScope<T>(this, _head);
 		return true;
 	}
 
@@ -247,11 +254,11 @@ public readonly ref struct PublishScope<T> where T : struct {
 ///   so the producer can reuse it while the handler is still running. If the handler doesn't release,
 ///   the worker loop's <c>finally</c> does as a safety net. <see cref="Release" /> is idempotent.
 /// </summary>
-public ref struct ConsumeScope<T> where T : struct {
+public ref struct HandleScope<T> where T : struct {
 	private readonly ValueSpscWorkerBase<T> _worker;
 	private readonly int _head;
 
-	internal ConsumeScope(ValueSpscWorkerBase<T> worker, int head) {
+	internal HandleScope(ValueSpscWorkerBase<T> worker, int head) {
 		_worker = worker;
 		_head = head;
 		IsReleased = false;
@@ -267,7 +274,7 @@ public ref struct ConsumeScope<T> where T : struct {
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	public readonly ref T Event() {
 		if (IsReleased)
-			throw new InvalidOperationException("ConsumeScope already released; the slot may have been reused.");
+			throw new InvalidOperationException("HandleScope already released; the slot may have been reused.");
 		return ref _worker._buffer[_head & _worker._mask];
 	}
 

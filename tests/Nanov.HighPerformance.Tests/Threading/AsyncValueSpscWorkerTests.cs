@@ -327,7 +327,7 @@ public class AsyncValueSpscWorkerTests {
 			_throwOnProcess = throwOnProcess;
 		}
 
-		public ValueTask HandleAsync(ref ConsumeScope<int> scope, CancellationToken cancellationToken) {
+		public ValueTask HandleAsync(ref HandleScope<int> scope, CancellationToken cancellationToken) {
 			ref var slot = ref scope.Event();
 			var value = slot;
 			if (_releaseEarly) scope.Release();
