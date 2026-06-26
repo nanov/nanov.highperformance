@@ -63,7 +63,13 @@ public sealed class AsyncValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 	/// </summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	public PublishScope<T> Publish() {
-		if (!_core.TryReserve(out var tail)) return default;
+		_core.DebugBeginProduce();
+		if (!_core.TryReserve(out var tail)) {
+			_core.DebugEndProduce();
+			return default;
+		}
+
+		// The producer transaction spans until the returned scope is disposed (which commits and ends it).
 		return new PublishScope<T>(_core, tail);
 	}
 

@@ -40,6 +40,7 @@ public readonly ref struct PublishScope<T> where T : struct {
 	public void Dispose() {
 		if (_core is null) return;
 		_core.CommitTail(_tail);
+		_core.DebugEndProduce(); // ends the producer transaction opened by Publish() (DEBUG-only no-op otherwise)
 	}
 }
 

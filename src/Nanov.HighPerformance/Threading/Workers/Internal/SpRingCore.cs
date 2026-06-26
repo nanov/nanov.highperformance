@@ -1,6 +1,7 @@
 namespace Nanov.HighPerformance.Threading.Workers.Internal;
 
 using System;
+using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Threading;
@@ -53,6 +54,9 @@ internal sealed class SpRingCore<T> : IDisposable {
 	private int _head; // consumer index (worker thread)
 	private volatile bool _stop; // hard stop (Dispose / cancel) — drop remaining
 	private int _tail; // producer index (dispatching thread)
+#if DEBUG
+	private int _producing; // 0/1 — debug-only re-entrancy flag for the producer overlap guard
+#endif
 
 	internal SpRingCore(int capacity, string threadName, ThreadStart runLoop) {
 		capacity = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(capacity, 1));
@@ -157,10 +161,40 @@ internal sealed class SpRingCore<T> : IDisposable {
 	/// <summary>Reserve + write + commit in one shot (copy-based producers). False if not accepting.</summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	internal bool TryEnqueue(T item) {
-		if (!TryReserve(out var tail)) return false;
+		DebugBeginProduce();
+		if (!TryReserve(out var tail)) {
+			DebugEndProduce();
+			return false;
+		}
+
 		_buffer[tail & _mask] = item;
 		CommitTail(tail);
+		DebugEndProduce();
 		return true;
+	}
+
+	/// <summary>
+	///   DEBUG-only producer overlap guard. SPSC requires the producer side to be non-concurrent —
+	///   different threads may produce serially (with a happens-before edge between them), but two
+	///   producers must never overlap. <see cref="DebugBeginProduce" /> marks a producer transaction
+	///   in progress (the whole <see cref="TryEnqueue" />, or a <c>Publish()</c>→scope-<c>Dispose()</c>
+	///   span) and throws if a second one starts before the first ends. Compiled out entirely in
+	///   Release.
+	/// </summary>
+	[Conditional("DEBUG")]
+	internal void DebugBeginProduce() {
+#if DEBUG
+		if (Interlocked.Exchange(ref _producing, 1) != 0)
+			throw new InvalidOperationException(
+				"Concurrent producer detected — SpWorker requires single-producer (non-overlapping) access.");
+#endif
+	}
+
+	[Conditional("DEBUG")]
+	internal void DebugEndProduce() {
+#if DEBUG
+		Volatile.Write(ref _producing, 0);
+#endif
 	}
 
 	/// <summary>

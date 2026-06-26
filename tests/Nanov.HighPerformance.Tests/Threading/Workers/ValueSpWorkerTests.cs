@@ -23,6 +23,20 @@ public class ValueSpWorkerTests {
 		Assert.That(w.Processed, Is.EqualTo(new[] { 42 }));
 	}
 
+#if DEBUG
+	// The producer overlap guard is compiled out in Release, so this only runs in Debug builds.
+	[Test]
+	public void Overlapping_Publish_Throws_In_Debug() {
+		using var w = new Rec(4);
+		w.Start();
+
+		using var first = w.Publish(); // opens a producer transaction (not yet disposed)
+		Assert.That(first.IsOpen, Is.True);
+		// A second Publish before the first scope is disposed is an overlapping producer.
+		Assert.Throws<InvalidOperationException>(() => { using var _ = w.Publish(); });
+	}
+#endif
+
 	[Test]
 	public void Publish_Process_InOrder() {
 		using var w = new Rec(16);
