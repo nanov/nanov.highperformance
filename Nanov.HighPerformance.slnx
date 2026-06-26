@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/Nanov.HighPerformance.Benchmarks/Nanov.HighPerformance.Benchmarks.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Nanov.HighPerformance/Nanov.HighPerformance.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Nanov.HighPerformance.Tests/Nanov.HighPerformance.Tests.csproj" />
+  </Folder>
+</Solution>

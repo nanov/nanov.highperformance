@@ -1,0 +1,31 @@
+## .NET / build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+*.user
+*.suo
+
+## BenchmarkDotNet
+BenchmarkDotNet.Artifacts/
+
+## Rider / VS / VS Code
+.idea/
+.vs/
+.vscode/
+
+## Test / coverage
+[Tt]est[Rr]esults/
+*.trx
+coverage*.json
+coverage*.xml
+coverage*.info
+
+## NuGet
+*.nupkg
+*.snupkg
+
+## OS
+.DS_Store
+Thumbs.db
