@@ -17,8 +17,8 @@ public class AsyncSpWorkerTests {
 	}
 
 	[Test]
-	public void TrulyAsync_ProcessAsync_Blocks_Worker_Until_Complete() {
-		// Async delay -> worker uses GetAwaiter-callback pattern (not sync path)
+	public void TrulyAsync_ProcessAsync_Processes_In_Order() {
+		// Async delay -> handler genuinely suspends; the ThreadPool loop resumes on the pool per item.
 		using var w = new Rec(8, asyncDelay: TimeSpan.FromMilliseconds(30));
 		w.Start();
 		for (var i = 0; i < 10; i++) w.Dispatch(i);
@@ -77,9 +77,8 @@ public class AsyncSpWorkerTests {
 		Assert.That(w.CompletedWith[0], Is.InstanceOf<OperationCanceledException>());
 	}
 
-	// Renamed from ProcessAsync_Exception_Is_Swallowed: the new worker no longer silently swallows a
-	// faulting HandleAsync — it reports the exception to the handler's OnError (synchronously) and
-	// continues to the next item. Assert both: the worker drained the other items AND OnError recorded it.
+	// A faulting HandleAsync is reported to the handler's OnError (synchronously) and the worker
+	// continues; assert both the worker drained the other items AND OnError recorded it.
 	[Test]
 	public void Handler_Exception_Is_Reported_To_OnError_And_Worker_Continues() {
 		using var w = new Rec(8, hook: i => {
@@ -120,15 +119,13 @@ public class AsyncSpWorkerTests {
 			for (var i = 0; i < n; i++) w.Dispatch(i);
 		});
 		w.TryComplete();
-		// Stall watchdog: a dropped wakeup plateaus Processed and fails fast, never hangs the run.
 		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => CountOf(w), n);
 
 		Assert.That(w.Processed, Is.EqualTo(Enumerable.Range(0, n)));
 	}
 
-	// Regression guard for the edge-triggered ring signaling (see AsyncSpWorker SIGNALING INVARIANT).
-	// Tiny capacity maximizes empty↔non-empty / full↔non-full transitions over many iterations; a dropped
-	// wakeup surfaces as a stall, not a wrong value.
+	// Regression guard for the edge-triggered ring signaling. Tiny capacity maximizes
+	// empty↔non-empty / full↔non-full transitions; a dropped wakeup surfaces as a stall.
 	[TestCase(1)]
 	[TestCase(2)]
 	public async Task Edge_Triggered_Signaling_Survives_Boundary_Churn(int capacity) {
@@ -146,9 +143,9 @@ public class AsyncSpWorkerTests {
 	}
 
 	// Same churn, but the handler completes asynchronously (Task.Yield) so every item goes through the
-	// _processDoneEvt Wait();Reset() rendezvous — the per-item park the async worker adds on top of the ring.
+	// ThreadPool async resume per item (plus the async item-signal at empty points).
 	[Test]
-	public async Task Truly_Async_Boundary_Churn_Survives_The_ProcessDone_Rendezvous() {
+	public async Task Truly_Async_Boundary_Churn_Survives_The_Pool_Resume() {
 		using var w = new Rec(2, yield: true);
 		w.Start();
 
@@ -162,18 +159,18 @@ public class AsyncSpWorkerTests {
 		Assert.That(w.Processed, Is.EqualTo(Enumerable.Range(0, n)));
 	}
 
-	// Deterministic lost-wakeup guard for the item signal — reliably parks the consumer first (unlike the
-	// churn test), so a dropped empty→non-empty Set() is always caught.
+	// Deterministic lost-wakeup guard for the async item-signal: reliably parks the consumer on
+	// WaitForItemAsync first, so a dropped empty→non-empty Set() is always caught.
 	[Test]
 	public void Dispatch_Wakes_An_Idle_Parked_Worker() {
 		using var w = new Rec(4);
 		w.Start();
 
-		Thread.Sleep(150); // let the consumer exhaust its spin budget and park on _itemEvt
+		Thread.Sleep(150); // let the consumer drain and await the async item-signal
 		Assert.That(w.Dispatch(1), Is.True);
 		WorkerTestUtil.AwaitProgress(() => CountOf(w), 1);
 
-		Thread.Sleep(150); // worker re-parks (queue drained, empty again)
+		Thread.Sleep(150); // worker re-awaits (queue drained, empty again)
 		Assert.That(w.Dispatch(2), Is.True);
 		WorkerTestUtil.AwaitProgress(() => CountOf(w), 2);
 
@@ -182,8 +179,7 @@ public class AsyncSpWorkerTests {
 		Assert.That(w.Processed, Is.EqualTo(new[] { 1, 2 }));
 	}
 
-	// Forces the producer to block on the space event repeatedly (slow consumer, tiny buffer), exercising
-	// the full→non-full conditional Set(). Every blocked Dispatch must be re-signaled; no hang.
+	// Forces the producer to block on the space event repeatedly (slow consumer, tiny buffer).
 	[Test]
 	public async Task Blocking_Producer_Is_Always_Re_Signaled_When_Space_Frees() {
 		using var w = new Rec(2, hook: i => { if (i % 10 == 0) Thread.Sleep(1); });
@@ -199,8 +195,8 @@ public class AsyncSpWorkerTests {
 		Assert.That(w.Processed, Is.EqualTo(Enumerable.Range(0, n)));
 	}
 
-	// "Queue cleaned up on shutdown": Complete called while the buffer is FULL (consumer gated mid-process)
-	// must still drain every committed item and resolve Completion within a bound — no item stranded.
+	// Complete called while the buffer is FULL (consumer gated mid-process) must still drain every
+	// committed item and resolve Completion — no item stranded.
 	[Test]
 	public void Complete_Drains_A_Full_Buffer() {
 		var entered = new ManualResetEventSlim(false);
@@ -235,7 +231,6 @@ public class AsyncSpWorkerTests {
 
 	[Test]
 	public void Pipeline_Propagates_Completion() {
-		// Simulate: stageA.OnCompleted -> stageB.TryComplete
 		using var stageB = new Rec(8);
 		stageB.Start();
 
@@ -250,8 +245,7 @@ public class AsyncSpWorkerTests {
 		Assert.That(stageB.Processed, Has.Count.EqualTo(20));
 	}
 
-	// Shared, observable state the struct handler writes through (the struct is copied into the worker;
-	// the test reads results via this reference).
+	// Shared, observable state the struct handler writes through.
 	private sealed class RecordingState {
 		public readonly List<Exception?> CompletedWith = new();
 		public readonly List<Exception> Errors = new();
@@ -277,8 +271,6 @@ public class AsyncSpWorkerTests {
 		public async ValueTask HandleAsync(int item, CancellationToken cancellationToken) {
 			_hook?.Invoke(item);
 			if (_syncDelay > TimeSpan.Zero) Thread.Sleep(_syncDelay);
-			// Task.Yield forces the truly-async path (the _processDoneEvt rendezvous) with no timer cost,
-			// so a boundary-churn test can hammer it across many iterations.
 			if (_yield) await Task.Yield();
 			if (_asyncDelay > TimeSpan.Zero) await Task.Delay(_asyncDelay, cancellationToken);
 			lock (_state.Processed) _state.Processed.Add(item);
@@ -294,7 +286,6 @@ public class AsyncSpWorkerTests {
 		}
 	}
 
-	// Thin harness mirroring the old Recording surface so the test bodies stay close to the original.
 	private sealed class Rec : IDisposable {
 		private readonly AsyncSpWorker<int, RecordingHandler> _worker;
 		private readonly RecordingState _state = new();
@@ -318,8 +309,6 @@ public class AsyncSpWorkerTests {
 		public void Dispose() => _worker.Dispose();
 	}
 
-	// Async pipeline stage: forwards each item downstream and propagates completion, mirroring the
-	// source's PipelineStage worker subclass.
 	private readonly struct PipelineHandler : IAsyncWorkerHandler<int> {
 		private readonly Rec _downstream;
 

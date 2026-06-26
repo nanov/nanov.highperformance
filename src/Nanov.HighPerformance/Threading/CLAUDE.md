@@ -46,23 +46,27 @@ full write-up lives in the `SpRingCore<T>` XML doc.
 - **OnError is always synchronous**, on every variant including async ones. `OnCompleted` is the
   drain hook (sync for sync workers, `…Async` for async). Handler exceptions are reported to
   `OnError` and the worker continues.
-- **Two async execution models — don't conflate them.**
-  - *Dedicated-thread* (`AsyncSpWorker` / `AsyncValueSpWorker`): the dedicated thread runs a **sync**
-    `RunLoop` and blocks per await via the `_processDoneEvt` rendezvous (eager + branchless: cache
-    `_processDoneEvt` + a method-group `Action _onProcessComplete = _processDoneEvt.Set` in the ctor;
-    do **not** make these lazy `??=` — we tried, not worth it). Best for *sync-completing* handlers.
-    Slow when every item truly suspends (per-item park/wake) — that's a documented boundary, not a bug.
-  - *ThreadPool* (`ThreadPoolAsyncSpWorker` / `ThreadPoolAsyncValueSpWorker`): no dedicated thread;
-    `Start` launches `RunLoopAsync` (an `async Task`) via `Task.Run`, using the core's no-thread ctor
-    (`new SpRingCore<T>(capacity)`), `TryClaimNow`/`TryDequeueNow` (non-blocking), and
-    `WaitForItemAsync` (backed by the internal zero-alloc `AsyncAutoResetEvent`, set on the
-    empty→non-empty edge by `CommitTail` when `_itemReadyAsync != null`). Matches/beats `Channel<T>`
-    for truly-async serial handlers because the continuation resumes on the pool — no thread to wake.
-    The scope worker reads + `Release()`s the `HandleScope` **synchronously before any await** (ref
-    struct can't cross await); `Dispose` `SignalStop()`s, waits the loop `Task`, then `_core.Dispose()`.
-  - The `Action`/rendezvous is only the dedicated-thread path; the ThreadPool path has neither.
-    Per-item handler state-machine boxing (when the handler genuinely suspends) is inherent to async
-    and unavoidable in either model; the worker loop itself is zero-alloc.
+- **Sync vs async use two different core paths — don't cross them.**
+  - *Sync* (`SpWorker` / `ValueSpWorker`): dedicated-thread core ctor
+    (`new SpRingCore<T>(capacity, threadName, runLoop)`), blocking consumer (`TryClaim`/`TryDequeue` +
+    `WaitForItemSlow` parking on `_itemEvt`).
+  - *Async* (`AsyncSpWorker` / `AsyncValueSpWorker`): **ThreadPool** loop, no dedicated thread.
+    `Start` launches `RunLoopAsync` (one `async Task`) via `Task.Run`, using the core's **no-thread**
+    ctor (`new SpRingCore<T>(capacity)`), `TryClaimNow`/`TryDequeueNow` (non-blocking), and
+    `WaitForItemAsync`. The continuation resumes on the pool — no thread parked per `await` — so it
+    matches/beats `Channel<T>` for truly-async serial handlers. The scope worker reads + `Release()`s
+    the `HandleScope` **synchronously before any await** (ref struct can't cross await); `Dispose`
+    `SignalStop()`s, `_loopTask?.Wait()`s, then `_core.Dispose()`. (We removed the old dedicated-thread
+    async workers and their `_processDoneEvt` rendezvous — don't reintroduce them.)
+- **The empty-wait must stay allocation-free.** `WaitForItemAsync` is **non-`async`** on purpose: it
+  returns a struct `ValueTask<bool>` (completed-true item available / completed-false stop-or-drained
+  / the `AsyncAutoResetEvent`'s pending wait, result `true` = "woke" → the loop re-checks). The
+  `AsyncAutoResetEvent` is a reused `IValueTaskSource<bool>` (`ManualResetValueTaskSourceCore<bool>` +
+  a small lock; set on the empty→non-empty edge by `CommitTail` when `_itemReadyAsync != null`, and by
+  `SignalStop`/`TryComplete`). Making `WaitForItemAsync` `async` again would box a state machine per
+  empty wait — don't. The only per-loop allocation left is `RunLoopAsync`'s one-time box; per-item
+  handler state-machine boxing (when the handler genuinely suspends) is inherent to async and the
+  channel pays it too.
 
 ## DEBUG-only producer overlap guard
 

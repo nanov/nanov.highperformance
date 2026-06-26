@@ -6,26 +6,26 @@ using System.Threading;
 using Nanov.HighPerformance.Threading.Workers.Internal;
 
 /// <summary>
-///   Async twin of <see cref="SpWorker{T, THandler}" />: <typeparamref name="THandler" />
-///   implements <see cref="IAsyncWorkerHandler{T}" /> whose <c>HandleAsync</c> returns a ValueTask.
-///   Runs on a dedicated thread with synchronous waits for items (zero alloc). For sync-completing
-///   HandleAsync, entirely synchronous (zero overhead). For truly async HandleAsync, the dedicated
-///   thread blocks on the ValueTask via its awaiter — the handler's internal async continuations run
-///   on ThreadPool as normal. No SynchronizationContext is set on the dedicated thread, so no deadlock
-///   risk from blocking. Suitable for bounded worker pools (dozens of workers); not for thousands of
-///   concurrent handlers — for that, use a ThreadPool-based async loop.
+///   Async copy-based worker. The consume loop runs as an <c>async Task</c> on the ThreadPool, so a
+///   suspended handler's continuation resumes the loop on the pool (no dedicated thread to wake) —
+///   matching a <c>Channel&lt;T&gt;</c> consumer for <b>truly-async, one-at-a-time (serial, FIFO)</b>
+///   handlers, while handlers that complete synchronously drain in a tight synchronous loop.
+///   <para>
+///     <typeparamref name="THandler" /> is a struct constrained to <see cref="IAsyncWorkerHandler{T}" />
+///     — calls devirtualize and inline. One item in flight at a time (no pipelining); the worker loop
+///     is allocation-free, but a handler that genuinely suspends boxes its own per-item state machine
+///     (inherent to async). For purely synchronous handlers use <see cref="SpWorker{T, THandler}" />.
+///   </para>
 /// </summary>
 public sealed class AsyncSpWorker<T, THandler> : IDisposable, IWorkerQueue
 	where THandler : struct, IAsyncWorkerHandler<T> {
 	private readonly SpRingCore<T> _core;
-	private readonly ManualResetEventSlim _processDoneEvt = new(false);
-	private readonly Action _onProcessComplete; // bound to _processDoneEvt.Set — one alloc per worker
 	private THandler _handler; // mutable struct — calls go through this field so state persists
+	private Task? _loopTask;
 
-	public AsyncSpWorker(THandler handler, int capacity, string? threadName = null) {
+	public AsyncSpWorker(THandler handler, int capacity) {
 		_handler = handler;
-		_onProcessComplete = _processDoneEvt.Set;
-		_core = new SpRingCore<T>(capacity, threadName ?? $"AsyncSpWorker<{typeof(T).Name}>", RunLoop);
+		_core = new SpRingCore<T>(capacity); // ThreadPool-async mode — no dedicated thread
 	}
 
 	/// <summary>Completes when the worker has drained and exited.</summary>
@@ -38,64 +38,49 @@ public sealed class AsyncSpWorker<T, THandler> : IDisposable, IWorkerQueue
 	public int Capacity => _core.Capacity;
 
 	/// <summary>
-	///   Start the worker thread. Optionally pass a CancellationToken — when cancelled, the worker
-	///   stops immediately (drops pending items) and <see cref="Completion" /> resolves with an
-	///   <see cref="OperationCanceledException" />.
+	///   Start the consume loop on the ThreadPool. Optionally pass a CancellationToken — when
+	///   cancelled, the worker stops (drops pending items) and <see cref="Completion" /> resolves with
+	///   an <see cref="OperationCanceledException" />.
 	/// </summary>
-	public void Start(CancellationToken ct = default) => _core.Start(ct);
+	public void Start(CancellationToken ct = default) {
+		_core.Start(ct);
+		_loopTask = Task.Run(RunLoopAsync);
+	}
 
 	/// <summary>
-	///   Signal that no more items will be dispatched. The worker drains remaining items (processing
-	///   each via HandleAsync) and then exits. Optionally pass an exception — if non-null,
-	///   <see cref="Completion" /> resolves faulted with it. Returns true on first call, false if
-	///   already completed.
+	///   Signal that no more items will be dispatched. The worker drains remaining items and then
+	///   exits. Optionally pass an exception to fault <see cref="Completion" />. Returns false if
+	///   already completing.
 	/// </summary>
 	public bool TryComplete(Exception? exception = null) => _core.TryComplete(exception);
 
 	/// <summary>
-	///   Enqueue an item. Returns false if the worker has been completed or disposed (item is not
-	///   enqueued). Returns true if successfully enqueued. Blocks if the buffer is full.
+	///   Enqueue an item. Returns false if the worker has been completed or disposed. Blocks if the
+	///   buffer is full.
 	/// </summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	public bool Dispatch(T item) => _core.TryEnqueue(item);
 
-	private void RunLoop() {
+	private async Task RunLoopAsync() {
 		try {
-			while (_core.TryDequeue(out var item)) {
-				try {
-#pragma warning disable CA2012 // advanced ValueTask awaiting; all completion cases are handled
-					var vt = _handler.HandleAsync(item, _core.CancellationToken);
-					var awaiter = vt.GetAwaiter();
-					if (!awaiter.IsCompleted) {
-						// 1:1 rendezvous: exactly one continuation Set() per item, consumed by this Wait();
-						// the Reset() restores the unsignaled precondition for the next item.
-						awaiter.UnsafeOnCompleted(_onProcessComplete);
-						_processDoneEvt.Wait();
-						_processDoneEvt.Reset();
+			var ct = _core.CancellationToken;
+			while (true) {
+				if (_core.TryDequeueNow(out var item)) {
+					try {
+						await _handler.HandleAsync(item, ct).ConfigureAwait(false);
 					}
-
-					awaiter.GetResult();
-#pragma warning restore CA2012
-				}
-				catch (Exception ex) {
-					_handler.OnError(ex);
+					catch (Exception ex) {
+						_handler.OnError(ex);
+					}
+				} else if (!await _core.WaitForItemAsync().ConfigureAwait(false)) {
+					break; // hard stop, or soft complete with the ring drained
 				}
 			}
 		}
 		finally {
 			var ex = _core.CompletionException();
 			try {
-#pragma warning disable CA2012
-				var vt = _handler.OnCompletedAsync(ex);
-				var aw = vt.GetAwaiter();
-				if (!aw.IsCompleted) {
-					aw.UnsafeOnCompleted(_onProcessComplete);
-					_processDoneEvt.Wait();
-					_processDoneEvt.Reset();
-				}
-
-				aw.GetResult();
-#pragma warning restore CA2012
+				await _handler.OnCompletedAsync(ex).ConfigureAwait(false);
 			}
 			catch (Exception onCompletedEx) {
 				_handler.OnError(onCompletedEx);
@@ -106,7 +91,14 @@ public sealed class AsyncSpWorker<T, THandler> : IDisposable, IWorkerQueue
 	}
 
 	public void Dispose() {
-		_core.Dispose();
-		_processDoneEvt.Dispose();
+		_core.SignalStop(); // wake the loop so it exits
+		try {
+			_loopTask?.Wait(1000);
+		}
+		catch {
+			/* ignore */
+		}
+
+		_core.Dispose(); // safe now — the loop has exited
 	}
 }

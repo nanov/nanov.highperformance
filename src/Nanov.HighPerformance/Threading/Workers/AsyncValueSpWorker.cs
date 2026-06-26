@@ -6,30 +6,27 @@ using System.Threading;
 using Nanov.HighPerformance.Threading.Workers.Internal;
 
 /// <summary>
-///   Async twin of <see cref="ValueSpWorker{T, THandler}" />. Same scope-based publish/consume APIs
-///   — <see cref="Publish" /> returns a <see cref="PublishScope{T}" />, the handler's <c>HandleAsync</c>
-///   receives a <see cref="HandleScope{T}" /> by ref — but the handler can return a
-///   <see cref="ValueTask" /> for in-flight async work (see <see cref="IAsyncValueWorkerHandler{T}" /> for
-///   the required non-<c>async</c> read-then-release shape).
-///   <para>
-///     Runs on a dedicated thread with synchronous waits for items (zero alloc). For sync-completing
-///     ValueTasks, entirely synchronous (zero overhead). For truly async ones, the dedicated thread
-///     blocks on the ValueTask via its awaiter. No <c>SynchronizationContext</c> on the dedicated
-///     thread, so no deadlock risk.
-///   </para>
+///   Zero-copy, scope-based async value worker. The consume loop runs as an <c>async Task</c> on the
+///   ThreadPool, so a suspended handler's continuation resumes the loop on the pool (no dedicated
+///   thread to park) — matching a <c>Channel&lt;T&gt;</c> consumer for truly-async, serial, FIFO
+///   handlers, while sync-completing handlers drain in a tight synchronous loop. Producers write
+///   directly into the ring slot via <see cref="Publish" />; the handler reads through a
+///   <see cref="HandleScope{T}" /> and must read + <see cref="HandleScope{T}.Release" /> the slot
+///   synchronously before returning its <see cref="ValueTask" /> (a ref struct can't cross an
+///   <c>await</c>) — see <see cref="IAsyncValueWorkerHandler{T}" />. Single logical consumer, one item
+///   in flight; the worker loop is allocation-free (a genuinely-suspending handler boxes its own
+///   per-item state machine, inherent to async).
 /// </summary>
 public sealed class AsyncValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 	where T : struct
 	where THandler : struct, IAsyncValueWorkerHandler<T> {
 	private readonly SpRingCore<T> _core;
-	private readonly ManualResetEventSlim _processDoneEvt = new(false);
-	private readonly Action _onProcessComplete; // bound to _processDoneEvt.Set — one alloc per worker
 	private THandler _handler; // mutable struct — calls go through this field so state persists
+	private Task? _loopTask;
 
-	public AsyncValueSpWorker(THandler handler, int capacity, string? threadName = null) {
+	public AsyncValueSpWorker(THandler handler, int capacity) {
 		_handler = handler;
-		_onProcessComplete = _processDoneEvt.Set;
-		_core = new SpRingCore<T>(capacity, threadName ?? $"AsyncValueSpWorker<{typeof(T).Name}>", RunLoop);
+		_core = new SpRingCore<T>(capacity); // ThreadPool-async mode — no dedicated thread
 	}
 
 	/// <summary>Completes when the worker has drained and exited.</summary>
@@ -42,24 +39,26 @@ public sealed class AsyncValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 	public int Capacity => _core.Capacity;
 
 	/// <summary>
-	///   Start the worker thread. Optionally pass a CancellationToken — when cancelled, the worker
-	///   stops immediately (drops pending items) and <see cref="Completion" /> resolves with an
-	///   <see cref="OperationCanceledException" />.
+	///   Start the consume loop on the ThreadPool. Optionally pass a CancellationToken — when
+	///   cancelled, the worker stops (drops pending items) and <see cref="Completion" /> resolves with
+	///   an <see cref="OperationCanceledException" />.
 	/// </summary>
-	public void Start(CancellationToken ct = default) => _core.Start(ct);
+	public void Start(CancellationToken ct = default) {
+		_core.Start(ct);
+		_loopTask = Task.Run(RunLoopAsync);
+	}
 
 	/// <summary>
 	///   Signal that no more items will be dispatched. The worker drains remaining items and then
-	///   exits. Optionally pass an exception — if non-null, <see cref="Completion" /> resolves faulted
-	///   with it. Returns true on first call, false if already completed.
+	///   exits. Optionally pass an exception to fault <see cref="Completion" />. Returns false if
+	///   already completing.
 	/// </summary>
 	public bool TryComplete(Exception? exception = null) => _core.TryComplete(exception);
 
 	/// <summary>
-	///   Claim the next slot for writing. Blocks if the ring is full. The returned
-	///   <see cref="PublishScope{T}" /> exposes a <see langword="ref" /> to the slot through
-	///   <see cref="PublishScope{T}.Event" />; disposing the scope publishes the slot and signals the
-	///   consumer. If the worker is Completed or Disposed, the returned scope is "closed".
+	///   Claim the next slot for writing. Blocks if the ring is full. Disposing the returned
+	///   <see cref="PublishScope{T}" /> publishes the slot and signals the consumer. If the worker is
+	///   completed/disposed, the scope is "closed" (<see cref="PublishScope{T}.IsOpen" /> is false).
 	/// </summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	public PublishScope<T> Publish() {
@@ -69,49 +68,46 @@ public sealed class AsyncValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 			return default;
 		}
 
-		// The producer transaction spans until the returned scope is disposed (which commits and ends it).
 		return new PublishScope<T>(_core, tail);
 	}
 
-	private void RunLoop() {
+	private async Task RunLoopAsync() {
 		try {
-			while (_core.TryClaim(out var head)) {
-				var scope = new HandleScope<T>(_core, head);
-				try {
-#pragma warning disable CA2012 // advanced ValueTask awaiting; all completion cases are handled
-					var vt = _handler.HandleAsync(ref scope, _core.CancellationToken);
-					var awaiter = vt.GetAwaiter();
-					if (!awaiter.IsCompleted) {
-						awaiter.UnsafeOnCompleted(_onProcessComplete);
-						_processDoneEvt.Wait();
-						_processDoneEvt.Reset();
+			var ct = _core.CancellationToken;
+			while (true) {
+				if (_core.TryClaimNow(out var head)) {
+					// The ref-struct scope is consumed synchronously (read + Release) before the await —
+					// it never crosses the suspension. The handler returns a ValueTask for any async tail.
+					var vt = default(ValueTask);
+					try {
+						var scope = new HandleScope<T>(_core, head);
+						try {
+							vt = _handler.HandleAsync(ref scope, ct);
+						}
+						finally {
+							scope.Release(); // safety net; idempotent (handler should release before returning)
+						}
+					}
+					catch (Exception ex) {
+						_handler.OnError(ex);
+						continue;
 					}
 
-					awaiter.GetResult();
-#pragma warning restore CA2012
-				}
-				catch (Exception ex) {
-					_handler.OnError(ex);
-				}
-				finally {
-					scope.Release();
+					try {
+						await vt.ConfigureAwait(false);
+					}
+					catch (Exception ex) {
+						_handler.OnError(ex);
+					}
+				} else if (!await _core.WaitForItemAsync().ConfigureAwait(false)) {
+					break; // hard stop, or soft complete with the ring drained
 				}
 			}
 		}
 		finally {
 			var ex = _core.CompletionException();
 			try {
-#pragma warning disable CA2012
-				var vt = _handler.OnCompletedAsync(ex);
-				var aw = vt.GetAwaiter();
-				if (!aw.IsCompleted) {
-					aw.UnsafeOnCompleted(_onProcessComplete);
-					_processDoneEvt.Wait();
-					_processDoneEvt.Reset();
-				}
-
-				aw.GetResult();
-#pragma warning restore CA2012
+				await _handler.OnCompletedAsync(ex).ConfigureAwait(false);
 			}
 			catch (Exception onCompletedEx) {
 				_handler.OnError(onCompletedEx);
@@ -122,7 +118,14 @@ public sealed class AsyncValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 	}
 
 	public void Dispose() {
+		_core.SignalStop();
+		try {
+			_loopTask?.Wait(1000);
+		}
+		catch {
+			/* ignore */
+		}
+
 		_core.Dispose();
-		_processDoneEvt.Dispose();
 	}
 }

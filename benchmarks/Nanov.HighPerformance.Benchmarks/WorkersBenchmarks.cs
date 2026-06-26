@@ -35,6 +35,7 @@ public sealed class RefMsg {
 // each benchmark to defeat dead-code elimination).
 public sealed class Box {
 	public long Sum;
+	public int Calls; // per-item counter for the mixed handler (single consumer → no lock)
 }
 
 // --- copy-based handlers ------------------------------------------------------------------------
@@ -78,6 +79,21 @@ public readonly struct AsyncRefSumHandler : IAsyncWorkerHandler<RefMsg> {
 		return HandleAsyncAwaiter();
 	}
 	private async ValueTask HandleAsyncAwaiter() => await Task.Yield();
+
+	public void OnError(Exception error) { }
+	public ValueTask OnCompletedAsync(Exception? error) => default;
+}
+
+// MIXED workload: 2 of every 3 items complete synchronously (return default); every 3rd truly
+// suspends (Task.Yield). Models a "mostly cached, occasionally async IO" handler.
+public readonly struct MixedAsyncRefHandler : IAsyncWorkerHandler<RefMsg> {
+	private readonly Box _box;
+	public MixedAsyncRefHandler(Box box) => _box = box;
+	public ValueTask HandleAsync(RefMsg item, CancellationToken cancellationToken) {
+		_box.Sum += item.Key;
+		return ++_box.Calls % 3 == 0 ? HandleAsyncAwaiter() : default;
+	}
+	private static async ValueTask HandleAsyncAwaiter() => await Task.Yield();
 
 	public void OnError(Exception error) { }
 	public ValueTask OnCompletedAsync(Exception? error) => default;
@@ -252,38 +268,6 @@ public class AsyncValueBenchmarks {
 		w.Completion.GetAwaiter().GetResult();
 		return box.Sum;
 	}
-
-	[Benchmark]
-	public long ThreadPoolAsyncSpWorker_Value() {
-		var box = new Box();
-		using var w = new ThreadPoolAsyncSpWorker<ValueMsg, AsyncValueSumHandler>(new AsyncValueSumHandler(box), Capacity);
-		w.Start();
-
-		var msg = Msg;
-		for (var i = 0; i < ItemCount; i++)
-			w.Dispatch(msg);
-
-		w.TryComplete();
-		w.Completion.GetAwaiter().GetResult();
-		return box.Sum;
-	}
-
-	[Benchmark]
-	public long ThreadPoolAsyncValueSpWorker_Value() {
-		var box = new Box();
-		using var w = new ThreadPoolAsyncValueSpWorker<ValueMsg, AsyncScopeSumHandler>(new AsyncScopeSumHandler(box), Capacity);
-		w.Start();
-
-		var msg = Msg;
-		for (var i = 0; i < ItemCount; i++) {
-			using var s = w.Publish();
-			s.Event() = msg;
-		}
-
-		w.TryComplete();
-		w.Completion.GetAwaiter().GetResult();
-		return box.Sum;
-	}
 }
 
 /// <summary>Reference (class) item, SYNC handler: Channel vs copy <see cref="SpWorker{T, THandler}" /> (no zero-copy variant — needs <c>T : struct</c>).</summary>
@@ -389,11 +373,53 @@ public class AsyncRefBenchmarks {
 		w.Completion.GetAwaiter().GetResult();
 		return box.Sum;
 	}
+}
+
+/// <summary>
+///   Reference (class) item, MIXED async handler: 2 of every 3 items complete synchronously, every
+///   3rd truly suspends. <c>Channel&lt;T&gt;</c> vs <see cref="AsyncSpWorker{T, THandler}" /> — shows
+///   how the worker handles a "mostly sync, occasionally async" workload.
+/// </summary>
+[MemoryDiagnoser]
+public class MixedRefBenchmarks {
+	private static readonly RefMsg Ref = new() { Key = 1, Value = 2, Timestamp = 3, Flags = 4 };
+
+	[Params(24)]
+	public int Capacity;
+
+	[Params(10_000)]
+	public int ItemCount;
+
+	[Benchmark(Baseline = true)]
+	public async Task<long> Channel_Ref() {
+		var channel = Channel.CreateBounded<RefMsg>(new BoundedChannelOptions(Capacity) {
+			SingleReader = true,
+			SingleWriter = true
+		});
+
+		var box = new Box();
+		var handler = new MixedAsyncRefHandler(box);
+		var consumer = Task.Run(async () => {
+			var reader = channel.Reader;
+			while (await reader.WaitToReadAsync().ConfigureAwait(false))
+			while (reader.TryRead(out var item))
+				await handler.HandleAsync(item, CancellationToken.None);
+		});
+
+		var writer = channel.Writer;
+		var msg = Ref;
+		for (var i = 0; i < ItemCount; i++)
+			await writer.WriteAsync(msg).ConfigureAwait(false);
+		writer.Complete();
+
+		await consumer.ConfigureAwait(false);
+		return box.Sum;
+	}
 
 	[Benchmark]
-	public long ThreadPoolAsyncSpWorker_Ref() {
+	public long AsyncSpWorker_Ref() {
 		var box = new Box();
-		using var w = new ThreadPoolAsyncSpWorker<RefMsg, AsyncRefSumHandler>(new AsyncRefSumHandler(box), Capacity);
+		using var w = new AsyncSpWorker<RefMsg, MixedAsyncRefHandler>(new MixedAsyncRefHandler(box), Capacity);
 		w.Start();
 
 		var msg = Ref;

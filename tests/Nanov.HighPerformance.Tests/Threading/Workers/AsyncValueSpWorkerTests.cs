@@ -37,8 +37,7 @@ public class AsyncValueSpWorkerTests {
 
 	[Test]
 	public void Truly_Async_ValueTask_Is_Awaited_Before_Next_Iteration() {
-		// AsyncTail returns a Task.Delay — the loop must block on it via the
-		// _processDoneEvt rendezvous before processing the next slot.
+		// AsyncTail returns a Task.Delay — the loop must await it before processing the next slot.
 		using var w = new Rec(4, asyncTail: _ => Task.Delay(25));
 		w.Start();
 
@@ -56,11 +55,6 @@ public class AsyncValueSpWorkerTests {
 
 	[Test]
 	public async Task Early_Release_Unblocks_Producer_While_Async_Tail_Is_Running() {
-		// Capacity 2. Sequence (mirrors sync variant):
-		//   publish(1) → Loop picks, Release early, AsyncTail blocks → head advanced by 1.
-		//   publish(2) → slot 1 filled.
-		//   publish(3) → would block WITHOUT early Release; succeeds WITH it.
-		// Synchronize on asyncTailBlocked before publish(3) to eliminate the race.
 		var asyncTailBlocked = new ManualResetEventSlim(false);
 		var asyncTailProceed = new ManualResetEventSlim(false);
 		using var w = new Rec(2, asyncTail: _ => Task.Run(() => {
@@ -106,9 +100,6 @@ public class AsyncValueSpWorkerTests {
 
 	[Test]
 	public void Handler_Throw_Is_Reported_To_OnError_And_Worker_Continues() {
-		// Faults are no longer swallowed — each sync throw inside HandleAsync goes to OnError and the
-		// worker continues to the next slot. The slot is still released (safety net), and nothing lands
-		// in Processed because the throw precedes the add.
 		using var w = new Rec(4, throwOnProcess: true);
 		w.Start();
 
@@ -126,10 +117,6 @@ public class AsyncValueSpWorkerTests {
 
 	[Test]
 	public void Async_Tail_Fault_Is_Reported_To_OnError_And_Worker_Continues() {
-		// A fault INSIDE the awaited ValueTask — surfaced by the Loop's awaiter.GetResult(). The tail is
-		// a faulted Task, so the outer ValueTask represents a truly async failure rather than a sync throw.
-		// Each fault is reported to OnError (await unwraps to the InvalidOperationException) and the worker
-		// drains; nothing reaches Processed because the tail faulted before the add ran.
 		using var w = new Rec(4, asyncTail: _ => Task.FromException(new InvalidOperationException("tail bang")));
 		w.Start();
 
@@ -187,9 +174,6 @@ public class AsyncValueSpWorkerTests {
 
 	// --- Edge-triggered signaling regression guards -------------------------------
 
-	// Regression guard for the edge-triggered ring signaling (see ValueSpWorkerBase SIGNALING
-	// INVARIANT). Tiny capacity maximizes empty↔non-empty / full↔non-full transitions; sync-completing
-	// handler. A dropped wakeup surfaces as a timeout (stall watchdog), not a wrong value.
 	[TestCase(1)]
 	[TestCase(2)]
 	public async Task Edge_Triggered_Signaling_Survives_Boundary_Churn(int capacity) {
@@ -204,16 +188,15 @@ public class AsyncValueSpWorkerTests {
 			}
 		});
 		w.TryComplete();
-		// Stall watchdog: a dropped wakeup plateaus Processed and fails fast, never hangs the run.
 		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => CountOf(w), n);
 
 		Assert.That(w.Processed, Is.EqualTo(Enumerable.Range(0, n)));
 	}
 
-	// Same churn, but every item goes through a truly-async tail so each crosses the _processDoneEvt
-	// Wait();Reset() rendezvous on top of the ring signaling.
+	// Same churn, but every item goes through a truly-async tail so each crosses the ThreadPool async
+	// resume on top of the ring signaling.
 	[Test]
-	public async Task Truly_Async_Boundary_Churn_Survives_The_ProcessDone_Rendezvous() {
+	public async Task Truly_Async_Boundary_Churn_Survives_The_Pool_Resume() {
 		using var w = new Rec(2, asyncTail: _ => Task.Run(() => { }));
 		w.Start();
 
@@ -230,18 +213,18 @@ public class AsyncValueSpWorkerTests {
 		Assert.That(w.Processed.OrderBy(x => x), Is.EqualTo(Enumerable.Range(0, n)));
 	}
 
-	// Deterministic lost-wakeup guard for the item signal — reliably parks the consumer on _itemEvt first
-	// (unlike the churn test), so a dropped empty→non-empty Set() in PublishScope.Dispose is always caught.
+	// Deterministic lost-wakeup guard for the async item-signal — reliably parks the consumer on
+	// WaitForItemAsync first, so a dropped empty→non-empty Set() in PublishScope.Dispose is always caught.
 	[Test]
 	public void Publish_Wakes_An_Idle_Parked_Worker() {
 		using var w = new Rec(4);
 		w.Start();
 
-		Thread.Sleep(150); // let the consumer exhaust its spin budget and park on _itemEvt
+		Thread.Sleep(150); // let the consumer drain and await the async item-signal
 		using (var s = w.Publish()) s.Event() = 1;
 		WorkerTestUtil.AwaitProgress(() => CountOf(w), 1);
 
-		Thread.Sleep(150); // worker re-parks (queue drained, empty again)
+		Thread.Sleep(150); // worker re-awaits (queue drained, empty again)
 		using (var s = w.Publish()) s.Event() = 2;
 		WorkerTestUtil.AwaitProgress(() => CountOf(w), 2);
 
@@ -250,8 +233,6 @@ public class AsyncValueSpWorkerTests {
 		Assert.That(w.Processed, Is.EqualTo(new[] { 1, 2 }));
 	}
 
-	// Forces the producer to block on the space event repeatedly. ReleaseEarly=false so head advances only
-	// after the (occasionally delayed) tail, keeping the tiny buffer full and the producer parking on space.
 	[Test]
 	public async Task Blocking_Producer_Is_Always_Re_Signaled_When_Space_Frees() {
 		using var w = new Rec(2, releaseEarly: false,
@@ -271,8 +252,6 @@ public class AsyncValueSpWorkerTests {
 		Assert.That(w.Processed, Is.EqualTo(Enumerable.Range(0, n)));
 	}
 
-	// "Queue cleaned up on shutdown": Complete called while the buffer is FULL (consumer gated in its async
-	// tail) must still drain every committed item and resolve Completion within a bound — no item stranded.
 	[Test]
 	public void Complete_Drains_A_Full_Buffer() {
 		var entered = new ManualResetEventSlim(false);
@@ -289,7 +268,6 @@ public class AsyncValueSpWorkerTests {
 		using (var s = w.Publish()) s.Event() = 0;
 		Assert.That(entered.Wait(2000), Is.True,
 			"consumer must enter the tail for item 0 before we fill the ring");
-		// head still 0 (released only after the tail completes); cap=2 ring now holds 0 and 1 → full.
 		using (var s = w.Publish()) s.Event() = 1;
 
 		Assert.That(w.TryComplete(), Is.True);
@@ -303,8 +281,6 @@ public class AsyncValueSpWorkerTests {
 		lock (w.Processed) return w.Processed.Count;
 	}
 
-	// Shared, observable state the struct handler writes through (the struct is copied into the worker;
-	// the test reads results via this reference).
 	private sealed class RecordingState {
 		public readonly List<Exception?> CompletedWith = new();
 		public readonly List<Exception> Errors = new();
@@ -352,7 +328,6 @@ public class AsyncValueSpWorkerTests {
 		}
 	}
 
-	// Thin harness mirroring the old Recording surface so the test bodies stay close to the original.
 	private sealed class Rec : IDisposable {
 		private readonly AsyncValueSpWorker<int, RecordingHandler> _worker;
 		private readonly RecordingState _state = new();

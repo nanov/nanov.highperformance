@@ -304,18 +304,21 @@ internal sealed class SpRingCore<T> : IDisposable {
 	}
 
 	/// <summary>
-	///   Async wait for the ThreadPool-async loop when the ring is empty: completes true when an item
-	///   is available, false on hard stop or soft-complete-drained. Allocation-free unless it actually
-	///   parks (rare under load). Single logical consumer only. Hard stop is checked first, so queued
-	///   items are dropped on stop; soft complete drains (returns false only once the ring is empty).
+	///   Item wait for the ThreadPool-async loop when the ring is empty. Returns a
+	///   <see cref="ValueTask{Boolean}" />: completed-<see langword="false" /> on hard stop or
+	///   soft-complete-drained (caller exits); completed-<see langword="true" /> when an item is
+	///   already available; otherwise the <see cref="AsyncAutoResetEvent" />'s pending wait (result
+	///   <see langword="true" /> = "woke" — the caller re-checks via <see cref="TryDequeueNow" /> /
+	///   <see cref="TryClaimNow" /> on the next loop turn). Deliberately NOT an <c>async</c> method, so
+	///   an empty wait allocates nothing — the suspension reuses the caller's single (one-time)
+	///   RunLoopAsync state machine. Hard stop is checked first, so queued items are dropped on stop.
+	///   Single logical consumer only.
 	/// </summary>
-	internal async ValueTask<bool> WaitForItemAsync() {
-		while (true) {
-			if (_stop) return false;
-			if (_head != Volatile.Read(ref _tail)) return true;
-			if (_completed) return false;
-			await _itemReadyAsync!.WaitAsync().ConfigureAwait(false);
-		}
+	internal ValueTask<bool> WaitForItemAsync() {
+		if (_stop) return new ValueTask<bool>(false);
+		if (_head != Volatile.Read(ref _tail)) return new ValueTask<bool>(true);
+		if (_completed) return new ValueTask<bool>(false);
+		return _itemReadyAsync!.WaitAsync();
 	}
 
 	// Cold path: producer parks until space frees, or the worker stops/completes.

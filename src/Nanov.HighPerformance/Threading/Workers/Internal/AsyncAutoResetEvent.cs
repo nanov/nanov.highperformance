@@ -10,10 +10,15 @@ using System.Threading.Tasks.Sources;
 ///   next <c>WaitAsync</c> isn't lost — mirrors the edge-triggered <c>ManualResetEventSlim</c> usage
 ///   on the dedicated-thread path). There is at most one waiter (the single logical consumer) and
 ///   one setter (the single producer) at a time; a small lock guards the rare transition (the wait
-///   is off the hot path — the ring is rarely empty under load). Reused across waits, so no per-item
-///   allocation.
+///   is off the hot path — the ring is rarely empty under load).
+///   <para>
+///     <see cref="WaitAsync" /> returns a <see cref="ValueTask{Boolean}" /> (result always
+///     <see langword="true" /> = "woke") so the consumer's wait can be a plain non-<c>async</c>
+///     method — no per-wait state-machine box. The struct <see cref="ValueTask{Boolean}" /> plus this
+///     reused source allocate nothing.
+///   </para>
 /// </summary>
-internal sealed class AsyncAutoResetEvent : IValueTaskSource {
+internal sealed class AsyncAutoResetEvent : IValueTaskSource<bool> {
 	private readonly object _gate = new();
 	private ManualResetValueTaskSourceCore<bool> _core; // mutable struct — must NOT be readonly
 	private bool _signaled;
@@ -32,24 +37,24 @@ internal sealed class AsyncAutoResetEvent : IValueTaskSource {
 		}
 	}
 
-	public ValueTask WaitAsync() {
+	public ValueTask<bool> WaitAsync() {
 		lock (_gate) {
 			if (_signaled) {
 				_signaled = false;
-				return ValueTask.CompletedTask;
+				return new ValueTask<bool>(true);
 			}
 
 			_core.Reset();
 			_waiting = true;
-			return new ValueTask(this, _core.Version);
+			return new ValueTask<bool>(this, _core.Version);
 		}
 	}
 
-	ValueTaskSourceStatus IValueTaskSource.GetStatus(short token) => _core.GetStatus(token);
+	bool IValueTaskSource<bool>.GetResult(short token) => _core.GetResult(token);
 
-	void IValueTaskSource.OnCompleted(Action<object?> continuation, object? state, short token,
+	ValueTaskSourceStatus IValueTaskSource<bool>.GetStatus(short token) => _core.GetStatus(token);
+
+	void IValueTaskSource<bool>.OnCompleted(Action<object?> continuation, object? state, short token,
 		ValueTaskSourceOnCompletedFlags flags) =>
 		_core.OnCompleted(continuation, state, token, flags);
-
-	void IValueTaskSource.GetResult(short token) => _core.GetResult(token);
 }
