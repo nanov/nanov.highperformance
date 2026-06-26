@@ -1,0 +1,100 @@
+namespace Nanov.HighPerformance.Threading;
+
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+
+/// <summary>
+///   Synchronous, copy-based handler for <see cref="SpscWorker{T, THandler}" />. Implement as a
+///   <see langword="struct" /> — the worker stores it by value and dispatches through a constrained
+///   generic call, so the JIT devirtualizes and inlines <see cref="Handle" /> per closed worker type
+///   (no virtual dispatch on the hot path). A stateless handler is an empty <c>readonly struct</c>;
+///   a stateful one keeps its mutable state in fields (mutations persist — calls go through the
+///   worker's handler field) or behind a reference it captures.
+/// </summary>
+public interface ISpscHandler<in T> {
+	/// <summary>Process one item. Invoked in FIFO order on the worker thread.</summary>
+	void Handle(T item);
+
+	/// <summary>
+	///   Invoked when <see cref="Handle" /> throws. Always synchronous. The worker swallows the
+	///   exception after this returns and continues with the next item.
+	/// </summary>
+	void OnError(Exception error);
+
+	/// <summary>
+	///   Invoked once after the worker has drained and is about to exit. <paramref name="error" />
+	///   is <see langword="null" /> for normal completion, an <see cref="OperationCanceledException" />
+	///   for cancellation, or the exception passed to <c>TryComplete</c>. Use it to propagate
+	///   completion to a downstream stage in a pipeline.
+	/// </summary>
+	void OnCompleted(Exception? error);
+}
+
+/// <summary>
+///   Asynchronous, copy-based handler for <see cref="AsyncSpscWorker{T, THandler}" />. Same
+///   devirtualized struct-handler contract as <see cref="ISpscHandler{T}" />, but
+///   <see cref="HandleAsync" /> returns a <see cref="ValueTask" /> for in-flight async work.
+///   <see cref="OnError" /> stays synchronous.
+/// </summary>
+public interface IAsyncSpscHandler<in T> {
+	/// <summary>
+	///   Process one item. Invoked in FIFO order on the worker thread. The
+	///   <paramref name="cancellationToken" /> is the one passed to <c>Start</c> — forward it to
+	///   async IO so a hard stop aborts in-flight work. Sync-completing <see cref="ValueTask" />s
+	///   incur no overhead; truly async ones block the dedicated thread during their internal awaits.
+	/// </summary>
+	ValueTask HandleAsync(T item, CancellationToken cancellationToken);
+
+	/// <summary>Invoked synchronously when <see cref="HandleAsync" /> faults. See <see cref="ISpscHandler{T}.OnError" />.</summary>
+	void OnError(Exception error);
+
+	/// <summary>Drain/shutdown hook. See <see cref="ISpscHandler{T}.OnCompleted" />.</summary>
+	ValueTask OnCompletedAsync(Exception? error);
+}
+
+/// <summary>
+///   Synchronous, zero-copy scope-based handler for <see cref="ValueSpscWorker{T, THandler}" />.
+///   Receives a <see cref="ConsumeScope{T}" /> by ref: read the slot via
+///   <see cref="ConsumeScope{T}.Event" />, optionally call <see cref="ConsumeScope{T}.Release" /> to
+///   free it for the producer early, then do the rest of the work. If you don't release, the worker
+///   loop auto-releases when <see cref="Handle" /> returns. Implement as a <see langword="struct" />
+///   for the same devirtualization benefit as <see cref="ISpscHandler{T}" />.
+/// </summary>
+public interface IValueSpscHandler<T> where T : struct {
+	/// <summary>Process one slot. Invoked in FIFO order on the worker thread.</summary>
+	void Handle(ref ConsumeScope<T> scope);
+
+	/// <summary>Invoked synchronously when <see cref="Handle" /> throws. See <see cref="ISpscHandler{T}.OnError" />.</summary>
+	void OnError(Exception error);
+
+	/// <summary>Drain/shutdown hook. See <see cref="ISpscHandler{T}.OnCompleted" />.</summary>
+	void OnCompleted(Exception? error);
+}
+
+/// <summary>
+///   Asynchronous, zero-copy scope-based handler for <see cref="AsyncValueSpscWorker{T, THandler}" />.
+///   <para>
+///     <see cref="HandleAsync" /> must NOT be declared <c>async</c> — a ref struct scope can't cross
+///     an <c>await</c>. Do the sync slot read + <see cref="ConsumeScope{T}.Release" /> in the method
+///     body, then return a <see cref="ValueTask" /> from a nested <c>async</c> helper:
+///   </para>
+///   <code>
+/// public ValueTask HandleAsync(ref ConsumeScope&lt;T&gt; scope, CancellationToken ct) {
+///     ref var slot = ref scope.Event();
+///     var a = slot.A; var b = slot.B;
+///     scope.Release();                 // producer can reuse the slot now
+///     return DoWorkAsync(a, b, ct);    // actual async work lives here
+/// }
+///   </code>
+/// </summary>
+public interface IAsyncValueSpscHandler<T> where T : struct {
+	/// <summary>Process one slot. Invoked in FIFO order on the worker thread. Must not be <c>async</c> (see remarks).</summary>
+	ValueTask HandleAsync(ref ConsumeScope<T> scope, CancellationToken cancellationToken);
+
+	/// <summary>Invoked synchronously when <see cref="HandleAsync" /> faults. See <see cref="ISpscHandler{T}.OnError" />.</summary>
+	void OnError(Exception error);
+
+	/// <summary>Drain/shutdown hook. See <see cref="ISpscHandler{T}.OnCompleted" />.</summary>
+	ValueTask OnCompletedAsync(Exception? error);
+}
