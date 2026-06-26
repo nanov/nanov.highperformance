@@ -24,7 +24,7 @@ public sealed class AsyncSpscWorker<T, THandler> : SpscWorkerBase<T>
 	private THandler _handler; // mutable struct — calls go through this field so state persists
 
 	public AsyncSpscWorker(THandler handler, int capacity, string? threadName = null)
-		: base(capacity, threadName ?? $"AsyncSpscWorker<{typeof(T).Name}>") {
+		: base(capacity, threadName, $"AsyncSpscWorker<{typeof(T).Name}>") {
 		_handler = handler;
 		_onProcessComplete = () => _processDoneEvt.Set(); // cached delegate, one-time alloc
 	}

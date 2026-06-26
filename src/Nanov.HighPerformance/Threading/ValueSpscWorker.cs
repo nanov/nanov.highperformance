@@ -25,7 +25,7 @@ public sealed class ValueSpscWorker<T, THandler> : ValueSpscWorkerBase<T>
 	private THandler _handler; // mutable struct — calls go through this field so state persists
 
 	public ValueSpscWorker(THandler handler, int capacity, string? threadName = null)
-		: base(capacity, threadName) {
+		: base(capacity, threadName, $"ValueSpscWorker<{typeof(T).Name}>") {
 		_handler = handler;
 	}
 

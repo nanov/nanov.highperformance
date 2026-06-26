@@ -25,7 +25,7 @@ public sealed class AsyncValueSpscWorker<T, THandler> : ValueSpscWorkerBase<T>
 	private THandler _handler; // mutable struct — calls go through this field so state persists
 
 	public AsyncValueSpscWorker(THandler handler, int capacity, string? threadName = null)
-		: base(capacity, threadName ?? $"AsyncValueSpscWorker<{typeof(T).Name}>") {
+		: base(capacity, threadName, $"AsyncValueSpscWorker<{typeof(T).Name}>") {
 		_handler = handler;
 		_onProcessComplete = () => _processDoneEvt.Set();
 	}
