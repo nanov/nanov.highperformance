@@ -46,11 +46,23 @@ full write-up lives in the `SpRingCore<T>` XML doc.
 - **OnError is always synchronous**, on every variant including async ones. `OnCompleted` is the
   drain hook (sync for sync workers, `…Async` for async). Handler exceptions are reported to
   `OnError` and the worker continues.
-- **Async rendezvous: eager + branchless.** The async workers cache `_processDoneEvt` + a method-
-  group `Action _onProcessComplete = _processDoneEvt.Set` in the constructor and use them
-  unconditionally in the loop. Do **not** make these lazy (`??=`) — we tried; it adds a branch on
-  the async path to save one one-time alloc, not worth it. The `Action` itself is unavoidable
-  (`UnsafeOnCompleted` has no stateful overload; `AsTask()` would allocate per item).
+- **Two async execution models — don't conflate them.**
+  - *Dedicated-thread* (`AsyncSpWorker` / `AsyncValueSpWorker`): the dedicated thread runs a **sync**
+    `RunLoop` and blocks per await via the `_processDoneEvt` rendezvous (eager + branchless: cache
+    `_processDoneEvt` + a method-group `Action _onProcessComplete = _processDoneEvt.Set` in the ctor;
+    do **not** make these lazy `??=` — we tried, not worth it). Best for *sync-completing* handlers.
+    Slow when every item truly suspends (per-item park/wake) — that's a documented boundary, not a bug.
+  - *ThreadPool* (`ThreadPoolAsyncSpWorker` / `ThreadPoolAsyncValueSpWorker`): no dedicated thread;
+    `Start` launches `RunLoopAsync` (an `async Task`) via `Task.Run`, using the core's no-thread ctor
+    (`new SpRingCore<T>(capacity)`), `TryClaimNow`/`TryDequeueNow` (non-blocking), and
+    `WaitForItemAsync` (backed by the internal zero-alloc `AsyncAutoResetEvent`, set on the
+    empty→non-empty edge by `CommitTail` when `_itemReadyAsync != null`). Matches/beats `Channel<T>`
+    for truly-async serial handlers because the continuation resumes on the pool — no thread to wake.
+    The scope worker reads + `Release()`s the `HandleScope` **synchronously before any await** (ref
+    struct can't cross await); `Dispose` `SignalStop()`s, waits the loop `Task`, then `_core.Dispose()`.
+  - The `Action`/rendezvous is only the dedicated-thread path; the ThreadPool path has neither.
+    Per-item handler state-machine boxing (when the handler genuinely suspends) is inherent to async
+    and unavoidable in either model; the worker loop itself is zero-alloc.
 
 ## DEBUG-only producer overlap guard
 

@@ -43,14 +43,16 @@ internal sealed class SpRingCore<T> : IDisposable {
 
 	internal readonly T[] _buffer;
 	internal readonly int _mask;
-	private readonly ManualResetEventSlim _itemEvt = new(false); // set when items available
+	private readonly ManualResetEventSlim _itemEvt = new(false); // set when items available (dedicated-thread consumers)
 	private readonly ManualResetEventSlim _spaceEvt = new(false); // set when space freed
+	private readonly AsyncAutoResetEvent? _itemReadyAsync; // async item signal (ThreadPool-async consumers); null on the dedicated-thread path
 	private readonly TaskCompletionSource _completionTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
-	private readonly Thread _thread;
+	private readonly Thread? _thread; // null in ThreadPool-async mode (the worker drives an async loop instead)
 	private volatile bool _completed; // soft stop (Complete) — drain remaining
 	private Exception? _completeException;
 	private CancellationToken _ct;
 	private CancellationTokenRegistration _ctRegistration;
+	private bool _disposed;
 	private int _head; // consumer index (worker thread)
 	private volatile bool _stop; // hard stop (Dispose / cancel) — drop remaining
 	private int _tail; // producer index (dispatching thread)
@@ -58,6 +60,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 	private int _producing; // 0/1 — debug-only re-entrancy flag for the producer overlap guard
 #endif
 
+	// Dedicated-thread mode (sync workers + the dedicated-thread async workers).
 	internal SpRingCore(int capacity, string threadName, ThreadStart runLoop) {
 		capacity = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(capacity, 1));
 		_buffer = new T[capacity];
@@ -66,6 +69,16 @@ internal sealed class SpRingCore<T> : IDisposable {
 			IsBackground = true,
 			Name = threadName
 		};
+	}
+
+	// ThreadPool-async mode: no dedicated thread; the worker drives an async loop via Task and waits
+	// for items through the async signal.
+	internal SpRingCore(int capacity) {
+		capacity = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(capacity, 1));
+		_buffer = new T[capacity];
+		_mask = capacity - 1;
+		_thread = null;
+		_itemReadyAsync = new AsyncAutoResetEvent();
 	}
 
 	internal Task Completion => _completionTcs.Task;
@@ -77,13 +90,17 @@ internal sealed class SpRingCore<T> : IDisposable {
 		_ct = ct;
 		if (ct.CanBeCanceled)
 			_ctRegistration = ct.Register(static s => ((SpRingCore<T>)s!).OnCancel(), this);
-		_thread.Start();
+		_thread?.Start(); // ThreadPool-async workers launch their own loop after Start
 	}
 
-	private void OnCancel() {
+	private void OnCancel() => SignalStop();
+
+	/// <summary>Set the hard-stop flag and wake every waiter (blocked producer, sync consumer, async consumer).</summary>
+	internal void SignalStop() {
 		_stop = true;
 		_itemEvt.Set();
 		_spaceEvt.Set();
+		_itemReadyAsync?.Set();
 	}
 
 	internal bool TryComplete(Exception? exception) {
@@ -91,6 +108,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 		_completeException = exception;
 		_completed = true;
 		_itemEvt.Set();
+		_itemReadyAsync?.Set();
 		return true;
 	}
 
@@ -110,17 +128,19 @@ internal sealed class SpRingCore<T> : IDisposable {
 	}
 
 	public void Dispose() {
-		if (_stop) return;
-		_stop = true;
-		// Wake up both sides so they observe _stop and exit.
-		_itemEvt.Set();
-		_spaceEvt.Set();
-		try {
-			_thread.Join(1000);
+		if (_disposed) return;
+		_disposed = true;
+		SignalStop(); // wake both sides so they observe _stop and exit
+		if (_thread is not null) {
+			try {
+				_thread.Join(1000);
+			}
+			catch {
+				/* ignore */
+			}
 		}
-		catch {
-			/* ignore */
-		}
+		// ThreadPool-async workers await their loop Task before calling Dispose, so the events are
+		// no longer in use by the consumer here.
 
 		_itemEvt.Dispose();
 		_spaceEvt.Dispose();
@@ -154,8 +174,13 @@ internal sealed class SpRingCore<T> : IDisposable {
 		Volatile.Write(ref _tail, tail + 1);
 		// Edge-triggered: signal only on the empty→non-empty transition (latching event; the consumer's
 		// post-Reset recheck re-reads _tail, so this lone Set cannot be lost). See SIGNALING INVARIANT.
-		if (Volatile.Read(ref _head) == tail)
-			_itemEvt.Set();
+		// The signal branch only runs on the (rare) edge, so the async-mode check is off the hot path.
+		if (Volatile.Read(ref _head) == tail) {
+			if (_itemReadyAsync is null)
+				_itemEvt.Set();
+			else
+				_itemReadyAsync.Set();
+		}
 	}
 
 	/// <summary>Reserve + write + commit in one shot (copy-based producers). False if not accepting.</summary>
@@ -243,6 +268,54 @@ internal sealed class SpRingCore<T> : IDisposable {
 		slot = default!;
 		AdvanceHead(head);
 		return true;
+	}
+
+	// --- ThreadPool-async consumer path -----------------------------------------------------------
+
+	/// <summary>
+	///   Non-blocking consumer claim for the async loop: false if the ring is empty or hard-stopped
+	///   (the caller then calls <see cref="WaitForItemAsync" /> to distinguish wait from exit). On
+	///   true, <paramref name="head" /> is the next item's index.
+	/// </summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal bool TryClaimNow(out int head) {
+		if (_head == Volatile.Read(ref _tail) || _stop) {
+			head = 0;
+			return false;
+		}
+
+		head = _head;
+		return true;
+	}
+
+	/// <summary>Non-blocking copy-out dequeue for the async loop. False if empty or hard-stopped.</summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal bool TryDequeueNow(out T item) {
+		if (!TryClaimNow(out var head)) {
+			item = default!;
+			return false;
+		}
+
+		ref var slot = ref _buffer[head & _mask];
+		item = slot;
+		slot = default!;
+		AdvanceHead(head);
+		return true;
+	}
+
+	/// <summary>
+	///   Async wait for the ThreadPool-async loop when the ring is empty: completes true when an item
+	///   is available, false on hard stop or soft-complete-drained. Allocation-free unless it actually
+	///   parks (rare under load). Single logical consumer only. Hard stop is checked first, so queued
+	///   items are dropped on stop; soft complete drains (returns false only once the ring is empty).
+	/// </summary>
+	internal async ValueTask<bool> WaitForItemAsync() {
+		while (true) {
+			if (_stop) return false;
+			if (_head != Volatile.Read(ref _tail)) return true;
+			if (_completed) return false;
+			await _itemReadyAsync!.WaitAsync().ConfigureAwait(false);
+		}
 	}
 
 	// Cold path: producer parks until space frees, or the worker stops/completes.

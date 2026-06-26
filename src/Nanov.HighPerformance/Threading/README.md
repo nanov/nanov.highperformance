@@ -26,13 +26,32 @@ per-message allocation**, blocking backpressure, drain-on-complete, and cancella
 | Type | Handler | Producer API | Use when |
 | --- | --- | --- | --- |
 | `SpWorker<T, THandler>` | `IWorkerHandler<T>` | `Dispatch(T)` | sync handler, copy-based |
-| `AsyncSpWorker<T, THandler>` | `IAsyncWorkerHandler<T>` | `Dispatch(T)` | async handler (`ValueTask`) |
+| `AsyncSpWorker<T, THandler>` | `IAsyncWorkerHandler<T>` | `Dispatch(T)` | async handler, dedicated thread |
+| `ThreadPoolAsyncSpWorker<T, THandler>` | `IAsyncWorkerHandler<T>` | `Dispatch(T)` | async handler, ThreadPool loop |
 | `ValueSpWorker<T, THandler>` | `IValueWorkerHandler<T>` | `Publish()` → `ref` | `T : struct`, zero-copy |
-| `AsyncValueSpWorker<T, THandler>` | `IAsyncValueWorkerHandler<T>` | `Publish()` → `ref` | `T : struct`, zero-copy + async |
+| `AsyncValueSpWorker<T, THandler>` | `IAsyncValueWorkerHandler<T>` | `Publish()` → `ref` | `T : struct`, zero-copy async, dedicated thread |
+| `ThreadPoolAsyncValueSpWorker<T, THandler>` | `IAsyncValueWorkerHandler<T>` | `Publish()` → `ref` | `T : struct`, zero-copy async, ThreadPool loop |
 
 `THandler` is a **struct** constrained to the handler interface, so the per-item `Handle` /
 `OnError` / `OnCompleted` calls devirtualize and inline — no virtual dispatch on the hot path. Put
 mutable handler state in struct fields, or behind a reference the struct captures.
+
+### Two async execution models
+
+The async copy/scope handlers each come in two flavours — pick by how the handler completes:
+
+- **Dedicated thread** (`AsyncSpWorker` / `AsyncValueSpWorker`): a dedicated consumer thread runs the
+  loop and blocks on each `await`. Best when the handler **usually completes synchronously** (cached
+  `default`/`ValueTask` fast path) — it then drains in a tight zero-overhead loop. When the handler
+  *truly* suspends every item it pays a per-item park/wake handshake (the thread can't run an `await`
+  continuation without blocking), so it's slower there.
+- **ThreadPool loop** (`ThreadPoolAsyncSpWorker` / `ThreadPoolAsyncValueSpWorker`): the loop is an
+  `async Task` on the ThreadPool, so a suspended handler's continuation resumes the loop *on the
+  pool* — no dedicated thread to wake. Matches (or beats) a `Channel<T>` consumer for **truly-async,
+  one-at-a-time (serial, FIFO)** handlers. These take `(handler, capacity)` (no thread name).
+
+Both are still strictly single-consumer/FIFO with one item in flight; a handler that genuinely
+suspends boxes its own per-item async state machine either way (inherent to async).
 
 ### Handler interface
 

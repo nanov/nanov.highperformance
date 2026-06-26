@@ -63,8 +63,9 @@ public readonly struct AsyncValueSumHandler : IAsyncWorkerHandler<ValueMsg> {
 	public AsyncValueSumHandler(Box box) => _box = box;
 	public ValueTask HandleAsync(ValueMsg item, CancellationToken cancellationToken) {
 		_box.Sum += item.Key;
-		return default;
+		return HandleAsyncAwaiter();
 	}
+	private async ValueTask HandleAsyncAwaiter() => await Task.Yield();
 	public void OnError(Exception error) { }
 	public ValueTask OnCompletedAsync(Exception? error) => default;
 }
@@ -74,8 +75,10 @@ public readonly struct AsyncRefSumHandler : IAsyncWorkerHandler<RefMsg> {
 	public AsyncRefSumHandler(Box box) => _box = box;
 	public ValueTask HandleAsync(RefMsg item, CancellationToken cancellationToken) {
 		_box.Sum += item.Key;
-		return default;
+		return HandleAsyncAwaiter();
 	}
+	private async ValueTask HandleAsyncAwaiter() => await Task.Yield();
+
 	public void OnError(Exception error) { }
 	public ValueTask OnCompletedAsync(Exception? error) => default;
 }
@@ -99,8 +102,10 @@ public readonly struct AsyncScopeSumHandler : IAsyncValueWorkerHandler<ValueMsg>
 	public ValueTask HandleAsync(ref HandleScope<ValueMsg> scope, CancellationToken cancellationToken) {
 		_box.Sum += scope.Event().Key;
 		scope.Release();
-		return default;
+		return HandleAsyncAwaiter();
 	}
+	private async ValueTask HandleAsyncAwaiter() => await Task.Yield();
+
 	public void OnError(Exception error) { }
 	public ValueTask OnCompletedAsync(Exception? error) => default;
 }
@@ -183,10 +188,10 @@ public class SyncValueBenchmarks {
 public class AsyncValueBenchmarks {
 	private static readonly ValueMsg Msg = new() { Key = 1, Value = 2, Timestamp = 3, Flags = 4 };
 
-	[Params(24, 1024)]
+	[Params(24)]
 	public int Capacity;
 
-	[Params(1_000_000)]
+	[Params(1_000)]
 	public int ItemCount;
 
 	[Benchmark(Baseline = true)]
@@ -196,12 +201,14 @@ public class AsyncValueBenchmarks {
 			SingleWriter = true
 		});
 
-		long sum = 0;
+		var box = new Box();
+		var handler = new AsyncValueSumHandler(box);
 		var consumer = Task.Run(async () => {
 			var reader = channel.Reader;
 			while (await reader.WaitToReadAsync().ConfigureAwait(false))
-				while (reader.TryRead(out var item))
-					sum += item.Key;
+			while (reader.TryRead(out var item)) {
+				await handler.HandleAsync(item, CancellationToken.None);
+			}
 		});
 
 		var writer = channel.Writer;
@@ -211,7 +218,7 @@ public class AsyncValueBenchmarks {
 		writer.Complete();
 
 		await consumer.ConfigureAwait(false);
-		return sum;
+		return box.Sum;
 	}
 
 	[Benchmark]
@@ -233,6 +240,38 @@ public class AsyncValueBenchmarks {
 	public long AsyncValueSpWorker_Value() {
 		var box = new Box();
 		using var w = new AsyncValueSpWorker<ValueMsg, AsyncScopeSumHandler>(new AsyncScopeSumHandler(box), Capacity);
+		w.Start();
+
+		var msg = Msg;
+		for (var i = 0; i < ItemCount; i++) {
+			using var s = w.Publish();
+			s.Event() = msg;
+		}
+
+		w.TryComplete();
+		w.Completion.GetAwaiter().GetResult();
+		return box.Sum;
+	}
+
+	[Benchmark]
+	public long ThreadPoolAsyncSpWorker_Value() {
+		var box = new Box();
+		using var w = new ThreadPoolAsyncSpWorker<ValueMsg, AsyncValueSumHandler>(new AsyncValueSumHandler(box), Capacity);
+		w.Start();
+
+		var msg = Msg;
+		for (var i = 0; i < ItemCount; i++)
+			w.Dispatch(msg);
+
+		w.TryComplete();
+		w.Completion.GetAwaiter().GetResult();
+		return box.Sum;
+	}
+
+	[Benchmark]
+	public long ThreadPoolAsyncValueSpWorker_Value() {
+		var box = new Box();
+		using var w = new ThreadPoolAsyncValueSpWorker<ValueMsg, AsyncScopeSumHandler>(new AsyncScopeSumHandler(box), Capacity);
 		w.Start();
 
 		var msg = Msg;
@@ -304,10 +343,10 @@ public class SyncRefBenchmarks {
 public class AsyncRefBenchmarks {
 	private static readonly RefMsg Ref = new() { Key = 1, Value = 2, Timestamp = 3, Flags = 4 };
 
-	[Params(24, 1024)]
+	[Params(24)]
 	public int Capacity;
 
-	[Params(1_000_000)]
+	[Params(1_000)]
 	public int ItemCount;
 
 	[Benchmark(Baseline = true)]
@@ -317,12 +356,13 @@ public class AsyncRefBenchmarks {
 			SingleWriter = true
 		});
 
-		long sum = 0;
+		var box = new Box();
+		var handler = new AsyncRefSumHandler(box);
 		var consumer = Task.Run(async () => {
 			var reader = channel.Reader;
 			while (await reader.WaitToReadAsync().ConfigureAwait(false))
-				while (reader.TryRead(out var item))
-					sum += item.Key;
+			while (reader.TryRead(out var item))
+				await handler.HandleAsync(item, CancellationToken.None);
 		});
 
 		var writer = channel.Writer;
@@ -332,13 +372,28 @@ public class AsyncRefBenchmarks {
 		writer.Complete();
 
 		await consumer.ConfigureAwait(false);
-		return sum;
+		return box.Sum;
 	}
 
 	[Benchmark]
 	public long AsyncSpWorker_Ref() {
 		var box = new Box();
 		using var w = new AsyncSpWorker<RefMsg, AsyncRefSumHandler>(new AsyncRefSumHandler(box), Capacity);
+		w.Start();
+
+		var msg = Ref;
+		for (var i = 0; i < ItemCount; i++)
+			w.Dispatch(msg);
+
+		w.TryComplete();
+		w.Completion.GetAwaiter().GetResult();
+		return box.Sum;
+	}
+
+	[Benchmark]
+	public long ThreadPoolAsyncSpWorker_Ref() {
+		var box = new Box();
+		using var w = new ThreadPoolAsyncSpWorker<RefMsg, AsyncRefSumHandler>(new AsyncRefSumHandler(box), Capacity);
 		w.Start();
 
 		var msg = Ref;
