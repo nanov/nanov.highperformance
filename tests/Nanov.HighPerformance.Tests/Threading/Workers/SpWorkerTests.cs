@@ -1,11 +1,11 @@
-namespace Nanov.HighPerformance.Tests.Threading;
+namespace Nanov.HighPerformance.Tests.Threading.Workers;
 
 using System.Linq;
-using Nanov.HighPerformance.Threading;
+using Nanov.HighPerformance.Threading.Workers;
 using NUnit.Framework;
 
 [TestFixture]
-public class SpscWorkerTests {
+public class SpWorkerTests {
 	[Test]
 	public void Capacity_Rounds_Up_To_Power_Of_2() {
 		using var w = new Rec(5);
@@ -151,7 +151,7 @@ public class SpscWorkerTests {
 		Assert.That(w.Processed, Is.EqualTo(Enumerable.Range(0, n)));
 	}
 
-	// Regression guard for the edge-triggered signaling (see SpscWorker SIGNALING INVARIANT). Tiny
+	// Regression guard for the edge-triggered signaling (see SpWorker SIGNALING INVARIANT). Tiny
 	// capacity maximizes empty↔non-empty / full↔non-full transitions — the exact boundary the conditional
 	// Set() gates — over many iterations. A dropped wakeup surfaces as a timeout here, not a wrong value.
 	[TestCase(1)]
@@ -253,7 +253,7 @@ public class SpscWorkerTests {
 		public readonly List<int> Processed = new();
 	}
 
-	private readonly struct RecordingHandler : ISpscHandler<int> {
+	private readonly struct RecordingHandler : IWorkerHandler<int> {
 		private readonly RecordingState _state;
 		private readonly TimeSpan _processDelay;
 		private readonly Action<int>? _hook;
@@ -281,11 +281,11 @@ public class SpscWorkerTests {
 
 	// Thin harness mirroring the old Recording surface so the test bodies stay close to the original.
 	private sealed class Rec : IDisposable {
-		private readonly SpscWorker<int, RecordingHandler> _worker;
+		private readonly SpWorker<int, RecordingHandler> _worker;
 		private readonly RecordingState _state = new();
 
 		public Rec(int capacity, TimeSpan processDelay = default, Action<int>? hook = null) =>
-			_worker = new SpscWorker<int, RecordingHandler>(new RecordingHandler(_state, processDelay, hook), capacity);
+			_worker = new SpWorker<int, RecordingHandler>(new RecordingHandler(_state, processDelay, hook), capacity);
 
 		public List<int> Processed => _state.Processed;
 		public List<Exception?> CompletedWith => _state.CompletedWith;

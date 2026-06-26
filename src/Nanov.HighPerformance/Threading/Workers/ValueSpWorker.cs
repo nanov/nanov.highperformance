@@ -1,12 +1,12 @@
-namespace Nanov.HighPerformance.Threading;
+namespace Nanov.HighPerformance.Threading.Workers;
 
 using System;
 using System.Runtime.CompilerServices;
 using System.Threading;
-using Nanov.HighPerformance.Threading.Internal;
+using Nanov.HighPerformance.Threading.Workers.Internal;
 
 /// <summary>
-///   Value-type twin of <see cref="SpscWorker{T, THandler}" /> in the Disruptor-net
+///   Value-type twin of <see cref="SpWorker{T, THandler}" /> in the Disruptor-net
 ///   <c>ValueDisruptor</c> style: producers write <b>directly into the ring slot</b> via
 ///   <see cref="Publish" /> (no struct copy at the call site).
 ///   <code>
@@ -21,15 +21,15 @@ using Nanov.HighPerformance.Threading.Internal;
 ///   invokes <typeparamref name="THandler" />'s <c>Handle(ref HandleScope&lt;T&gt;)</c> per slot —
 ///   devirtualized (struct handler), no virtual dispatch per item.
 /// </summary>
-public sealed class ValueSpscWorker<T, THandler> : IDisposable, ISpscWorkerQueue
+public sealed class ValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 	where T : struct
-	where THandler : struct, IValueSpscHandler<T> {
-	private readonly SpscRingCore<T> _core;
+	where THandler : struct, IValueWorkerHandler<T> {
+	private readonly SpRingCore<T> _core;
 	private THandler _handler; // mutable struct — calls go through this field so state persists
 
-	public ValueSpscWorker(THandler handler, int capacity, string? threadName = null) {
+	public ValueSpWorker(THandler handler, int capacity, string? threadName = null) {
 		_handler = handler;
-		_core = new SpscRingCore<T>(capacity, threadName ?? $"ValueSpscWorker<{typeof(T).Name}>", RunLoop);
+		_core = new SpRingCore<T>(capacity, threadName ?? $"ValueSpWorker<{typeof(T).Name}>", RunLoop);
 	}
 
 	/// <summary>Completes when the worker has drained and exited (after Complete() or Dispose()).</summary>

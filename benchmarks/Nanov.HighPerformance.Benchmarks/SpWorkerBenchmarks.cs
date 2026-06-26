@@ -4,23 +4,23 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using BenchmarkDotNet.Attributes;
-using Nanov.HighPerformance.Threading;
+using Nanov.HighPerformance.Threading.Workers;
 
 /// <summary>
 ///   Throughput / allocation comparison: pushing <see cref="ItemCount" /> items through a single
 ///   dedicated consumer. Baseline is a bounded <see cref="Channel{T}" /> with one reader task;
-///   the comparison is <see cref="SpscWorker{T, THandler}" /> (devirtualized struct handler, zero
+///   the comparison is <see cref="SpWorker{T, THandler}" /> (devirtualized struct handler, zero
 ///   per-item allocation after construction).
 /// </summary>
 [MemoryDiagnoser]
-public class SpscWorkerBenchmarks {
+public class SpWorkerBenchmarks {
 	private const int Capacity = 24;
 
 	[Params(1_000_000)]
 	public int ItemCount;
 
 	// Empty-bodied handler: isolates the dispatch/consume machinery, not the work.
-	private readonly struct CountingHandler : ISpscHandler<int> {
+	private readonly struct CountingHandler : IWorkerHandler<int> {
 		private readonly StrongBox _box;
 
 		public CountingHandler(StrongBox box) => _box = box;
@@ -60,9 +60,9 @@ public class SpscWorkerBenchmarks {
 	}
 
 	[Benchmark]
-	public long SpscWorkerDispatch() {
+	public long SpWorkerDispatch() {
 		var box = new StrongBox();
-		using var worker = new SpscWorker<int, CountingHandler>(new CountingHandler(box), Capacity);
+		using var worker = new SpWorker<int, CountingHandler>(new CountingHandler(box), Capacity);
 		worker.Start();
 
 		for (var i = 0; i < ItemCount; i++)

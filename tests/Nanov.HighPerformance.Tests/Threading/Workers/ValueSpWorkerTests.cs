@@ -1,11 +1,11 @@
-namespace Nanov.HighPerformance.Tests.Threading;
+namespace Nanov.HighPerformance.Tests.Threading.Workers;
 
 using System.Linq;
-using Nanov.HighPerformance.Threading;
+using Nanov.HighPerformance.Threading.Workers;
 using NUnit.Framework;
 
 [TestFixture]
-public class ValueSpscWorkerTests {
+public class ValueSpWorkerTests {
 	// --- Smoke tests --------------------------------------------------------------
 
 	[Test]
@@ -337,7 +337,7 @@ public class ValueSpscWorkerTests {
 
 	// --- Edge-triggered signaling regression guards -------------------------------
 
-	// Regression guard for the edge-triggered ring signaling (see ValueSpscWorkerBase SIGNALING
+	// Regression guard for the edge-triggered ring signaling (see ValueSpWorkerBase SIGNALING
 	// INVARIANT). Tiny capacity maximizes empty↔non-empty / full↔non-full transitions over many
 	// iterations; a dropped wakeup surfaces as a timeout (stall watchdog fires), not a wrong value.
 	[TestCase(1)]
@@ -441,7 +441,7 @@ public class ValueSpscWorkerTests {
 
 	// Struct handler that records every processed slot. Reads its config from the shared reference-type
 	// state so tests can toggle flags / set the hook after construction (the struct is copied by value).
-	private readonly struct RecordingHandler : IValueSpscHandler<int> {
+	private readonly struct RecordingHandler : IValueWorkerHandler<int> {
 		private readonly RecordingState _state;
 
 		public RecordingHandler(RecordingState state) => _state = state;
@@ -468,11 +468,11 @@ public class ValueSpscWorkerTests {
 
 	// Thin harness mirroring the old Recording surface so the test bodies stay close to the original.
 	private sealed class Rec : IDisposable {
-		private readonly ValueSpscWorker<int, RecordingHandler> _worker;
+		private readonly ValueSpWorker<int, RecordingHandler> _worker;
 		private readonly RecordingState _state = new();
 
 		public Rec(int capacity) =>
-			_worker = new ValueSpscWorker<int, RecordingHandler>(new RecordingHandler(_state), capacity);
+			_worker = new ValueSpWorker<int, RecordingHandler>(new RecordingHandler(_state), capacity);
 
 		public List<int> Processed => _state.Processed;
 		public List<Exception?> CompletedWith => _state.CompletedWith;

@@ -1,11 +1,11 @@
-namespace Nanov.HighPerformance.Tests.Threading;
+namespace Nanov.HighPerformance.Tests.Threading.Workers;
 
 using System.Linq;
-using Nanov.HighPerformance.Threading;
+using Nanov.HighPerformance.Threading.Workers;
 using NUnit.Framework;
 
 [TestFixture]
-public class AsyncSpscWorkerTests {
+public class AsyncSpWorkerTests {
 	[Test]
 	public void SyncCompleting_ProcessAsync_Processes_In_Order() {
 		using var w = new Rec(16);
@@ -126,7 +126,7 @@ public class AsyncSpscWorkerTests {
 		Assert.That(w.Processed, Is.EqualTo(Enumerable.Range(0, n)));
 	}
 
-	// Regression guard for the edge-triggered ring signaling (see AsyncSpscWorker SIGNALING INVARIANT).
+	// Regression guard for the edge-triggered ring signaling (see AsyncSpWorker SIGNALING INVARIANT).
 	// Tiny capacity maximizes empty↔non-empty / full↔non-full transitions over many iterations; a dropped
 	// wakeup surfaces as a stall, not a wrong value.
 	[TestCase(1)]
@@ -258,7 +258,7 @@ public class AsyncSpscWorkerTests {
 		public readonly List<int> Processed = new();
 	}
 
-	private readonly struct RecordingHandler : IAsyncSpscHandler<int> {
+	private readonly struct RecordingHandler : IAsyncWorkerHandler<int> {
 		private readonly RecordingState _state;
 		private readonly TimeSpan _syncDelay;
 		private readonly TimeSpan _asyncDelay;
@@ -296,7 +296,7 @@ public class AsyncSpscWorkerTests {
 
 	// Thin harness mirroring the old Recording surface so the test bodies stay close to the original.
 	private sealed class Rec : IDisposable {
-		private readonly AsyncSpscWorker<int, RecordingHandler> _worker;
+		private readonly AsyncSpWorker<int, RecordingHandler> _worker;
 		private readonly RecordingState _state = new();
 
 		public Rec(int capacity,
@@ -304,7 +304,7 @@ public class AsyncSpscWorkerTests {
 			TimeSpan asyncDelay = default,
 			Action<int>? hook = null,
 			bool yield = false) =>
-			_worker = new AsyncSpscWorker<int, RecordingHandler>(
+			_worker = new AsyncSpWorker<int, RecordingHandler>(
 				new RecordingHandler(_state, syncDelay, asyncDelay, hook, yield), capacity);
 
 		public List<int> Processed => _state.Processed;
@@ -320,7 +320,7 @@ public class AsyncSpscWorkerTests {
 
 	// Async pipeline stage: forwards each item downstream and propagates completion, mirroring the
 	// source's PipelineStage worker subclass.
-	private readonly struct PipelineHandler : IAsyncSpscHandler<int> {
+	private readonly struct PipelineHandler : IAsyncWorkerHandler<int> {
 		private readonly Rec _downstream;
 
 		public PipelineHandler(Rec downstream) => _downstream = downstream;
@@ -339,10 +339,10 @@ public class AsyncSpscWorkerTests {
 	}
 
 	private sealed class PipelineStage : IDisposable {
-		private readonly AsyncSpscWorker<int, PipelineHandler> _worker;
+		private readonly AsyncSpWorker<int, PipelineHandler> _worker;
 
 		public PipelineStage(int capacity, Rec downstream) =>
-			_worker = new AsyncSpscWorker<int, PipelineHandler>(new PipelineHandler(downstream), capacity);
+			_worker = new AsyncSpWorker<int, PipelineHandler>(new PipelineHandler(downstream), capacity);
 
 		public Task Completion => _worker.Completion;
 

@@ -1,13 +1,13 @@
-namespace Nanov.HighPerformance.Threading;
+namespace Nanov.HighPerformance.Threading.Workers;
 
 using System;
 using System.Runtime.CompilerServices;
 using System.Threading;
-using Nanov.HighPerformance.Threading.Internal;
+using Nanov.HighPerformance.Threading.Workers.Internal;
 
 /// <summary>
-///   Async twin of <see cref="SpscWorker{T, THandler}" />: <typeparamref name="THandler" />
-///   implements <see cref="IAsyncSpscHandler{T}" /> whose <c>HandleAsync</c> returns a ValueTask.
+///   Async twin of <see cref="SpWorker{T, THandler}" />: <typeparamref name="THandler" />
+///   implements <see cref="IAsyncWorkerHandler{T}" /> whose <c>HandleAsync</c> returns a ValueTask.
 ///   Runs on a dedicated thread with synchronous waits for items (zero alloc). For sync-completing
 ///   HandleAsync, entirely synchronous (zero overhead). For truly async HandleAsync, the dedicated
 ///   thread blocks on the ValueTask via its awaiter — the handler's internal async continuations run
@@ -15,17 +15,17 @@ using Nanov.HighPerformance.Threading.Internal;
 ///   risk from blocking. Suitable for bounded worker pools (dozens of workers); not for thousands of
 ///   concurrent handlers — for that, use a ThreadPool-based async loop.
 /// </summary>
-public sealed class AsyncSpscWorker<T, THandler> : IDisposable, ISpscWorkerQueue
-	where THandler : struct, IAsyncSpscHandler<T> {
-	private readonly SpscRingCore<T> _core;
+public sealed class AsyncSpWorker<T, THandler> : IDisposable, IWorkerQueue
+	where THandler : struct, IAsyncWorkerHandler<T> {
+	private readonly SpRingCore<T> _core;
 	private readonly ManualResetEventSlim _processDoneEvt = new(false);
 	private readonly Action _onProcessComplete; // bound to _processDoneEvt.Set — one alloc per worker
 	private THandler _handler; // mutable struct — calls go through this field so state persists
 
-	public AsyncSpscWorker(THandler handler, int capacity, string? threadName = null) {
+	public AsyncSpWorker(THandler handler, int capacity, string? threadName = null) {
 		_handler = handler;
 		_onProcessComplete = _processDoneEvt.Set;
-		_core = new SpscRingCore<T>(capacity, threadName ?? $"AsyncSpscWorker<{typeof(T).Name}>", RunLoop);
+		_core = new SpRingCore<T>(capacity, threadName ?? $"AsyncSpWorker<{typeof(T).Name}>", RunLoop);
 	}
 
 	/// <summary>Completes when the worker has drained and exited.</summary>

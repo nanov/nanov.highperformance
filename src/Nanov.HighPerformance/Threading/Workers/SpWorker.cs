@@ -1,29 +1,29 @@
-namespace Nanov.HighPerformance.Threading;
+namespace Nanov.HighPerformance.Threading.Workers;
 
 using System;
 using System.Runtime.CompilerServices;
 using System.Threading;
-using Nanov.HighPerformance.Threading.Internal;
+using Nanov.HighPerformance.Threading.Workers.Internal;
 
 /// <summary>
 ///   Single-producer / single-consumer buffered worker with zero per-message allocation.
 ///   - Producer calls <see cref="Dispatch" /> on its own thread; blocks if the buffer is full.
 ///   - A dedicated worker thread invokes <typeparamref name="THandler" />'s <c>Handle</c> for each
 ///     item in order. The handler is a <see langword="struct" /> constrained to
-///     <see cref="ISpscHandler{T}" />, so its calls devirtualize and inline — no virtual dispatch
+///     <see cref="IWorkerHandler{T}" />, so its calls devirtualize and inline — no virtual dispatch
 ///     on the hot path.
 ///   - Backpressure via user-mode / kernel fallback <see cref="ManualResetEventSlim" /> waits — no
 ///     heap allocations per message.
-///   For zero-copy over large structs use <see cref="ValueSpscWorker{T, THandler}" /> instead.
+///   For zero-copy over large structs use <see cref="ValueSpWorker{T, THandler}" /> instead.
 /// </summary>
-public sealed class SpscWorker<T, THandler> : IDisposable, ISpscWorkerQueue
-	where THandler : struct, ISpscHandler<T> {
-	private readonly SpscRingCore<T> _core;
+public sealed class SpWorker<T, THandler> : IDisposable, IWorkerQueue
+	where THandler : struct, IWorkerHandler<T> {
+	private readonly SpRingCore<T> _core;
 	private THandler _handler; // mutable struct — calls go through this field so state persists
 
-	public SpscWorker(THandler handler, int capacity, string? threadName = null) {
+	public SpWorker(THandler handler, int capacity, string? threadName = null) {
 		_handler = handler;
-		_core = new SpscRingCore<T>(capacity, threadName ?? $"SpscWorker<{typeof(T).Name}>", RunLoop);
+		_core = new SpRingCore<T>(capacity, threadName ?? $"SpWorker<{typeof(T).Name}>", RunLoop);
 	}
 
 	/// <summary>Completes when the worker has drained and exited (after Complete() or Dispose()).</summary>

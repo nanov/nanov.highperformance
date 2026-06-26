@@ -1,12 +1,12 @@
-namespace Nanov.HighPerformance.Threading;
+namespace Nanov.HighPerformance.Threading.Workers;
 
 using System;
 using System.Runtime.CompilerServices;
-using Nanov.HighPerformance.Threading.Internal;
+using Nanov.HighPerformance.Threading.Workers.Internal;
 
 /// <summary>
 ///   In-flight publish handle for a value-type SPSC worker (returned by <c>Publish()</c> on
-///   <see cref="ValueSpscWorker{T, THandler}" /> / <see cref="AsyncValueSpscWorker{T, THandler}" />).
+///   <see cref="ValueSpWorker{T, THandler}" /> / <see cref="AsyncValueSpWorker{T, THandler}" />).
 ///   Non-<see cref="IDisposable" /> on purpose — the C# pattern-based <c>using</c> picks up the public
 ///   <see cref="Dispose" /> by name. Don't stash, don't return, don't escape — the scope must fall out
 ///   of its <c>using</c> block in the same stack frame it was claimed in, or the slot will never
@@ -17,10 +17,10 @@ using Nanov.HighPerformance.Threading.Internal;
 ///   </para>
 /// </summary>
 public readonly ref struct PublishScope<T> where T : struct {
-	private readonly SpscRingCore<T>? _core;
+	private readonly SpRingCore<T>? _core;
 	private readonly int _tail;
 
-	internal PublishScope(SpscRingCore<T> core, int tail) {
+	internal PublishScope(SpRingCore<T> core, int tail) {
 		_core = core;
 		_tail = tail;
 	}
@@ -50,10 +50,10 @@ public readonly ref struct PublishScope<T> where T : struct {
 ///   the worker loop's <c>finally</c> does as a safety net. <see cref="Release" /> is idempotent.
 /// </summary>
 public ref struct HandleScope<T> where T : struct {
-	private readonly SpscRingCore<T> _core;
+	private readonly SpRingCore<T> _core;
 	private readonly int _head;
 
-	internal HandleScope(SpscRingCore<T> core, int head) {
+	internal HandleScope(SpRingCore<T> core, int head) {
 		_core = core;
 		_head = head;
 		IsReleased = false;

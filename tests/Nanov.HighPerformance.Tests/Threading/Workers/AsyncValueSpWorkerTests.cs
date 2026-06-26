@@ -1,11 +1,11 @@
-namespace Nanov.HighPerformance.Tests.Threading;
+namespace Nanov.HighPerformance.Tests.Threading.Workers;
 
 using System.Linq;
-using Nanov.HighPerformance.Threading;
+using Nanov.HighPerformance.Threading.Workers;
 using NUnit.Framework;
 
 [TestFixture]
-public class AsyncValueSpscWorkerTests {
+public class AsyncValueSpWorkerTests {
 	// --- Smoke --------------------------------------------------------------------
 
 	[Test]
@@ -187,7 +187,7 @@ public class AsyncValueSpscWorkerTests {
 
 	// --- Edge-triggered signaling regression guards -------------------------------
 
-	// Regression guard for the edge-triggered ring signaling (see ValueSpscWorkerBase SIGNALING
+	// Regression guard for the edge-triggered ring signaling (see ValueSpWorkerBase SIGNALING
 	// INVARIANT). Tiny capacity maximizes empty↔non-empty / full↔non-full transitions; sync-completing
 	// handler. A dropped wakeup surfaces as a timeout (stall watchdog), not a wrong value.
 	[TestCase(1)]
@@ -313,7 +313,7 @@ public class AsyncValueSpscWorkerTests {
 
 	// Read the slot + Release synchronously, then return a ValueTask from the nested async helper — a ref
 	// struct scope can't cross an await, so HandleAsync itself must NOT be async.
-	private readonly struct RecordingHandler : IAsyncValueSpscHandler<int> {
+	private readonly struct RecordingHandler : IAsyncValueWorkerHandler<int> {
 		private readonly RecordingState _state;
 		private readonly Func<int, Task>? _asyncTail; // invoked AFTER Release, returned as ValueTask
 		private readonly bool _releaseEarly;
@@ -354,12 +354,12 @@ public class AsyncValueSpscWorkerTests {
 
 	// Thin harness mirroring the old Recording surface so the test bodies stay close to the original.
 	private sealed class Rec : IDisposable {
-		private readonly AsyncValueSpscWorker<int, RecordingHandler> _worker;
+		private readonly AsyncValueSpWorker<int, RecordingHandler> _worker;
 		private readonly RecordingState _state = new();
 
 		public Rec(int capacity, Func<int, Task>? asyncTail = null, bool releaseEarly = true,
 			bool throwOnProcess = false) =>
-			_worker = new AsyncValueSpscWorker<int, RecordingHandler>(
+			_worker = new AsyncValueSpWorker<int, RecordingHandler>(
 				new RecordingHandler(_state, asyncTail, releaseEarly, throwOnProcess), capacity);
 
 		public List<int> Processed => _state.Processed;

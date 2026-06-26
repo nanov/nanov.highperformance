@@ -1,4 +1,4 @@
-namespace Nanov.HighPerformance.Threading.Internal;
+namespace Nanov.HighPerformance.Threading.Workers.Internal;
 
 using System;
 using System.Numerics;
@@ -33,7 +33,7 @@ using System.Threading;
 ///     worker thread, breaks this and hangs silently.
 ///   </para>
 /// </summary>
-internal sealed class SpscRingCore<T> : IDisposable {
+internal sealed class SpRingCore<T> : IDisposable {
 	/// <summary>
 	///   SpinWait iterations before falling back to manual reset event wait.
 	///   Reduces syscall overhead for bursty traffic at the cost of CPU during idle.
@@ -54,7 +54,7 @@ internal sealed class SpscRingCore<T> : IDisposable {
 	private volatile bool _stop; // hard stop (Dispose / cancel) — drop remaining
 	private int _tail; // producer index (dispatching thread)
 
-	internal SpscRingCore(int capacity, string threadName, ThreadStart runLoop) {
+	internal SpRingCore(int capacity, string threadName, ThreadStart runLoop) {
 		capacity = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(capacity, 1));
 		_buffer = new T[capacity];
 		_mask = capacity - 1;
@@ -72,7 +72,7 @@ internal sealed class SpscRingCore<T> : IDisposable {
 	internal void Start(CancellationToken ct) {
 		_ct = ct;
 		if (ct.CanBeCanceled)
-			_ctRegistration = ct.Register(static s => ((SpscRingCore<T>)s!).OnCancel(), this);
+			_ctRegistration = ct.Register(static s => ((SpRingCore<T>)s!).OnCancel(), this);
 		_thread.Start();
 	}
 

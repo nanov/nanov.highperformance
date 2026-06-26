@@ -1,4 +1,4 @@
-namespace Nanov.HighPerformance.Tests.Threading;
+namespace Nanov.HighPerformance.Tests.Threading.Workers;
 
 using System.Diagnostics;
 
