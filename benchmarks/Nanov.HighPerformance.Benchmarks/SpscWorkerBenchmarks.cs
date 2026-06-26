@@ -14,7 +14,7 @@ using Nanov.HighPerformance.Threading;
 /// </summary>
 [MemoryDiagnoser]
 public class SpscWorkerBenchmarks {
-	private const int Capacity = 1024;
+	private const int Capacity = 24;
 
 	[Params(1_000_000)]
 	public int ItemCount;

@@ -1,4 +1,4 @@
-namespace Nanov.HighPerformance.Threading;
+namespace Nanov.HighPerformance.Threading.Internal;
 
 using System;
 using System.Numerics;
@@ -6,20 +6,18 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 
 /// <summary>
-///   Core single-producer / single-consumer ring buffer shared by the whole SPSC worker family: the
-///   power-of-two ring, the edge-triggered wake events, the dedicated worker thread, the lifecycle
-///   (<see cref="Start" />/<see cref="Dispose" />/<see cref="TryComplete" />/cancellation/completion),
-///   and the producer/consumer wait + signal primitives. It is deliberately access-agnostic — the
-///   copy-based family (<see cref="SpscWorkerBase{T}" />: <c>Dispatch</c> / <c>TryDequeue(out T)</c>)
-///   and the zero-copy scope-based family (<see cref="ValueSpscWorkerBase{T}" />: <c>Publish</c> /
-///   <c>TryDequeue(out HandleScope&lt;T&gt;)</c>) layer their own slot-access API on top.
+///   Internal single-producer / single-consumer ring buffer core, shared (by composition) across the
+///   whole SPSC worker family: the power-of-two ring, the edge-triggered wake events, the dedicated
+///   worker thread, the lifecycle (<see cref="Start" />/<see cref="Dispose" />/<see cref="TryComplete" />/
+///   cancellation/completion), and the producer/consumer wait + signal primitives. The public workers
+///   own one of these and forward to it; the public scopes hold one to reach the slot. Not part of the
+///   public API.
 ///   <para>
 ///     The producer/consumer FAST paths (the empty/full index checks, slot write/read, and the
-///     edge-triggered <c>Set()</c>) stay inlined in the leaf access methods via
-///     <see cref="TryReserve" /> / <see cref="TryClaim" /> / <see cref="CommitTail" /> /
-///     <see cref="AdvanceHead" />; only the COLD parking loops (<c>WaitForSpaceSlow</c> /
-///     <c>WaitForItemSlow</c>) are out-of-line (<see cref="MethodImplOptions.NoInlining" />), keeping
-///     the hot frame tight.
+///     edge-triggered <c>Set()</c>) are <see cref="MethodImplOptions.AggressiveInlining" /> so they
+///     inline into the callers' hot loops; only the COLD parking loops
+///     (<see cref="WaitForSpaceSlow" />/<see cref="WaitForItemSlow" />) are
+///     <see cref="MethodImplOptions.NoInlining" />, keeping the hot frame tight.
 ///   </para>
 ///   <para>
 ///     SIGNALING INVARIANT (strict SPSC). Exactly one producer thread reserves+commits slots; the
@@ -35,7 +33,7 @@ using System.Threading;
 ///     worker thread, breaks this and hangs silently.
 ///   </para>
 /// </summary>
-public abstract class SpscRingBase<T> : IDisposable, ISpscWorkerQueue {
+internal sealed class SpscRingCore<T> : IDisposable {
 	/// <summary>
 	///   SpinWait iterations before falling back to manual reset event wait.
 	///   Reduces syscall overhead for bursty traffic at the cost of CPU during idle.
@@ -52,36 +50,62 @@ public abstract class SpscRingBase<T> : IDisposable, ISpscWorkerQueue {
 	private Exception? _completeException;
 	private CancellationToken _ct;
 	private CancellationTokenRegistration _ctRegistration;
-	internal int _head; // consumer index (worker thread)
+	private int _head; // consumer index (worker thread)
 	private volatile bool _stop; // hard stop (Dispose / cancel) — drop remaining
-	internal int _tail; // producer index (dispatching thread)
+	private int _tail; // producer index (dispatching thread)
 
-	private protected SpscRingBase(int capacity, string? threadName, string defaultThreadName) {
+	internal SpscRingCore(int capacity, string threadName, ThreadStart runLoop) {
 		capacity = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(capacity, 1));
 		_buffer = new T[capacity];
 		_mask = capacity - 1;
-		_thread = new Thread(RunLoop) {
+		_thread = new Thread(runLoop) {
 			IsBackground = true,
-			Name = threadName ?? defaultThreadName
+			Name = threadName
 		};
 	}
 
-	/// <summary>Completes when the worker has drained and exited (after Complete() or Dispose()).</summary>
-	public Task Completion => _completionTcs.Task;
+	internal Task Completion => _completionTcs.Task;
+	internal int QueuedApprox => _tail - _head;
+	internal int Capacity => _buffer.Length;
+	internal CancellationToken CancellationToken => _ct;
 
-	/// <summary>Approximate items currently queued (<c>Tail − Head</c>). Lock-free, racy by a few.</summary>
-	public int QueuedApprox => _tail - _head;
+	internal void Start(CancellationToken ct) {
+		_ct = ct;
+		if (ct.CanBeCanceled)
+			_ctRegistration = ct.Register(static s => ((SpscRingCore<T>)s!).OnCancel(), this);
+		_thread.Start();
+	}
 
-	/// <summary>Ring capacity (rounded up to a power of two).</summary>
-	public int Capacity => _buffer.Length;
+	private void OnCancel() {
+		_stop = true;
+		_itemEvt.Set();
+		_spaceEvt.Set();
+	}
 
-	/// <summary>
-	///   Token captured at <see cref="Start" /> time. Subclasses pass it to work that accepts
-	///   cancellation so hard-stop requests abort in-progress work.
-	/// </summary>
-	protected CancellationToken CancellationToken => _ct;
+	internal bool TryComplete(Exception? exception) {
+		if (_completed) return false;
+		_completeException = exception;
+		_completed = true;
+		_itemEvt.Set();
+		return true;
+	}
 
-	public virtual void Dispose() {
+	/// <summary>The exception to complete with: the explicit one, else cancellation, else null.</summary>
+	internal Exception? CompletionException() =>
+		_completeException ?? (_ct.IsCancellationRequested ? new OperationCanceledException(_ct) : null);
+
+	/// <summary>Resolve the completion task and tear down the cancellation registration. Call once, on exit.</summary>
+	internal void SetCompletion(Exception? exception) {
+		if (exception is OperationCanceledException)
+			_completionTcs.TrySetCanceled(_ct);
+		else if (exception is not null)
+			_completionTcs.TrySetException(exception);
+		else
+			_completionTcs.TrySetResult();
+		_ctRegistration.Dispose();
+	}
+
+	public void Dispose() {
 		if (_stop) return;
 		_stop = true;
 		// Wake up both sides so they observe _stop and exit.
@@ -100,84 +124,24 @@ public abstract class SpscRingBase<T> : IDisposable, ISpscWorkerQueue {
 	}
 
 	/// <summary>
-	///   Start the worker thread. Optionally pass a CancellationToken — when cancelled,
-	///   the worker stops immediately (drops pending items) and <see cref="Completion" />
-	///   resolves with an <see cref="OperationCanceledException" />.
-	/// </summary>
-	public void Start(CancellationToken ct = default) {
-		_ct = ct;
-		if (ct.CanBeCanceled)
-			_ctRegistration = ct.Register(static s => ((SpscRingBase<T>)s!).OnCancel(), this);
-		_thread.Start();
-	}
-
-	private void OnCancel() {
-		_stop = true;
-		_itemEvt.Set();
-		_spaceEvt.Set();
-	}
-
-	/// <summary>
-	///   Signal that no more items will be dispatched. The worker drains remaining items
-	///   and then exits. Optionally pass an exception — if non-null, <see cref="Completion" />
-	///   resolves faulted with it; otherwise it resolves normally.
-	///   Returns true on first call, false if already completed.
-	/// </summary>
-	public bool TryComplete(Exception? exception = null) {
-		if (_completed) return false;
-		_completeException = exception;
-		_completed = true;
-		_itemEvt.Set();
-		return true;
-	}
-
-	/// <summary>
-	///   The dedicated worker thread's entry point. Each leaf drains the ring here (claiming via
-	///   <see cref="TryClaim" />, dispatching its struct handler per item), and on exit calls the
-	///   handler's completion hook and resolves <see cref="Completion" /> via <see cref="SetCompletion" />.
-	/// </summary>
-	protected abstract void RunLoop();
-
-	/// <summary>The exception to complete with: the explicit one, else cancellation, else null.</summary>
-	protected Exception? CompletionException() =>
-		_completeException ?? (_ct.IsCancellationRequested ? new OperationCanceledException(_ct) : null);
-
-	/// <summary>Resolve <see cref="Completion" /> and tear down the cancellation registration. Call once, on exit.</summary>
-	protected void SetCompletion(Exception? exception) {
-		if (exception is OperationCanceledException)
-			_completionTcs.TrySetCanceled(_ct);
-		else if (exception is not null)
-			_completionTcs.TrySetException(exception);
-		else
-			_completionTcs.TrySetResult();
-		_ctRegistration.Dispose();
-	}
-
-	/// <summary>
 	///   Producer reservation. Fast-path inline fullness check; parks on the cold path. Returns false
-	///   if the worker is no longer accepting (completed/disposed). On true, the next slot to write is
-	///   <c>_buffer[_tail &amp; _mask]</c>; the caller writes it then calls <see cref="CommitTail" />.
+	///   if the worker is no longer accepting. On true, <paramref name="tail" /> is the index to write
+	///   (<c>_buffer[tail &amp; _mask]</c>); the caller writes it then calls <see cref="CommitTail" />.
 	/// </summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	private protected bool TryReserve() {
-		if (_completed || _stop) return false;
-		if (_tail - Volatile.Read(ref _head) == _buffer.Length)
-			return WaitForSpaceSlow();
-		return true;
-	}
-
-	/// <summary>
-	///   Consumer claim. Fast-path inline emptiness check; parks on the cold path. Returns false to
-	///   exit the loop — hard stop (drops queued items) or soft complete with the ring drained. On
-	///   true, the next item is at <c>_buffer[_head &amp; _mask]</c>.
-	/// </summary>
-	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	private protected bool TryClaim() {
-		if (_head == Volatile.Read(ref _tail) && !WaitForItemSlow())
+	internal bool TryReserve(out int tail) {
+		if (_completed || _stop) {
+			tail = 0;
 			return false;
-		// Hard stop drops items still in the ring; soft complete drains them (WaitForItemSlow exits
-		// above only once the ring is empty).
-		return !_stop;
+		}
+
+		if (_tail - Volatile.Read(ref _head) == _buffer.Length && !WaitForSpaceSlow()) {
+			tail = 0;
+			return false;
+		}
+
+		tail = _tail;
+		return true;
 	}
 
 	/// <summary>Publish the slot at <paramref name="tail" /> and edge-signal the consumer.</summary>
@@ -190,6 +154,38 @@ public abstract class SpscRingBase<T> : IDisposable, ISpscWorkerQueue {
 			_itemEvt.Set();
 	}
 
+	/// <summary>Reserve + write + commit in one shot (copy-based producers). False if not accepting.</summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal bool TryEnqueue(T item) {
+		if (!TryReserve(out var tail)) return false;
+		_buffer[tail & _mask] = item;
+		CommitTail(tail);
+		return true;
+	}
+
+	/// <summary>
+	///   Consumer claim. Fast-path inline emptiness check; parks on the cold path. Returns false to
+	///   exit the loop — hard stop (drops queued items) or soft complete with the ring drained. On
+	///   true, <paramref name="head" /> is the next item's index (<c>_buffer[head &amp; _mask]</c>).
+	/// </summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal bool TryClaim(out int head) {
+		if (_head == Volatile.Read(ref _tail) && !WaitForItemSlow()) {
+			head = 0;
+			return false;
+		}
+
+		// Hard stop drops items still in the ring; soft complete drains them (WaitForItemSlow exits
+		// above only once the ring is empty).
+		if (_stop) {
+			head = 0;
+			return false;
+		}
+
+		head = _head;
+		return true;
+	}
+
 	/// <summary>Release the slot at <paramref name="head" /> and edge-signal a blocked producer.</summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	internal void AdvanceHead(int head) {
@@ -198,6 +194,21 @@ public abstract class SpscRingBase<T> : IDisposable, ISpscWorkerQueue {
 		// full→non-full transition. Safe under SPSC (single producer). See SIGNALING INVARIANT.
 		if (Volatile.Read(ref _tail) - head == _buffer.Length)
 			_spaceEvt.Set();
+	}
+
+	/// <summary>Claim + copy out + clear + advance in one shot (copy-based consumers). False to exit.</summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal bool TryDequeue(out T item) {
+		if (!TryClaim(out var head)) {
+			item = default!;
+			return false;
+		}
+
+		ref var slot = ref _buffer[head & _mask];
+		item = slot;
+		slot = default!;
+		AdvanceHead(head);
+		return true;
 	}
 
 	// Cold path: producer parks until space frees, or the worker stops/completes.

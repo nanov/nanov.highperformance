@@ -1,15 +1,16 @@
 namespace Nanov.HighPerformance.Threading;
 
 using System;
+using System.Runtime.CompilerServices;
 using System.Threading;
-using System.Threading.Tasks;
+using Nanov.HighPerformance.Threading.Internal;
 
 /// <summary>
-///   Async twin of <see cref="ValueSpscWorker{T, THandler}" />. Same scope-based publish/consume
-///   APIs — <see cref="ValueSpscWorkerBase{T}.Publish" /> returns a <see cref="PublishScope{T}" />,
-///   the handler's <c>HandleAsync</c> receives a <see cref="HandleScope{T}" /> by ref — but the
-///   handler can return a <see cref="ValueTask" /> for in-flight async work (see
-///   <see cref="IAsyncValueSpscHandler{T}" /> for the required non-<c>async</c> read-then-release shape).
+///   Async twin of <see cref="ValueSpscWorker{T, THandler}" />. Same scope-based publish/consume APIs
+///   — <see cref="Publish" /> returns a <see cref="PublishScope{T}" />, the handler's <c>HandleAsync</c>
+///   receives a <see cref="HandleScope{T}" /> by ref — but the handler can return a
+///   <see cref="ValueTask" /> for in-flight async work (see <see cref="IAsyncValueSpscHandler{T}" /> for
+///   the required non-<c>async</c> read-then-release shape).
 ///   <para>
 ///     Runs on a dedicated thread with synchronous waits for items (zero alloc). For sync-completing
 ///     ValueTasks, entirely synchronous (zero overhead). For truly async ones, the dedicated thread
@@ -17,29 +18,64 @@ using System.Threading.Tasks;
 ///     thread, so no deadlock risk.
 ///   </para>
 /// </summary>
-public sealed class AsyncValueSpscWorker<T, THandler> : ValueSpscWorkerBase<T>
+public sealed class AsyncValueSpscWorker<T, THandler> : IDisposable, ISpscWorkerQueue
 	where T : struct
 	where THandler : struct, IAsyncValueSpscHandler<T> {
+	private readonly SpscRingCore<T> _core;
 	private readonly Action _onProcessComplete;
 	private readonly ManualResetEventSlim _processDoneEvt = new(false);
 	private THandler _handler; // mutable struct — calls go through this field so state persists
 
-	public AsyncValueSpscWorker(THandler handler, int capacity, string? threadName = null)
-		: base(capacity, threadName, $"AsyncValueSpscWorker<{typeof(T).Name}>") {
+	public AsyncValueSpscWorker(THandler handler, int capacity, string? threadName = null) {
 		_handler = handler;
 		_onProcessComplete = () => _processDoneEvt.Set();
+		_core = new SpscRingCore<T>(capacity, threadName ?? $"AsyncValueSpscWorker<{typeof(T).Name}>", RunLoop);
 	}
 
-	protected override void RunLoop() {
+	/// <summary>Completes when the worker has drained and exited.</summary>
+	public Task Completion => _core.Completion;
+
+	/// <summary>Approximate items currently queued (<c>Tail − Head</c>). Lock-free, racy by a few.</summary>
+	public int QueuedApprox => _core.QueuedApprox;
+
+	/// <summary>Ring capacity (rounded up to a power of two).</summary>
+	public int Capacity => _core.Capacity;
+
+	/// <summary>
+	///   Start the worker thread. Optionally pass a CancellationToken — when cancelled, the worker
+	///   stops immediately (drops pending items) and <see cref="Completion" /> resolves with an
+	///   <see cref="OperationCanceledException" />.
+	/// </summary>
+	public void Start(CancellationToken ct = default) => _core.Start(ct);
+
+	/// <summary>
+	///   Signal that no more items will be dispatched. The worker drains remaining items and then
+	///   exits. Optionally pass an exception — if non-null, <see cref="Completion" /> resolves faulted
+	///   with it. Returns true on first call, false if already completed.
+	/// </summary>
+	public bool TryComplete(Exception? exception = null) => _core.TryComplete(exception);
+
+	/// <summary>
+	///   Claim the next slot for writing. Blocks if the ring is full. The returned
+	///   <see cref="PublishScope{T}" /> exposes a <see langword="ref" /> to the slot through
+	///   <see cref="PublishScope{T}.Event" />; disposing the scope publishes the slot and signals the
+	///   consumer. If the worker is Completed or Disposed, the returned scope is "closed".
+	/// </summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	public PublishScope<T> Publish() {
+		if (!_core.TryReserve(out var tail)) return default;
+		return new PublishScope<T>(_core, tail);
+	}
+
+	private void RunLoop() {
 		try {
-			while (TryDequeue(out var scope)) {
+			while (_core.TryClaim(out var head)) {
+				var scope = new HandleScope<T>(_core, head);
 				try {
 #pragma warning disable CA2012 // advanced ValueTask awaiting; all completion cases are handled
-					var vt = _handler.HandleAsync(ref scope, CancellationToken);
+					var vt = _handler.HandleAsync(ref scope, _core.CancellationToken);
 					var awaiter = vt.GetAwaiter();
 					if (!awaiter.IsCompleted) {
-						// 1:1 rendezvous: exactly one continuation Set() per item, consumed by this Wait();
-						// the Reset() restores the unsignaled precondition for the next item.
 						awaiter.UnsafeOnCompleted(_onProcessComplete);
 						_processDoneEvt.Wait();
 						_processDoneEvt.Reset();
@@ -57,7 +93,7 @@ public sealed class AsyncValueSpscWorker<T, THandler> : ValueSpscWorkerBase<T>
 			}
 		}
 		finally {
-			var ex = CompletionException();
+			var ex = _core.CompletionException();
 			try {
 #pragma warning disable CA2012
 				var vt = _handler.OnCompletedAsync(ex);
@@ -75,12 +111,12 @@ public sealed class AsyncValueSpscWorker<T, THandler> : ValueSpscWorkerBase<T>
 				_handler.OnError(onCompletedEx);
 			}
 
-			SetCompletion(ex);
+			_core.SetCompletion(ex);
 		}
 	}
 
-	public override void Dispose() {
-		base.Dispose();
+	public void Dispose() {
+		_core.Dispose();
 		_processDoneEvt.Dispose();
 	}
 }
