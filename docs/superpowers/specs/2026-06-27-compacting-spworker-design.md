@@ -134,12 +134,23 @@ lifecycle, `WaitForItemSlow`/`WaitForSpaceSlow`, cancel/complete) are copied/ada
 
 ### `CompactingKeyMap<TKey>` (producer-private)
 
-A purpose-built open-addressing, linear-probe map `TKey → int seq`, ArrayPool-backed, modeled on
-Prague's `ValueDictionary` metadata layout but trimmed to a single `int` value (the slot sequence):
+A **purpose-built** open-addressing, linear-probe map `TKey → int seq`, ArrayPool-backed —
+**inspired by** Prague's `ValueDictionary` but not a port (decided: a lean tailored map, not a copy of
+the general-purpose collection).
 
-- `ref int GetSeqRefOrAdd(TKey key, out bool exists)` — get-or-add, returns a writable ref to the seq.
-- `Compact(predicate)` — `Filter`-style O(capacity) compact-and-rebuild that evicts entries whose
-  predicate is false (used to drop stale, already-consumed keys).
+- Layout: `TKey[] _keys` + `int[] _seqs` + `int[] _metadata` (probe slot → entry index), power-of-two
+  mask, `Unsafe.Add` probe loops — i.e. it **mirrors `ValueDictionary`'s proven hot-path structure**
+  (metadata-as-index open addressing, compact-and-rebuild) so we inherit the battle-tested algorithm.
+- Members: `ref int GetSeqRefOrAdd(TKey key, out bool exists)` (get-or-add, writable ref to the seq);
+  `Compact(predicate)` (`Filter`-style O(capacity) compact-and-rebuild evicting entries whose
+  predicate is false → drops stale, already-consumed keys). Nothing else — none of `ValueDictionary`'s
+  `Intersect`/`Crop`/`Sort`/`ExtractValues`/window-slicing surface.
+- Deliberately **not** ported because: we need ~3 of its ~15 members; it uses `Memory<T>` struct
+  fields (house-rule smell) where we use plain arrays + local spans; it requires an `IKeyComparer<TKey>`
+  where we use natural hashing (`IEquatable` + `GetHashCode`); and our value is always `int`. A
+  cross-repo copy would drift anyway, so we own a small tailored map (~120 lines vs ~400).
+- Re-authoring the probe/compact logic means it gets **standalone unit tests** (add/lookup, probe
+  collisions, compaction correctness, zero steady-state alloc).
 - Sized to comfortably exceed ring capacity (at most `capacity` keys are ever pending; stale entries
   are evicted on fill). Touched **only by the producer thread** → no synchronization, single-writer.
 
@@ -150,16 +161,11 @@ Prague's `ValueDictionary` metadata layout but trimmed to a single `int` value (
 ### Reaching `Merge` from the core
 
 The map + conflation logic live in the (THandler-erased) core, so it needs to call back into the
-THandler-typed `Merge`. Two viable structures, decided at implementation:
-- **Trampoline (consistent with the codebase):** a `MergeInvoker<TValue>` struct holding the worker as
-  `object` + a `delegate*` to a static trampoline that `Unsafe.As`-es it back to the closed worker and
-  calls `_handler.Merge` — exactly the `SlotCleaner<T>` pattern. One indirect call, but only on a
-  conflation *hit*.
-- **Worker-hosted (fully devirtualized):** keep the conflation routine in the generic worker (direct
-  `_handler.Merge` struct call) and have the core expose the needed primitives (`GetSeqRefOrAdd`,
-  slot ref, `pending`, `TryReserve`/`CommitTail`).
-Lean: start with the trampoline for cohesion (mirrors `SlotCleaner`); revisit if the indirect call
-shows up on the conflation-hit path in benchmarks.
+THandler-typed `Merge`. **Decided: trampoline** (mirrors the existing `SlotCleaner<T>` pattern) — a
+`MergeInvoker<TValue>` struct holding the worker as `object` + a `delegate*` to a static trampoline
+that `Unsafe.As`-es it back to the closed worker and calls `_handler.Merge`. One indirect call, but
+only on a conflation *hit* (not on fresh enqueues). Revisit only if benchmarks show it on the
+conflation-hit path; the worker-hosted fully-devirtualized alternative stays in reserve.
 
 ## Dispatch protocol (producer) — the crux
 
