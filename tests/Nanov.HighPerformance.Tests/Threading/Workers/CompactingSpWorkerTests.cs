@@ -1,6 +1,7 @@
 namespace Nanov.HighPerformance.Tests.Threading.Workers;
 
 using System.Linq;
+using System.Runtime.CompilerServices;
 using Nanov.HighPerformance.Threading.Workers;
 using NUnit.Framework;
 
@@ -486,5 +487,203 @@ public class CompactingSpWorkerTests {
 		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => CountOf(w), n);
 		Assert.That(w.Processed, Has.Count.EqualTo(n));
 		Assert.That(w.Processed.Select(p => p.Key), Is.EqualTo(Enumerable.Range(0, n)));
+	}
+
+	// Gap 1: a combine merge (fresh result) must Discard BOTH inputs — current and incoming — since
+	// neither is the returned value. Consumer parked → clean trust path → deterministic.
+	[Test]
+	public void Combine_Merge_Discards_Both_Inputs() {
+		var entered = new ManualResetEventSlim(false);
+		var gate = new ManualResetEventSlim(false);
+		var state = new RecordingState();
+		using var w = new CompactingSpWorker<int, Boxed, SumHandler>(new SumHandler(state, entered, gate), 16);
+		w.Start();
+
+		Assert.That(w.Dispatch(0, new Boxed(0)), Is.True); // blocks consumer
+		Assert.That(entered.Wait(2000), Is.True);
+		Assert.That(w.Dispatch(7, new Boxed(10)), Is.True); // fresh
+		Assert.That(w.Dispatch(7, new Boxed(5)), Is.True);  // merge(10,5)=15 → discard 10 and 5
+		Assert.That(w.Dispatch(7, new Boxed(1)), Is.True);  // merge(15,1)=16 → discard 15 and 1
+
+		gate.Set();
+		w.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => { lock (state.Processed) return state.Processed.Count; }, 2);
+
+		// Every input + intermediate result is discarded except the final survivor (16, delivered).
+		Assert.That(state.Discarded, Is.EquivalentTo(new[] { 10, 5, 15, 1 }));
+		Assert.That(state.Processed, Does.Contain((7, 16)));
+	}
+
+	// Gap 2: keep-existing merge (return current) must Discard the incoming (the dropped input).
+	[Test]
+	public void KeepExisting_Merge_Discards_Incoming() {
+		var entered = new ManualResetEventSlim(false);
+		var gate = new ManualResetEventSlim(false);
+		var state = new RecordingState();
+		using var w = new CompactingSpWorker<int, Boxed, KeepFirstHandler>(new KeepFirstHandler(state, entered, gate), 16);
+		w.Start();
+
+		Assert.That(w.Dispatch(0, new Boxed(0)), Is.True); // blocks consumer
+		Assert.That(entered.Wait(2000), Is.True);
+		Assert.That(w.Dispatch(7, new Boxed(100)), Is.True); // fresh (the kept value)
+		Assert.That(w.Dispatch(7, new Boxed(5)), Is.True);   // return current → discard incoming 5
+		Assert.That(w.Dispatch(7, new Boxed(1)), Is.True);   // return current → discard incoming 1
+
+		gate.Set();
+		w.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => { lock (state.Processed) return state.Processed.Count; }, 2);
+
+		Assert.That(state.Discarded, Is.EquivalentTo(new[] { 5, 1 }), "incoming values are dropped, current is kept");
+		Assert.That(state.Processed, Does.Contain((7, 100)), "the first (kept) value is delivered");
+	}
+
+	// keep-existing handler: Merge returns current (ignore incoming).
+	private readonly struct KeepFirstHandler : ICompactingWorkerHandler<int, Boxed> {
+		private readonly RecordingState _state;
+		private readonly ManualResetEventSlim _entered;
+		private readonly ManualResetEventSlim _gate;
+
+		public KeepFirstHandler(RecordingState state, ManualResetEventSlim entered, ManualResetEventSlim gate) {
+			_state = state;
+			_entered = entered;
+			_gate = gate;
+		}
+
+		public Boxed Merge(Boxed current, Boxed incoming) => current;
+
+		public void Discarded(Boxed value) {
+			lock (_state.Discarded) _state.Discarded.Add(value.Value);
+		}
+
+		public void Handle(int key, Boxed value) {
+			if (key == 0) {
+				_entered.Set();
+				_gate.Wait();
+			}
+
+			lock (_state.Processed) _state.Processed.Add((key, value.Value));
+		}
+
+		public void OnError(Exception error) {
+			lock (_state.Errors) _state.Errors.Add(error);
+		}
+
+		public void OnCompleted(Exception? error) {
+			lock (_state.CompletedWith) _state.CompletedWith.Add(error);
+		}
+	}
+
+	// Gap 3: a drained reference value must be cleared from its ring slot so it's collectable (no pin).
+	[Test]
+	public void Ref_Value_Slots_Are_Cleared_After_Drain() {
+		var w = new CompactingSpWorker<int, object, NoopObjHandler>(new NoopObjHandler(), 8);
+		w.Start();
+
+		var weak = DispatchTransient(w);
+		w.TryComplete();
+		Assert.That(w.Completion.Wait(2000), Is.True);
+
+		GC.Collect();
+		GC.WaitForPendingFinalizers();
+		GC.Collect();
+
+		Assert.That(weak.TryGetTarget(out _), Is.False, "drained value slot must be cleared so the item is collectable");
+		GC.KeepAlive(w); // keep the ring alive: proves the SLOT was cleared, not just the worker freed
+		w.Dispose();
+	}
+
+	// Object created + dispatched in a non-inlined frame so the only strong reference is the ring slot.
+	[MethodImpl(MethodImplOptions.NoInlining)]
+	private static WeakReference<object> DispatchTransient(CompactingSpWorker<int, object, NoopObjHandler> w) {
+		var obj = new object();
+		var weak = new WeakReference<object>(obj);
+		Assert.That(w.Dispatch(1, obj), Is.True);
+		return weak;
+	}
+
+	private readonly struct NoopObjHandler : ICompactingWorkerHandler<int, object> {
+		public object Merge(object current, object incoming) => incoming;
+		public void Discarded(object value) { }
+		public void Handle(int key, object value) { }
+		public void OnError(Exception error) { }
+		public void OnCompleted(Exception? error) { }
+	}
+
+	// Gap 4: Dispatch after Dispose returns false.
+	[Test]
+	public void Dispatch_After_Dispose_Returns_False() {
+		var w = new Rec(8);
+		w.Start();
+		w.Dispose();
+		Assert.That(w.Dispatch(42, 1), Is.False);
+	}
+
+	// Gap 5: TryComplete(exception) faults Completion and OnCompleted receives the exception.
+	[Test]
+	public void TryComplete_With_Exception_Faults_Completion() {
+		using var w = new Rec(8);
+		w.Start();
+		w.Dispatch(1, 1);
+		var err = new InvalidOperationException("boom");
+		Assert.That(w.TryComplete(err), Is.True);
+
+		var agg = Assert.Throws<AggregateException>(() => w.Completion.Wait(2000));
+		Assert.That(agg!.InnerException, Is.InstanceOf<InvalidOperationException>());
+		Assert.That(w.CompletedWith, Has.Count.EqualTo(1));
+		Assert.That(w.CompletedWith[0], Is.SameAs(err));
+	}
+
+	// Gap 6: reference-type keys conflate by value-equality (distinct string instance, equal value).
+	[Test]
+	public void Reference_Type_Keys_Conflate_By_Value_Equality() {
+		var entered = new ManualResetEventSlim(false);
+		var gate = new ManualResetEventSlim(false);
+		var state = new StrState();
+		using var w = new CompactingSpWorker<string, Boxed, StrHandler>(new StrHandler(state, entered, gate), 16);
+		w.Start();
+
+		Assert.That(w.Dispatch("k0", new Boxed(0)), Is.True); // blocks consumer
+		Assert.That(entered.Wait(2000), Is.True);
+		Assert.That(w.Dispatch("a", new Boxed(1)), Is.True);
+		Assert.That(w.Dispatch("b", new Boxed(2)), Is.True);
+		// Distinct string instance, equal value — must conflate with "a" via Equals, not reference identity.
+		Assert.That(w.Dispatch(new string('a', 1), new Boxed(3)), Is.True);
+
+		gate.Set();
+		w.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => { lock (state.Processed) return state.Processed.Count; }, 3);
+
+		Assert.That(state.Processed, Is.EqualTo(new[] { ("k0", 0), ("a", 3), ("b", 2) }));
+	}
+
+	private sealed class StrState {
+		public readonly List<(string Key, int Value)> Processed = new();
+	}
+
+	private readonly struct StrHandler : ICompactingWorkerHandler<string, Boxed> {
+		private readonly StrState _state;
+		private readonly ManualResetEventSlim _entered;
+		private readonly ManualResetEventSlim _gate;
+
+		public StrHandler(StrState state, ManualResetEventSlim entered, ManualResetEventSlim gate) {
+			_state = state;
+			_entered = entered;
+			_gate = gate;
+		}
+
+		public Boxed Merge(Boxed current, Boxed incoming) => incoming;
+		public void Discarded(Boxed value) { }
+
+		public void Handle(string key, Boxed value) {
+			if (key == "k0") {
+				_entered.Set();
+				_gate.Wait();
+			}
+
+			lock (_state.Processed) _state.Processed.Add((key, value.Value));
+		}
+
+		public void OnError(Exception error) { }
+		public void OnCompleted(Exception? error) { }
 	}
 }
