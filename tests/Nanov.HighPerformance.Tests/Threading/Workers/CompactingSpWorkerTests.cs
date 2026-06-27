@@ -237,4 +237,130 @@ public class CompactingSpWorkerTests {
 		w.Dispose();
 		Assert.DoesNotThrow(() => w.Dispose());
 	}
+
+	// Distinct-key flood with a stall watchdog — a dropped wakeup plateaus progress and fails fast.
+	[Test]
+	public async Task Distinct_Key_Flood_Preserves_Order() {
+		using var w = new Rec(16);
+		w.Start();
+		const int n = 10_000;
+		await Task.Run(() => {
+			for (var i = 0; i < n; i++) w.Dispatch(i, i);
+		});
+		w.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => CountOf(w), n);
+		Assert.That(w.Processed.Select(p => p.Key), Is.EqualTo(Enumerable.Range(0, n)));
+		Assert.That(w.Processed.All(p => p.Value == p.Key), Is.True);
+	}
+
+	// Lost-update / lost-wakeup stress: a small key space heavily re-dispatched against a slightly slow
+	// consumer maximizes the in-place-override race. Guarantee: for every key, the LAST value dispatched
+	// is delivered at some point (latest-wins merge). Watchdog catches a hang from a dropped wakeup.
+	[TestCase(1)]
+	[TestCase(2)]
+	[TestCase(8)]
+	public async Task Conflation_Stress_Delivers_Latest_Per_Key(int capacity) {
+		using var w = new Rec(capacity, hook: _ => Thread.SpinWait(50));
+		w.Start();
+
+		const int keys = 4;
+		const int rounds = 30_000;
+		var lastSent = new int[keys];
+		await Task.Run(() => {
+			for (var r = 0; r < rounds; r++) {
+				var k = r % keys;
+				var v = r;
+				lastSent[k] = v;
+				while (!w.Dispatch(k, v)) { } // single producer
+			}
+		});
+		w.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => CountOf(w), keys); // at least one per key
+
+		// For each key, the final delivered value must equal the last value we sent for that key.
+		var lastSeen = new Dictionary<int, int>();
+		lock (w.Processed)
+			foreach (var (k, v) in w.Processed)
+				lastSeen[k] = v;
+		for (var k = 0; k < keys; k++) {
+			Assert.That(lastSeen.ContainsKey(k), Is.True, $"key {k} was never delivered");
+			Assert.That(lastSeen[k], Is.EqualTo(lastSent[k]),
+				$"key {k}: last delivered {lastSeen[k]} != last sent {lastSent[k]} (lost update)");
+		}
+	}
+
+	// Backpressure: with capacity distinct keys pending and the consumer gated, a NEW distinct key blocks
+	// until space frees; conflating an EXISTING key never blocks.
+	[Test]
+	public async Task New_Key_Blocks_When_Full_But_Conflation_Does_Not() {
+		var entered = new ManualResetEventSlim(false);
+		var gate = new ManualResetEventSlim(false);
+		using var w = new Rec(2, hook: k => {
+			if (k == 0) {
+				entered.Set();
+				gate.Wait();
+			}
+		});
+		w.Start();
+
+		Assert.That(w.Dispatch(0, 0), Is.True);
+		Assert.That(entered.Wait(2000), Is.True); // head advanced to 1; ring (cap 2) can hold 2 more
+		Assert.That(w.Dispatch(1, 1), Is.True);
+		Assert.That(w.Dispatch(2, 2), Is.True); // ring now full (keys 1,2 pending)
+
+		// Conflating an already-pending key must NOT block.
+		var conflate = Task.Run(() => w.Dispatch(1, 100));
+		Assert.That(conflate.Wait(200), Is.True, "conflation of a pending key must not block");
+		Assert.That(await conflate, Is.True);
+
+		// A NEW distinct key must block until the consumer frees a slot.
+		var blocked = Task.Run(() => w.Dispatch(3, 3));
+		Assert.That(blocked.Wait(50), Is.False, "new key must block when full");
+
+		gate.Set();
+		Assert.That(await blocked, Is.True);
+		w.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => CountOf(w), 4);
+
+		// key 1 delivered its latest (100); key 3 eventually delivered.
+		var lastSeen = new Dictionary<int, int>();
+		lock (w.Processed)
+			foreach (var (k, v) in w.Processed)
+				lastSeen[k] = v;
+		Assert.That(lastSeen[1], Is.EqualTo(100));
+		Assert.That(lastSeen.ContainsKey(3), Is.True);
+	}
+
+	// Deterministic wake of a parked consumer (mirrors SpWorkerTests).
+	[Test]
+	public void Dispatch_Wakes_An_Idle_Parked_Worker() {
+		using var w = new Rec(4);
+		w.Start();
+		Thread.Sleep(150); // exhaust spin budget, park on _itemEvt
+		Assert.That(w.Dispatch(1, 10), Is.True);
+		WorkerTestUtil.AwaitProgress(() => CountOf(w), 1);
+		Thread.Sleep(150);
+		Assert.That(w.Dispatch(2, 20), Is.True);
+		WorkerTestUtil.AwaitProgress(() => CountOf(w), 2);
+		w.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => CountOf(w), 2);
+		Assert.That(w.Processed, Is.EqualTo(new[] { (1, 10), (2, 20) }));
+	}
+
+	// Map eviction: a long flood of one-shot keys must not grow unbounded — the producer compacts. We
+	// can't read the map directly (it's producer-private), so assert the run completes and stays correct
+	// with far more distinct keys than capacity (forces repeated compaction).
+	[Test]
+	public async Task Many_One_Shot_Keys_Force_Compaction_And_Stay_Correct() {
+		using var w = new Rec(8);
+		w.Start();
+		const int n = 100_000;
+		await Task.Run(() => {
+			for (var i = 0; i < n; i++) w.Dispatch(i, i);
+		});
+		w.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => CountOf(w), n);
+		Assert.That(w.Processed, Has.Count.EqualTo(n));
+		Assert.That(w.Processed.Select(p => p.Key), Is.EqualTo(Enumerable.Range(0, n)));
+	}
 }
