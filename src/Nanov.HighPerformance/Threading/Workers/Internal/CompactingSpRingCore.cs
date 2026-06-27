@@ -20,8 +20,10 @@ using System.Threading;
 ///     → read <c>_reading</c> THEN <c>Head</c>. Trust the in-place override (the consumer will
 ///     acquire-read the merged value) unless the consumer has CONSUMED the slot (<c>Head &gt; seq</c>) or
 ///     is MID-READING this exact slot (<c>Head == seq &amp;&amp; _reading</c>); in those cases enqueue a
-///     FRESH slot with the un-merged incoming value (a rare, harmless duplicate under replace-style
-///     merge). Consumer side (<see cref="TryTake" />): set <c>_reading=1</c> → StoreLoad fence → read the
+///     FRESH slot with the un-merged incoming value (a rare, harmless duplicate). This is correct for
+///     LAST-WINS only (incoming wins regardless of what the consumer took); combine/additive merges
+///     cannot be made exactly-once on a ring and belong in a cell-based accumulating worker.
+///     Consumer side (<see cref="TryTake" />): set <c>_reading=1</c> → StoreLoad fence → read the
 ///     value → advance <c>Head</c> → clear <c>_reading=0</c>. The matching fences plus the producer
 ///     reading <c>_reading</c> before <c>Head</c> make it impossible to both read a stale value AND have
 ///     the producer trust the override. The <c>_reading</c> flag is what lets the slot at <c>Head</c>
@@ -164,7 +166,10 @@ internal sealed class CompactingSpRingCore<TKey, TValue, TMerger> : IDisposable
 						_merger.Discarded(value);
 					return true;
 				}
-				// else: consumer consumed or is mid-reading the slot → enqueue the un-merged value fresh (rare dup)
+				// else: consumer consumed or is mid-reading the slot → enqueue the un-merged value fresh.
+				// CORRECT ONLY for last-wins (incoming wins regardless of what was consumed). Combine/additive
+				// merges cannot be made exactly-once here (the consumer may have taken `current`, which `merged`
+				// also contains) — use the cell-based accumulating worker for those.
 			}
 
 			if (!TryReserve(out var tail)) return false;
