@@ -114,15 +114,18 @@ overwritten — conflation keeps the same key, only the value changes.)
 ## Architecture
 
 ```
-CompactingSpWorker<TKey,TValue,THandler>   (public, sealed; owns the core + the struct handler)
+CompactingSpWorker<TKey,TValue,THandler>            (public, sealed facade; forwards to the core)
         │ forwards Dispatch/Start/Complete/Dispose
         ▼
-CompactingSpRingCore<TKey,TValue>          (internal, sibling to SpRingCore — NOT a modification of it)
+CompactingSpRingCore<TKey,TValue,THandler>          (internal sibling to SpRingCore — NOT a mod of it;
+        │                                            generic over THandler → direct devirt handler calls)
+        ├── THandler _handler   (SOLE owner; Merge on the producer path + Handle/OnError/OnCompleted
+        │                        in its own run loop — all direct devirtualized calls, no trampoline)
         ├── TKey[]   _keys      ┐ two parallel ring arrays (power-of-two), so the consumer can
         ├── TValue[] _values    ┘ deliver (key,value) and override touches only _values[seq & mask]
         ├── PaddedIndices _idx  (reused: cache-line-separated Head/Tail, monotonic ints)
         ├── wake events / dedicated thread / lifecycle  (reused shape from SpRingCore)
-        └── CompactingKeyMap<TKey>  _pending   (PRODUCER-THREAD-ONLY: TKey → seq)
+        └── CompactingKeyMap<TKey>  _pending   (PRODUCER-THREAD-ONLY: TKey → int seq)
 ```
 
 Decision — **sibling core, not an extension of `SpRingCore`.** `SpRingCore`'s documented SPSC
@@ -160,12 +163,25 @@ the general-purpose collection).
 
 ### Reaching `Merge` from the core
 
-The map + conflation logic live in the (THandler-erased) core, so it needs to call back into the
-THandler-typed `Merge`. **Decided: trampoline** (mirrors the existing `SlotCleaner<T>` pattern) — a
-`MergeInvoker<TValue>` struct holding the worker as `object` + a `delegate*` to a static trampoline
-that `Unsafe.As`-es it back to the closed worker and calls `_handler.Merge`. One indirect call, but
-only on a conflation *hit* (not on fresh enqueues). Revisit only if benchmarks show it on the
-conflation-hit path; the worker-hosted fully-devirtualized alternative stays in reserve.
+**Decided: make the sibling core generic over `THandler`** (`CompactingSpRingCore<TKey, TValue,
+THandler> where THandler : struct, ICompactingWorkerHandler<TKey, TValue>`). The core holds the
+handler by value and calls `_handler.Merge(current, incoming)` **directly** inside its conflation
+`Dispatch` — a devirtualized, inlinable struct call, **zero indirection and no `unsafe`**.
+
+This deliberately differs from the shared `SpRingCore`, which is `THandler`-erased (used by all four
+FIFO workers) and therefore needs the `SlotCleaner<T>` `delegate*` trampoline to reach
+`THandler.Clear`. `CompactingSpRingCore` is a **new sibling used by exactly one worker type**, so
+there is no sharing reason to erase it — making it `THandler`-generic is cohesive (all conflation
+logic in one place) and JIT-specializes per `THandler` exactly like the rest of the family.
+
+> Note: the merge can't live *in* `CompactingKeyMap` — the map holds only `TKey → int seq` (no
+> `TValue`), and the override is a ring-slot write gated by the head/tail fence+recheck, which is not a
+> map concern. The map stays a pure key→seq index.
+
+Alternative kept in reserve (not chosen): host the conflation routine in the worker's `Dispatch`
+(already `THandler`-generic) with the core exposing `[AggressiveInlining]` primitives
+(`GetSeqRefOrAdd`/`Pending`/`ReadSlot`/`OverrideSlot`/`TryReserve`/`CommitTail`). Also zero-indirection,
+but splits the protocol across worker + core; prefer B's cohesion unless a reason to split emerges.
 
 ## Dispatch protocol (producer) — the crux
 
