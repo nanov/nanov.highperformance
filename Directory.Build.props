@@ -10,6 +10,13 @@
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
   </PropertyGroup>
 
+  <!-- Central version management — the produced assembly / package version for every project.
+       Bump VersionPrefix here; CI can append a prerelease label via VersionSuffix. -->
+  <PropertyGroup>
+    <VersionPrefix>0.0.1</VersionPrefix>
+    <VersionSuffix></VersionSuffix>
+  </PropertyGroup>
+
   <!-- Shared package / repository metadata -->
   <PropertyGroup>
     <Authors>Dimitar Nanov</Authors>
