@@ -153,8 +153,17 @@ internal sealed class CompactingSpRingCore<TKey, TValue, TMerger> : IDisposable
 				// with the consumer parked / not yet reading it) the consumer will acquire-read the merged value.
 				var reading = Volatile.Read(ref _reading);
 				var head = Volatile.Read(ref _idx.Head);
-				if (head - seq < 0 || (head == seq && reading == 0))
+				if (head - seq < 0 || (head == seq && reading == 0)) {
+					// Trust the in-place override. Release the input(s) the merge dropped — whichever of
+					// current/incoming it did NOT return (the returned value is live in the slot). Covers
+					// last-wins (frees current), keep-existing (frees incoming), and combine (frees both).
+					// Guard the alias case (caller reused a reference) so a value isn't discarded twice.
+					if (!ReferenceEquals(merged, current))
+						_merger.Discarded(current);
+					if (!ReferenceEquals(merged, value) && !ReferenceEquals(value, current))
+						_merger.Discarded(value);
 					return true;
+				}
 				// else: consumer consumed or is mid-reading the slot → enqueue the un-merged value fresh (rare dup)
 			}
 

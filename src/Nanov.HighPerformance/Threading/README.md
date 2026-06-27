@@ -188,6 +188,7 @@ the strict-FIFO `SpWorker` core forbids.
 ```csharp
 public interface IItemMerger<TValue> {
   TValue Merge(TValue current, TValue incoming);   // PRODUCER thread; pure; replace-style
+  void Discarded(TValue value);                    // PRODUCER thread; release a dropped value
 }
 
 public interface ICompactingWorkerHandler<TKey, TValue> : IItemMerger<TValue> {
@@ -198,10 +199,33 @@ public interface ICompactingWorkerHandler<TKey, TValue> : IItemMerger<TValue> {
 ```
 
 `Merge` is the conflation function: `return incoming;` for last-wins, or combine fields / keep the
-higher version. Two rules: it runs on the **producer** thread (not the worker thread), so it must be
-**pure** — read its two arguments, return a value, touch no mutable handler state; and it must be
-**replace-style** — each returned value self-contained (under a race the worker may deliver the
-previous value and then `incoming` separately, so additive/accumulate merges would double-count).
+higher version. Its guarantees:
+
+- **Called at most once per `Dispatch`, only when conflating** — i.e. the key is still pending (queued,
+  not yet consumed). Not called on a key's first dispatch, nor when its prior slot was already
+  consumed/evicted (those enqueue fresh). For a hot key, merges **chain** — `current` is the
+  accumulated result of prior merges.
+- **Runs on the producer thread** (concurrent with `Handle`), so it must be **pure**: read its two
+  arguments, return a value, touch no mutable handler state.
+- **Both arguments are read-only** — return `incoming` unchanged (last-wins) or build a **fresh** object
+  to combine; don't mutate either. `current` is the live queued value (never null), possibly read by the
+  consumer or delivered as-is, and only its reference write is atomic (mutating fields risks a torn
+  read). Mutating `incoming` is also unsafe: it can **alias** `current` (caller reusing a reference) and
+  is itself published as-is on the rare doubt path.
+- **Replace-style only** — each returned value self-contained. Under a rare race the worker may deliver
+  the previous value and then `incoming` separately, so additive/accumulate would double-count.
+- **The result may be discarded** under that race (the un-merged `incoming` is delivered instead). The
+  newest value is always delivered; the specific returned object is not guaranteed to reach `Handle`,
+  so don't put result-assuming side effects in `Merge`.
+
+`Discarded(value)` releases values the ring drops (pool-return, dispose, `ArrayPool.Return`). It's
+called for each input `Merge` did **not** return — last-wins (`return incoming`) → `Discarded(current)`;
+keep-existing (`return current`) → `Discarded(incoming)`; combine (fresh) → both. So in the common case
+**every dispatched value is released exactly once — via `Handle` (survivors) or `Discarded` (conflated
+away)**, which makes pooled payloads round-trip cleanly (last-wins *and* combine). Two caveats: it's
+**at-most-once** — under the rare doubt-race a superseded value may be delivered instead (never both), so
+keep cleanup tolerant (pool-return/dispose, not a hard exactly-once counter); and a **hard stop**
+(cancel/`Dispose`) drops queued values without `Discarded` — drain via `TryComplete` for full cleanup.
 
 ### Usage
 

@@ -190,10 +190,22 @@ already-queued value for the same key **in place, keeping its position**, via th
   flipping the read order, or using `<=` for the trust test reintroduces a lost update or a
   deterministic head-slot duplicate. The consumer **acquire-reads the value** (`Volatile.Read`) because
   an override publishes without moving `Tail`.
-- **`Merge` runs on the PRODUCER thread; must be pure + replace-style.** Different thread from `Handle`
-  → sharing mutable handler state is a race. Replace-style only: the doubt-path delivers `current` then
+- **`Merge` runs on the PRODUCER thread; must be pure + replace-style; both args read-only.** Different
+  thread from `Handle` → sharing mutable handler state is a race. Both `current` and `incoming` are
+  immutable (don't mutate either: `current` may be read by the consumer; `incoming` can alias `current`
+  and is published as-is on the doubt path). Replace-style only: the doubt-path delivers `current` then
   `incoming` separately, so additive/accumulate would double-count. The worker passes the handler to
-  the core as `TMerger`; the core holds a copy used solely for `Merge` (purity makes the copy safe).
+  the core as `TMerger`; the core holds a copy used solely for `Merge`/`Discarded` (purity makes the
+  copy safe).
+- **`Discarded` releases dropped values (pooling).** On the conflation **trust path** the core calls
+  `_merger.Discarded` for each input `Merge` did NOT return (compared by `ReferenceEquals`): last-wins
+  → `current`; keep-existing → `incoming`; combine → both; with an alias guard so a value isn't
+  discarded twice. Producer-thread, only on the trust path (on the doubt path the dropped value's fate
+  is ambiguous — left to the consumer / a rare miss). Net: every dispatched value is released once via
+  `Handle` or `Discarded`, **at-most-once** (rare doubt-race may deliver instead of discard — never
+  both). Hard stop (cancel/`Dispose`) drops queued values **without** `Discarded`; `TryComplete` drains
+  them through `Handle`. Don't move `Discarded` to the doubt path or drop the alias/ReferenceEquals
+  guards.
 - **`CompactingKeyMap<TKey>` is producer-thread-only.** `TKey → int seq` open-addressing map, no
   per-key delete (eviction is the bulk `Compact`). Never read/write it from the consumer. Fresh-enqueue
   records `key → tail`; the producer compacts (drops stale `seq < head`) when the map fills. `TValue`

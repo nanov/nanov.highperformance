@@ -37,12 +37,18 @@ Non-goals (v1):
 ## Public surface
 
 ```csharp
-// Narrow, producer-side merge facet. Separate from the handler so the core depends ONLY on this
-// (the core never touches Handle), keeping the core reusable by a future AsyncCompactingSpWorker.
+// Narrow, producer-side facet. Separate from the handler so the core depends ONLY on this (the core
+// never touches Handle), keeping it reusable by a future AsyncCompactingSpWorker. Both run on the
+// PRODUCER thread.
 public interface IItemMerger<TValue> {
   // Conflate an incoming value into the one already queued for this key; returns the value to publish.
-  // Runs on the PRODUCER thread; must be pure / replace-style (see "Merge" semantics).
+  // Pure / replace-style (see "Merge" semantics).
   TValue Merge(TValue current, TValue incoming);
+  // Release a value the ring drops (pool-return / dispose). Called for each input Merge did NOT return:
+  // last-wins → Discarded(current); keep-existing → Discarded(incoming); combine → both. So every
+  // dispatched value is released once via Handle (survivor) or Discarded (dropped) — at-most-once
+  // (rare doubt-race may deliver instead), and hard stop drops without Discarded (drain via TryComplete).
+  void Discarded(TValue value);
 }
 
 // The handler the user implements (one struct) — inherits the merge facet, adds the consumer side.
@@ -84,11 +90,11 @@ effect). "Combine fields / keep max / keep higher version" = compute and return 
 
 Three hard contracts:
 
-1. **Functional signature, not in-place mutation.** The override is published with a single atomic
-   reference `Volatile.Write`, so the consumer never reads a torn value. `Merge` therefore *returns*
-   the value to publish; it must not mutate the live `current` object's fields in place (the consumer
-   may be reading it). Mutating-and-returning `incoming` (a value the consumer can't yet see) is fine
-   and is the pooling-friendly path.
+1. **Functional signature; both arguments read-only.** The override is published with a single atomic
+   reference `Volatile.Write`, so the consumer never reads a torn value. `Merge` *returns* the value to
+   publish and must not mutate `current` (the consumer may be reading/delivering it) **nor** `incoming`
+   (it can alias `current` when the caller reuses a reference, and it is itself published as-is on the
+   doubt path). Return `incoming` unchanged for last-wins, or a fresh object to combine.
 2. **Runs on the PRODUCER thread.** `Merge` runs on the producer thread; `Handle`/`OnError`/
    `OnCompleted` run on the consumer/worker thread. Because the two sides run on different threads,
    `Merge` **must be pure**: read only its two arguments, return a value, touch no mutable handler

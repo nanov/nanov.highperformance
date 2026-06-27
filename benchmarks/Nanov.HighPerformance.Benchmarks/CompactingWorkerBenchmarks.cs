@@ -29,6 +29,7 @@ public class CompactingWorkerBenchmarks {
 
 	private readonly struct DropHandler : ICompactingWorkerHandler<int, Tick> {
 		public Tick Merge(Tick current, Tick incoming) => incoming; // latest-wins
+		public void Discarded(Tick value) { } // GC-managed payload — nothing to release
 		public void Handle(int key, Tick value) { _ = value.Value; }
 		public void OnError(Exception error) { }
 		public void OnCompleted(Exception? error) { }

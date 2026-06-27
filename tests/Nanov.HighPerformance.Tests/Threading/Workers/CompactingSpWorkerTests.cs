@@ -11,6 +11,7 @@ public class CompactingSpWorkerTests {
 	// producer thread and must be pure (it does NOT touch this state).
 	private sealed class RecordingState {
 		public readonly List<(int Key, int Value)> Processed = new();
+		public readonly List<int> Discarded = new();
 		public readonly List<Exception> Errors = new();
 		public readonly List<Exception?> CompletedWith = new();
 	}
@@ -35,6 +36,10 @@ public class CompactingSpWorkerTests {
 
 		public Boxed Merge(Boxed current, Boxed incoming) => incoming; // latest-wins, pure
 
+		public void Discarded(Boxed value) {
+			lock (_state.Discarded) _state.Discarded.Add(value.Value);
+		}
+
 		public void Handle(int key, Boxed value) {
 			_hook?.Invoke(key);
 			if (_delay > TimeSpan.Zero) Thread.Sleep(_delay);
@@ -58,6 +63,7 @@ public class CompactingSpWorkerTests {
 			_worker = new CompactingSpWorker<int, Boxed, LatestHandler>(new LatestHandler(_state, delay, hook), capacity);
 
 		public List<(int Key, int Value)> Processed => _state.Processed;
+		public List<int> Discarded => _state.Discarded;
 		public List<Exception> Errors => _state.Errors;
 		public List<Exception?> CompletedWith => _state.CompletedWith;
 		public Task Completion => _worker.Completion;
@@ -164,6 +170,10 @@ public class CompactingSpWorkerTests {
 
 		public Boxed Merge(Boxed current, Boxed incoming) => new(current.Value + incoming.Value);
 
+		public void Discarded(Boxed value) {
+			lock (_state.Discarded) _state.Discarded.Add(value.Value);
+		}
+
 		public void Handle(int key, Boxed value) {
 			if (key == 0) {
 				_entered.Set();
@@ -228,6 +238,120 @@ public class CompactingSpWorkerTests {
 		var agg = Assert.Throws<AggregateException>(() => w.Completion.Wait(2000));
 		Assert.That(agg!.InnerException, Is.InstanceOf<OperationCanceledException>());
 		Assert.That(w.CompletedWith[0], Is.InstanceOf<OperationCanceledException>());
+	}
+
+	// Superseded values are reported to Discarded (last-wins → the old value is dropped). Consumer is
+	// parked on key 0, so every key-1 conflation takes the clean trust path → deterministic accounting.
+	[Test]
+	public void Superseded_Values_Are_Discarded_Latest_Wins() {
+		var entered = new ManualResetEventSlim(false);
+		var gate = new ManualResetEventSlim(false);
+		using var w = new Rec(16, hook: k => {
+			if (k == 0) {
+				entered.Set();
+				gate.Wait();
+			}
+		});
+		w.Start();
+
+		Assert.That(w.Dispatch(0, 0), Is.True);
+		Assert.That(entered.Wait(2000), Is.True);
+		Assert.That(w.Dispatch(1, 100), Is.True);
+		Assert.That(w.Dispatch(1, 101), Is.True); // supersedes 100
+		Assert.That(w.Dispatch(1, 102), Is.True); // supersedes 101
+
+		gate.Set();
+		w.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => CountOf(w), 2);
+
+		Assert.That(w.Discarded, Is.EqualTo(new[] { 100, 101 }), "dropped values must be reported to Discarded");
+		Assert.That(w.Processed, Is.EqualTo(new[] { (0, 0), (1, 102) }), "only survivors reach Handle");
+		// Accounting: {0,102} Handled ∪ {100,101} Discarded covers every dispatched value, disjointly.
+	}
+
+	// The exact pooled-resource scenario: every rented value round-trips back to the pool exactly once —
+	// via Handle (survivors) or Discarded (conflated-away) — with no double-free and no leak.
+	[Test]
+	public void Pooled_Values_Are_Released_Exactly_Once() {
+		var pool = new TestPool();
+		var entered = new ManualResetEventSlim(false);
+		var gate = new ManualResetEventSlim(false);
+		using var w = new CompactingSpWorker<int, Pooled, PoolHandler>(new PoolHandler(pool, entered, gate), 16);
+		w.Start();
+
+		Assert.That(w.Dispatch(0, pool.Rent()), Is.True); // key 0 blocks the consumer
+		Assert.That(entered.Wait(2000), Is.True);
+
+		// 50 updates across 5 keys while the consumer is parked → heavy conflation, all trust-path.
+		for (var i = 0; i < 50; i++)
+			Assert.That(w.Dispatch(1 + (i % 5), pool.Rent()), Is.True);
+
+		gate.Set();
+		w.TryComplete();
+		Assert.That(w.Completion.Wait(5000), Is.True);
+
+		Assert.That(pool.Rented, Is.EqualTo(51));
+		Assert.That(pool.DoubleFrees, Is.Zero, "no value released twice (no double-free / use-after-free)");
+		Assert.That(pool.Outstanding, Is.Zero, "every rented value released exactly once (no leak)");
+	}
+
+	private sealed class Pooled {
+		public bool Freed;
+	}
+
+	// Tracks rent/free with a per-object guard so a double-release (or a leak) fails the test.
+	private sealed class TestPool {
+		private int _outstanding;
+		public int Rented { get; private set; }
+		public int DoubleFrees { get; private set; }
+		public int Outstanding => Volatile.Read(ref _outstanding);
+
+		public Pooled Rent() {
+			Rented++; // producer thread only (single producer)
+			Interlocked.Increment(ref _outstanding);
+			return new Pooled();
+		}
+
+		public void Free(Pooled p) {
+			// Handle runs on the worker thread, Discarded on the producer thread → guard the flag.
+			lock (this) {
+				if (p.Freed) {
+					DoubleFrees++;
+					return;
+				}
+
+				p.Freed = true;
+			}
+
+			Interlocked.Decrement(ref _outstanding);
+		}
+	}
+
+	private readonly struct PoolHandler : ICompactingWorkerHandler<int, Pooled> {
+		private readonly TestPool _pool;
+		private readonly ManualResetEventSlim _entered;
+		private readonly ManualResetEventSlim _gate;
+
+		public PoolHandler(TestPool pool, ManualResetEventSlim entered, ManualResetEventSlim gate) {
+			_pool = pool;
+			_entered = entered;
+			_gate = gate;
+		}
+
+		public Pooled Merge(Pooled current, Pooled incoming) => incoming; // last-wins
+		public void Discarded(Pooled value) => _pool.Free(value);
+
+		public void Handle(int key, Pooled value) {
+			if (key == 0) {
+				_entered.Set();
+				_gate.Wait();
+			}
+
+			_pool.Free(value);
+		}
+
+		public void OnError(Exception error) { }
+		public void OnCompleted(Exception? error) { }
 	}
 
 	[Test]
