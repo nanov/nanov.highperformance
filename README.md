@@ -39,4 +39,4 @@ dotnet run -c Release --project benchmarks/Nanov.HighPerformance.Benchmarks -- -
 
 ## License
 
-[MIT](LICENSE) © Dimitar Nanov
+[MIT](LICENSE) © 2026 Dimitar Nanov

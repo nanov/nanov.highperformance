@@ -321,3 +321,9 @@ await w.Completion;
 
 Both share the same map + dirty-ring infrastructure; conflation is the slimmer last-wins
 specialization. Lifecycle, errors, and telemetry are identical across the whole family.
+
+---
+
+## License
+
+[MIT](https://github.com/nanov/nanov.highperformance/blob/main/LICENSE) © 2026 Dimitar Nanov
