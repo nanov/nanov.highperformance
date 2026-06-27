@@ -220,12 +220,12 @@ bool Dispatch(TKey key, TValue value):
             TValue merged  = _merger.Merge(current, value)    // PRODUCER-thread, pure, replace-style (devirt)
             Volatile.Write(ref _values[seq & _mask], merged)
             Interlocked.MemoryBarrier()                       // StoreLoad fence
-            if ((Volatile.Read(ref _idx.Head) - seq) < 0)     // consumer strictly behind → it WILL read merged
-                return true
-            // else consumer may be at/past the slot → fall through and enqueue `value` fresh.
-            // Fresh-enqueue uses the un-merged `value` (not `merged`): if the consumer already took
-            // `current`, delivering `value` standalone is correct for replace-style; `merged` could
-            // re-deliver `current`'s content. (This is exactly why additive merge is unsafe here.)
+            reading = Volatile.Read(ref _reading)             // read _reading BEFORE Head (lossless order)
+            head    = Volatile.Read(ref _idx.Head)
+            if ((head - seq) < 0 || (head == seq && reading == 0))
+                return true                                   // consumer hasn't touched the slot → reads merged
+            // else consumer consumed (head>seq) or is mid-reading this exact slot (head==seq && reading):
+            // fall through and enqueue the un-merged `value` fresh (rare, harmless duplicate).
 
     // fresh enqueue: new key, stale entry, or doubtful override
     if (!TryReserve(out int tail)) return false               // blocks if full; false if completed/stopped
@@ -238,39 +238,51 @@ bool Dispatch(TKey key, TValue value):
 
 ### Why this is lossless (the ordering argument)
 
-Shared locations: the value slot and `_idx.Head`.
+Shared locations: the value slot, `_idx.Head`, and a one-int **`_reading`** flag (consumer-written,
+producer-read) marking "the consumer is mid-reading the slot at `Head`."
 
-- **Producer override:** store(slot) → `MemoryBarrier` → load(head). Enqueues a fresh slot whenever
-  the recheck shows `head − seq >= 0` (consumer has reached/passed the slot).
-- **Consumer:** acquire-read(slot) → advance(head) (read-then-advance; the ring contract is
-  respected — the consumer reads the slot it owns at `head`, then frees it).
+The naive "trust iff `Head − seq < 0`" is **not enough**: the worker's `TryTake` advances `Head`
+*before* invoking the handler, so a slow/parked consumer sits at `Head == seq` for the very key being
+conflated. Treating `Head == seq` as doubt would duplicate the head slot on *every* conflation under a
+slow consumer (exactly the case conflation exists for); treating it as trust would lose updates if the
+consumer is mid-read. `Head` alone can't tell the two apart — hence `_reading`.
 
-Two cases, both safe:
-1. Recheck sees `head − seq < 0` (consumer strictly behind): the producer's release store of the
-   **merged** value happens-before the consumer's later acquire read of that slot → consumer reads the
-   merged value. (Value slot uses `Volatile.Write`/`Volatile.Read` so this holds without relying on
-   the `Tail` barrier, which a conflated override does **not** move.)
-2. Recheck sees `head − seq >= 0` (consumer at/past the slot — may already have taken `current`):
-   the producer **enqueues a fresh slot** with the un-merged `incoming` value → newest delivered
-   (possibly after a duplicate older delivery). Safe because merge is replace-style.
+- **Consumer (`TryTake`):** `_reading = 1` → **StoreLoad fence** → acquire-read(slot) → clear slot →
+  advance(`Head`) → `_reading = 0`. Read-then-advance keeps the ring contract intact (the slot is freed
+  only after it's read).
+- **Producer override:** store(slot, merged) → **StoreLoad fence** → read `_reading` **then** `Head`.
+  **Trust** the in-place override (return) when `Head − seq < 0`, **or** `Head == seq && _reading == 0`.
+  **Doubt** → enqueue a fresh slot with the un-merged `incoming` when `Head − seq > 0` (consumer
+  consumed the slot) **or** `Head == seq && _reading == 1` (consumer mid-read of this exact slot).
 
-So the newest value is always delivered via case 1 or case 2; the only artifact is a duplicate
-(older then newer) under the exact at-`head` race. This is the same Dekker store/load-fence pattern
-already documented in `SpRingCore` (`CommitTail` async branch) and `AsyncAutoResetEvent`.
+Both sides fence (true Dekker), and the producer reads `_reading` **before** `Head`. That ordering makes
+it impossible to *both* have the consumer read a stale value *and* have the producer trust the override:
+if the consumer read the slot it set `_reading=1` first (so a producer that trusts must have read
+`_reading` before that, hence `Head` after the consumer's later advance → sees `Head > seq` → doubt).
+So the newest value is always delivered — in place (trust) or via a fresh slot (doubt). The only
+artifact is a **rare** duplicate (older then newer) under a genuine at-`head` race; a merely *parked*
+consumer conflates the head slot **cleanly** (no duplicate). Same Dekker store/load-fence family already
+in `SpRingCore` / `AsyncAutoResetEvent`.
 
-> The earlier-considered "advance head, then read slot" consumer ordering is **rejected**: it would
-> win Dekker on paper but break the ring contract (reading a slot after freeing it) and open a
-> slot-reuse aliasing window. Read-then-advance + producer-enqueue-fresh-on-doubt is the chosen,
-> contract-preserving form.
+Cost: the consumer pays one `Interlocked.MemoryBarrier()` per consumed item (unavoidable for safe
+in-place override of *any* slot, including the head one); the producer's fence + `_reading` read are on
+the conflation-hit path only.
+
+> Rejected alternatives: (1) "trust iff `Head − seq < 0`" alone — deterministic duplicate of the head
+> slot under a slow consumer. (2) "advance head, then read slot" — wins Dekker on paper but breaks the
+> ring contract (reading a freed slot) and opens a slot-reuse aliasing window. The chosen form is
+> read-then-advance + the `_reading` flag + producer-enqueue-fresh-on-doubt.
 
 ## Consumer
 
 The consumer run loop lives in the **worker** (not the core), exactly like `SpWorker.RunLoop` — so a
 future async worker swaps in an async loop over the same core. It's the same dedicated-thread
-run-claim drain (core's `TryClaimRun` per run + per-item advance), with one change: the value is
+run-claim drain (core's `TryClaimRun` per run + per-item `TryTake`), with two changes: (1) the value is
 **acquire-read** (`Volatile.Read(ref _values[head & _mask])`) before delivery, because a conflated
 override publishes a new value **without** advancing `Tail`, so the normal `Tail`-acquire in
-`TryClaimRun` doesn't cover it.
+`TryClaimRun` doesn't cover it; (2) `TryTake` sets `_reading = 1` + a StoreLoad fence before reading the
+slot and clears `_reading = 0` after advancing `Head` (the consumer half of the override Dekker — see
+above).
 
 Per item: acquire-read key+value → advance `Head` (+ edge-signal a blocked producer, as today) →
 `handler.Handle(key, value)` (wrapped in the existing try/catch → `OnError`). Slot clearing: null the
