@@ -76,16 +76,23 @@ full write-up lives in the `SpRingCore<T>` XML doc.
 - **The empty-wait must stay allocation-free.** `WaitForItemAsync` is **non-`async`** on purpose: it
   returns a struct `ValueTask<bool>` (completed-true item available / completed-false stop-or-drained
   / the `AsyncAutoResetEvent`'s pending wait, result `true` = "woke" → the loop re-checks). The
-  `AsyncAutoResetEvent` is a reused `IValueTaskSource<bool>` (`ManualResetValueTaskSourceCore<bool>` +
-  a small lock; set on the empty→non-empty edge by `CommitTail` when `_itemReadyAsync != null`, and by
-  `SignalStop`/`TryComplete`). Making `WaitForItemAsync` `async` again would box a state machine per
+  `AsyncAutoResetEvent` is a reused, **lock-free** `IValueTaskSource<bool>` (single state machine over
+  one `_continuation` field + a sentinel; set on the empty→non-empty edge by `CommitTail` when
+  `_itemReadyAsync != null`, and by `SignalStop`/`TryComplete`). Making `WaitForItemAsync` `async` again would box a state machine per
   empty wait — don't. The only per-loop allocation left is `RunLoopAsync`'s one-time box; per-item
   handler state-machine boxing (when the handler genuinely suspends) is inherent to async and the
   channel pays it too.
-  - The lock in `AsyncAutoResetEvent` is on the **cold** path (only when the ring is empty). A
-    lock-free rewrite (Idle/Signaled/Waiting CAS state machine) was attempted and **reverted** — it
-    caused a lost-wakeup hang in the suite. Keep the lock; the marginal cold-path gain isn't worth a
-    hang-prone primitive.
+  - `AsyncAutoResetEvent` is **lock-free**: a single state machine over one `_continuation` field
+    (sentinel `s_signaled`), resolved by `Interlocked.CompareExchange`, modeled on the BCL's
+    `AsyncOperation` / `SocketAsyncEventArgs`. **Do not** go back to the earlier `MRVTSC` + external
+    `_signaled`/`_waiting` latch: those are two state machines with a desync **seam** that lost a
+    wakeup under cap-2 churn (consistent hang). The single-field design has no seam. It also
+    implements `IThreadPoolWorkItem` and queues **itself** (reused) to resume the waiter, so the
+    suspend→wake path allocates nothing (no per-wake delegate/work-item wrapper). Contract: **single
+    serial waiter** + **multiple concurrent setters**; the resume runs on the ThreadPool without
+    EC/scheduler capture (fine — the loop suppresses EC and uses `ConfigureAwait(false)`). Covered by
+    `AsyncAutoResetEventTests` (unit + edge-gated 1M lost-wakeup stress + a per-cycle alloc guard);
+    don't regress it.
 
 ## DEBUG-only producer overlap guard
 
