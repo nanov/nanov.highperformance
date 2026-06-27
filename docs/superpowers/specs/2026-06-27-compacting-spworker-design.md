@@ -37,15 +37,22 @@ Non-goals (v1):
 ## Public surface
 
 ```csharp
-public interface ICompactingWorkerHandler<TKey, TValue> {
-  // Conflate an incoming value into the one already queued for this key. Returns the value to
-  // publish. Runs on the PRODUCER thread (see "Merge"). Must be pure / replace-style (see semantics).
+// Narrow, producer-side merge facet. Separate from the handler so the core depends ONLY on this
+// (the core never touches Handle), keeping the core reusable by a future AsyncCompactingSpWorker.
+public interface IItemMerger<TValue> {
+  // Conflate an incoming value into the one already queued for this key; returns the value to publish.
+  // Runs on the PRODUCER thread; must be pure / replace-style (see "Merge" semantics).
   TValue Merge(TValue current, TValue incoming);
+}
 
+// The handler the user implements (one struct) — inherits the merge facet, adds the consumer side.
+public interface ICompactingWorkerHandler<TKey, TValue> : IItemMerger<TValue> {
   void Handle(TKey key, TValue value);   // FIFO over first-seen key order, on the worker thread
   void OnError(Exception error);          // always synchronous; worker continues
   void OnCompleted(Exception? error);     // drain/shutdown hook (null / OCE / TryComplete exception)
 }
+// A future IAsyncCompactingWorkerHandler<TKey,TValue> : IItemMerger<TValue> would add HandleAsync /
+// OnCompletedAsync — reusing the SAME core (generic over the merger facet, see Architecture).
 
 public sealed class CompactingSpWorker<TKey, TValue, THandler> : IDisposable, IWorkerQueue
   where TKey : notnull, IEquatable<TKey>
@@ -82,9 +89,11 @@ Three hard contracts:
    the value to publish; it must not mutate the live `current` object's fields in place (the consumer
    may be reading it). Mutating-and-returning `incoming` (a value the consumer can't yet see) is fine
    and is the pooling-friendly path.
-2. **Runs on the PRODUCER thread.** Unlike `Handle`/`OnError`/`OnCompleted` (consumer/worker thread),
-   `Merge` runs on the producer thread — so the handler struct is touched by both threads. `Merge`
-   **must be pure**: read only its two arguments, return a value, touch no mutable handler state.
+2. **Runs on the PRODUCER thread.** `Merge` runs on the producer thread; `Handle`/`OnError`/
+   `OnCompleted` run on the consumer/worker thread. Because the two sides run on different threads,
+   `Merge` **must be pure**: read only its two arguments, return a value, touch no mutable handler
+   state (sharing mutable state with `Handle` would be a data race regardless). The core holds the
+   merger facet by value (a copy carrying any readonly config); its purity makes the copy harmless.
 3. **Replace-style / idempotent only (v1).** Each value `Merge` returns must be self-contained
    (authoritative on its own). The lossless protocol's doubtful-race fallback delivers `current` then
    `incoming` as two separate items; with replace-style values that's a harmless duplicate. **Additive
@@ -114,18 +123,24 @@ overwritten — conflation keeps the same key, only the value changes.)
 ## Architecture
 
 ```
-CompactingSpWorker<TKey,TValue,THandler>            (public, sealed facade; forwards to the core)
-        │ forwards Dispatch/Start/Complete/Dispose
+CompactingSpWorker<TKey,TValue,THandler>            (public, sealed; owns THandler + the SYNC run loop
+        │                                            calling _handler.Handle — async variant later swaps
+        │ forwards Dispatch/Start/Complete/Dispose    this loop and reuses the SAME core)
         ▼
-CompactingSpRingCore<TKey,TValue,THandler>          (internal sibling to SpRingCore — NOT a mod of it;
-        │                                            generic over THandler → direct devirt handler calls)
-        ├── THandler _handler   (SOLE owner; Merge on the producer path + Handle/OnError/OnCompleted
-        │                        in its own run loop — all direct devirtualized calls, no trampoline)
+CompactingSpRingCore<TKey,TValue,TMerger>           (internal sibling to SpRingCore — NOT a mod of it;
+        │   where TMerger : struct, IItemMerger<TValue>   generic over the MERGER facet only)
+        ├── TMerger _merger     (Merge called directly on the producer/conflation path — devirt, no
+        │                        trampoline; NO Handle here → core is consumer-model-agnostic)
         ├── TKey[]   _keys      ┐ two parallel ring arrays (power-of-two), so the consumer can
         ├── TValue[] _values    ┘ deliver (key,value) and override touches only _values[seq & mask]
         ├── PaddedIndices _idx  (reused: cache-line-separated Head/Tail, monotonic ints)
         ├── wake events / dedicated thread / lifecycle  (reused shape from SpRingCore)
+        ├── producer conflation Dispatch (map lookup + Merge + fenced override)  — shared by sync+async
+        ├── consumer-drain primitives (TryClaimRun / take key+value)  — driven by the worker's loop
         └── CompactingKeyMap<TKey>  _pending   (PRODUCER-THREAD-ONLY: TKey → int seq)
+
+The sync worker constructs the core with TMerger = THandler (the handler satisfies IItemMerger). A
+future AsyncCompactingSpWorker does the same and runs an async loop calling _handler.HandleAsync.
 ```
 
 Decision — **sibling core, not an extension of `SpRingCore`.** `SpRingCore`'s documented SPSC
@@ -161,27 +176,31 @@ the general-purpose collection).
 / `Tail` as monotonic ints, wrapping only at `& _mask`). All seq/head/tail comparisons use wrap-safe
 `int` subtraction, exactly like the existing core's `Tail − Head` idiom.
 
-### Reaching `Merge` from the core
+### Reaching `Merge` from the core — devirtualized, no trampoline
 
-**Decided: make the sibling core generic over `THandler`** (`CompactingSpRingCore<TKey, TValue,
-THandler> where THandler : struct, ICompactingWorkerHandler<TKey, TValue>`). The core holds the
-handler by value and calls `_handler.Merge(current, incoming)` **directly** inside its conflation
-`Dispatch` — a devirtualized, inlinable struct call, **zero indirection and no `unsafe`**.
+**Decided: the sibling core is generic over the merger facet** —
+`CompactingSpRingCore<TKey, TValue, TMerger> where TMerger : struct, IItemMerger<TValue>`. It holds
+`TMerger _merger` by value and calls `_merger.Merge(current, incoming)` **directly** in its conflation
+`Dispatch` — a devirtualized, inlinable struct call, **zero indirection, no `unsafe`**. The sync
+worker instantiates it with `TMerger = THandler` (the handler implements `IItemMerger`).
 
-This deliberately differs from the shared `SpRingCore`, which is `THandler`-erased (used by all four
-FIFO workers) and therefore needs the `SlotCleaner<T>` `delegate*` trampoline to reach
-`THandler.Clear`. `CompactingSpRingCore` is a **new sibling used by exactly one worker type**, so
-there is no sharing reason to erase it — making it `THandler`-generic is cohesive (all conflation
-logic in one place) and JIT-specializes per `THandler` exactly like the rest of the family.
+Why generic over the **merger** and not the full `THandler`:
+- **Consumer-model-agnostic / async-ready.** The core never references `Handle`, so the identical core
+  is reused by the sync worker (sync `Handle` loop) and a future `AsyncCompactingSpWorker` (async
+  `HandleAsync` loop) — the consumer loop lives in the worker, exactly like today's
+  `SpWorker`/`AsyncSpWorker` split over the shared `SpRingCore`.
+- **Narrowest dependency.** The core depends only on the one method it actually calls.
+- **Conflation implemented once.** The producer Dispatch (map lookup + `Merge` + fenced override) lives
+  in the core and is shared by both sync and async workers, not duplicated per worker.
+
+This differs from the shared `SpRingCore`, which is fully `THandler`-erased and needs the
+`SlotCleaner<T>` `delegate*` trampoline to reach `THandler.Clear`. Here we don't erase the merger —
+we make the core generic over it — so we get the direct call without any trampoline, while still
+keeping `Handle` out of the core.
 
 > Note: the merge can't live *in* `CompactingKeyMap` — the map holds only `TKey → int seq` (no
 > `TValue`), and the override is a ring-slot write gated by the head/tail fence+recheck, which is not a
 > map concern. The map stays a pure key→seq index.
-
-Alternative kept in reserve (not chosen): host the conflation routine in the worker's `Dispatch`
-(already `THandler`-generic) with the core exposing `[AggressiveInlining]` primitives
-(`GetSeqRefOrAdd`/`Pending`/`ReadSlot`/`OverrideSlot`/`TryReserve`/`CommitTail`). Also zero-indirection,
-but splits the protocol across worker + core; prefer B's cohesion unless a reason to split emerges.
 
 ## Dispatch protocol (producer) — the crux
 
@@ -198,7 +217,7 @@ bool Dispatch(TKey key, TValue value):
         if (pending(seq)):
             // conflate: merge incoming into the queued value, publish the result atomically (release)
             TValue current = Volatile.Read(ref _values[seq & _mask])
-            TValue merged  = _handler.Merge(current, value)   // PRODUCER-thread, pure, replace-style
+            TValue merged  = _merger.Merge(current, value)    // PRODUCER-thread, pure, replace-style (devirt)
             Volatile.Write(ref _values[seq & _mask], merged)
             Interlocked.MemoryBarrier()                       // StoreLoad fence
             if ((Volatile.Read(ref _idx.Head) - seq) < 0)     // consumer strictly behind → it WILL read merged
@@ -246,10 +265,12 @@ already documented in `SpRingCore` (`CommitTail` async branch) and `AsyncAutoRes
 
 ## Consumer
 
-Same dedicated-thread run-claim drain as `SpWorker.RunLoop` (`TryClaimRun` per run +
-per-item advance), with one change: the value is **acquire-read** (`Volatile.Read(ref
-_values[head & _mask])`) before delivery, because a conflated override publishes a new value
-**without** advancing `Tail`, so the normal `Tail`-acquire in `TryClaimRun` doesn't cover it.
+The consumer run loop lives in the **worker** (not the core), exactly like `SpWorker.RunLoop` — so a
+future async worker swaps in an async loop over the same core. It's the same dedicated-thread
+run-claim drain (core's `TryClaimRun` per run + per-item advance), with one change: the value is
+**acquire-read** (`Volatile.Read(ref _values[head & _mask])`) before delivery, because a conflated
+override publishes a new value **without** advancing `Tail`, so the normal `Tail`-acquire in
+`TryClaimRun` doesn't cover it.
 
 Per item: acquire-read key+value → advance `Head` (+ edge-signal a blocked producer, as today) →
 `handler.Handle(key, value)` (wrapped in the existing try/catch → `OnError`). Slot clearing: null the
