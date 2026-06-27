@@ -79,18 +79,21 @@ public sealed class AsyncSpWorker<T, THandler> : IDisposable, IWorkerQueue
 	private async Task RunLoopAsync() {
 		try {
 			var ct = _core.CancellationToken;
-			while (true) {
-				if (_core.TryDequeueNow(out var item)) {
-					try {
-						await _handler.HandleAsync(item, ct).ConfigureAwait(false);
+			// Claim the whole available run, drain it item-by-item, then re-claim — one _idx.Tail read per
+			// run instead of per item (mirrors the sync SpWorker). Head still advances per item via
+			// TryTakeAndAdvance (eager slot-free, tight backpressure, per-item hard-stop drop); only when a
+			// fresh claim finds the ring empty do we park on WaitForItemAsync.
+			do {
+				while (_core.TryClaimRunNow(out var head, out var available)) {
+					while (head != available && _core.TryTakeAndAdvance(head++, out var item)) {
+						try {
+							await _handler.HandleAsync(item, ct).ConfigureAwait(false);
+						} catch (Exception ex) {
+							_handler.OnError(ex);
+						}
 					}
-					catch (Exception ex) {
-						_handler.OnError(ex);
-					}
-				} else if (!await _core.WaitForItemAsync().ConfigureAwait(false)) {
-					break; // hard stop, or soft complete with the ring drained
 				}
-			}
+			} while (await _core.WaitForItemAsync().ConfigureAwait(false));
 		}
 		finally {
 			var ex = _core.CompletionException();

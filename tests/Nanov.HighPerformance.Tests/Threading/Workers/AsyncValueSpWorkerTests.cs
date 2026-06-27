@@ -1,6 +1,7 @@
 namespace Nanov.HighPerformance.Tests.Threading.Workers;
 
 using System.Linq;
+using System.Runtime.CompilerServices;
 using Nanov.HighPerformance.Threading.Workers;
 using NUnit.Framework;
 
@@ -313,6 +314,8 @@ public class AsyncValueSpWorkerTests {
 			return default;
 		}
 
+		public void Clear(ref int value) { } // blittable slot — nothing to release
+
 		public void OnError(Exception error) {
 			lock (_state.Errors) _state.Errors.Add(error);
 		}
@@ -325,6 +328,142 @@ public class AsyncValueSpWorkerTests {
 		private async ValueTask DoAsync(int value) {
 			await _asyncTail!(value).ConfigureAwait(false);
 			lock (_state.Processed) _state.Processed.Add(value);
+		}
+	}
+
+	// --- cleaner spec (handler-driven Clear on the async worker) --------------------------------------
+
+	// Clear runs once per slot at release on the async worker too — on the early-release path (the norm:
+	// the handler frees the slot before returning its ValueTask) AND the loop's auto-release safety net —
+	// and sees a live reference (proving the handler, not a library default-write, clears the slot).
+	[TestCase(true, TestName = "Clear_Runs_On_Early_Release_Async")]
+	[TestCase(false, TestName = "Clear_Runs_On_Auto_Release_Async")]
+	public void Clear_Runs_On_Slot_Release(bool releaseEarly) {
+		var probe = new ClearProbe { ReleaseEarly = releaseEarly };
+		using var w = new AsyncValueSpWorker<Boxed, AsyncClearProbeHandler>(new AsyncClearProbeHandler(probe), 8);
+		w.Start();
+
+		const int n = 5;
+		for (var i = 0; i < n; i++)
+			using (var s = w.Publish())
+				s.Event() = new Boxed { Ref = new object() };
+
+		w.TryComplete();
+		Assert.That(w.Completion.Wait(2000), Is.True);
+
+		Assert.That(probe.ClearCount, Is.EqualTo(n), "Clear must run once per released slot");
+		Assert.That(probe.SawAlreadyCleared, Is.False,
+			"Clear must see the live reference — it (not a library default-write) clears the slot");
+	}
+
+	// Ref-containing slots are cleared so a drained item is collectable (the async ring doesn't pin it).
+	[Test]
+	public void Ref_Containing_Struct_Slots_Are_Cleared_After_Drain_Async() {
+		var w = new AsyncValueSpWorker<Boxed, AsyncClearProbeHandler>(new AsyncClearProbeHandler(new ClearProbe()), 8);
+		w.Start();
+
+		var weak = PublishTransient(w);
+		w.TryComplete();
+		Assert.That(w.Completion.Wait(2000), Is.True);
+
+		GC.Collect();
+		GC.WaitForPendingFinalizers();
+		GC.Collect();
+
+		Assert.That(weak.TryGetTarget(out _), Is.False,
+			"released slot must be cleared so the boxed reference is collectable");
+		GC.KeepAlive(w); // keep the buffer alive: proves the SLOT was cleared, not just the buffer freed
+		w.Dispose();
+	}
+
+	// The async worker also dispatches through its _handler FIELD (never a per-call copy), so a mutable
+	// struct handler's value-type state accumulates across HandleAsync + Clear and is observed by
+	// OnCompletedAsync on the same instance.
+	[Test]
+	public void Handler_Struct_Value_State_Persists_Across_Calls() {
+		var sink = new int[2];
+		using var w = new AsyncValueSpWorker<int, AsyncStatefulHandler>(new AsyncStatefulHandler(sink), 8);
+		w.Start();
+
+		const int n = 7;
+		for (var i = 0; i < n; i++)
+			using (var s = w.Publish())
+				s.Event() = i;
+
+		w.TryComplete();
+		Assert.That(w.Completion.Wait(2000), Is.True);
+
+		Assert.That(sink[0], Is.EqualTo(n),
+			"HandleAsync's value-type counter must accumulate — calls go through the _handler field, not a copy");
+		Assert.That(sink[1], Is.EqualTo(n), "Clear runs once per item on the same handler instance");
+	}
+
+	// Object created + published in a non-inlined frame so the only strong reference is the ring slot.
+	[MethodImpl(MethodImplOptions.NoInlining)]
+	private static WeakReference<object> PublishTransient(AsyncValueSpWorker<Boxed, AsyncClearProbeHandler> w) {
+		var obj = new object();
+		var weak = new WeakReference<object>(obj);
+		using (var s = w.Publish()) s.Event() = new Boxed { Ref = obj };
+		return weak;
+	}
+
+	private struct Boxed {
+		public object? Ref;
+	}
+
+	private sealed class ClearProbe {
+		public int ClearCount;
+		public bool ReleaseEarly;
+		public bool SawAlreadyCleared;
+	}
+
+	private readonly struct AsyncClearProbeHandler : IAsyncValueWorkerHandler<Boxed> {
+		private readonly ClearProbe _probe;
+		public AsyncClearProbeHandler(ClearProbe probe) => _probe = probe;
+
+		public ValueTask HandleAsync(ref HandleScope<Boxed> scope, CancellationToken cancellationToken) {
+			_ = scope.Event().Ref;
+			if (_probe.ReleaseEarly) scope.Release();
+			return default;
+		}
+
+		// Runs on the single consumer (loop thread), so the plain ++ is race-free.
+		public void Clear(ref Boxed value) {
+			_probe.ClearCount++;
+			if (value.Ref is null) _probe.SawAlreadyCleared = true;
+			value.Ref = null;
+		}
+
+		public void OnError(Exception error) { }
+		public ValueTask OnCompletedAsync(Exception? error) => default;
+	}
+
+	// Mutable struct (NOT readonly) holding value-type state; the int[] sink only reads the final counters
+	// out of OnCompletedAsync — the state under test is _handleCount/_clearCount.
+	private struct AsyncStatefulHandler : IAsyncValueWorkerHandler<int> {
+		private readonly int[] _sink;
+		private int _handleCount;
+		private int _clearCount;
+
+		public AsyncStatefulHandler(int[] sink) {
+			_sink = sink;
+			_handleCount = 0;
+			_clearCount = 0;
+		}
+
+		public ValueTask HandleAsync(ref HandleScope<int> scope, CancellationToken cancellationToken) {
+			_ = scope.Event();
+			_handleCount++;
+			scope.Release();
+			return default;
+		}
+
+		public void Clear(ref int value) => _clearCount++;
+		public void OnError(Exception error) { }
+		public ValueTask OnCompletedAsync(Exception? error) {
+			_sink[0] = _handleCount;
+			_sink[1] = _clearCount;
+			return default;
 		}
 	}
 

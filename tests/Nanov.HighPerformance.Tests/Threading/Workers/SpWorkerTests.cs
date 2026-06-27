@@ -1,6 +1,7 @@
 namespace Nanov.HighPerformance.Tests.Threading.Workers;
 
 using System.Linq;
+using System.Runtime.CompilerServices;
 using Nanov.HighPerformance.Threading.Workers;
 using NUnit.Framework;
 
@@ -231,6 +232,70 @@ public class SpWorkerTests {
 		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => CountOf(w), 3);
 
 		Assert.That(w.Processed, Is.EqualTo(new[] { 0, 1, 2 }));
+	}
+
+	// Gate the consumer inside item 0's hook while the ring fills to capacity, then release: the
+	// consumer must drain the full backlog (items 1..15) in order with no lost wakeup.
+	[Test]
+	public void Drains_A_Full_Ring_Burst_In_Order() {
+		var entered = new ManualResetEventSlim(false);
+		var gate = new ManualResetEventSlim(false);
+		using var w = new Rec(16, hook: i => {
+			if (i == 0) {
+				entered.Set();
+				gate.Wait();
+			}
+		});
+		w.Start();
+
+		Assert.That(w.Dispatch(0), Is.True);
+		Assert.That(entered.Wait(2000), Is.True, "consumer must enter item 0's hook (head still 0)");
+		// Fill the rest of the cap-16 ring while the consumer is gated → items 1..15 sit committed.
+		for (var i = 1; i < 16; i++) Assert.That(w.Dispatch(i), Is.True);
+
+		gate.Set(); // release: consumer drains 1..15 in a single batch claim
+		w.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => CountOf(w), 16);
+
+		Assert.That(w.Processed, Is.EqualTo(Enumerable.Range(0, 16)));
+	}
+
+	// Reference-type T must still have its ring slot cleared after the item is dequeued (TryDequeue
+	// clears when IsReferenceOrContainsReferences<T>), so a drained item is collectable and the ring
+	// doesn't pin it. The int-based tests only cover the skip-clear (blittable) side; this covers the
+	// clear side — the guard for the blittable-skip optimization.
+	[Test]
+	public void Ref_Type_Slots_Are_Cleared_After_Drain() {
+		var w = new SpWorker<object, NoopObjHandler>(new NoopObjHandler(), 8);
+		w.Start();
+
+		var weak = DispatchTransient(w);
+		w.TryComplete();
+		Assert.That(w.Completion.Wait(2000), Is.True);
+
+		GC.Collect();
+		GC.WaitForPendingFinalizers();
+		GC.Collect();
+
+		Assert.That(weak.TryGetTarget(out _), Is.False,
+			"drained ring slot must be cleared so the item is collectable");
+		GC.KeepAlive(w); // keep the buffer alive: proves the SLOT was cleared, not just the buffer freed
+		w.Dispose();
+	}
+
+	// Object created and dispatched in a non-inlined frame so the only strong reference is the ring slot.
+	[MethodImpl(MethodImplOptions.NoInlining)]
+	private static WeakReference<object> DispatchTransient(SpWorker<object, NoopObjHandler> w) {
+		var obj = new object();
+		var weak = new WeakReference<object>(obj);
+		Assert.That(w.Dispatch(obj), Is.True);
+		return weak;
+	}
+
+	private readonly struct NoopObjHandler : IWorkerHandler<object> {
+		public void Handle(object item) { }
+		public void OnError(Exception error) { }
+		public void OnCompleted(Exception? error) { }
 	}
 
 	[Test]

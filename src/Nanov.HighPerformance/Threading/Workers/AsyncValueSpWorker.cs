@@ -26,8 +26,17 @@ public sealed class AsyncValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 
 	public AsyncValueSpWorker(THandler handler, int capacity) {
 		_handler = handler;
-		_core = new SpRingCore<T>(capacity); // ThreadPool-async mode — no dedicated thread
+		_core = new SpRingCore<T>(capacity, MakeCleaner()); // ThreadPool-async mode — no dedicated thread
 	}
+
+	// Bridge for HandleScope.Release → SpRingCore.ClearSlot to reach this worker's strongly-typed handler
+	// without the (THandler-erased) core/scope naming THandler. The trampoline is a static method on this
+	// closed generic, so it can name THandler; the holder (this) is a GC-tracked object, so nothing is a
+	// raw pointer into the heap. _handler.Clear runs in-place on the field (state persists, devirtualized).
+	private unsafe SlotCleaner<T> MakeCleaner() => new(this, &ClearTrampoline);
+
+	private static void ClearTrampoline(object holder, ref T slot) =>
+		Unsafe.As<AsyncValueSpWorker<T, THandler>>(holder)._handler.Clear(ref slot);
 
 	/// <summary>Completes when the worker has drained and exited.</summary>
 	public Task Completion => _core.Completion;
@@ -89,34 +98,40 @@ public sealed class AsyncValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 	private async Task RunLoopAsync() {
 		try {
 			var ct = _core.CancellationToken;
+			// Claim the whole available run, drain it scope-by-scope, then re-claim — one _idx.Tail read per
+			// run instead of per item (mirrors the sync ValueSpWorker). Head still advances per item via
+			// HandleScope.Release; IsStopped is rechecked per item so a hard stop drops the rest of the run.
+			// Only when a fresh claim finds the ring empty do we park on WaitForItemAsync.
 			while (true) {
-				if (_core.TryClaimNow(out var head)) {
-					// The ref-struct scope is consumed synchronously (read + Release) before the await —
-					// it never crosses the suspension. The handler returns a ValueTask for any async tail.
-					var vt = default(ValueTask);
-					try {
+				while (_core.TryClaimRunNow(out var head, out var available)) {
+					do {
+						// The ref-struct scope is consumed synchronously (read + Release) before the await —
+						// it never crosses the suspension. The handler returns a ValueTask for any async tail.
+						var vt = default(ValueTask);
 						var scope = new HandleScope<T>(_core, head);
 						try {
 							vt = _handler.HandleAsync(ref scope, ct);
 						}
+						catch (Exception ex) {
+							_handler.OnError(ex);
+							vt = default; // nothing to await; the finally still releases the slot
+						}
 						finally {
 							scope.Release(); // safety net; idempotent (handler should release before returning)
 						}
-					}
-					catch (Exception ex) {
-						_handler.OnError(ex);
-						continue;
-					}
 
-					try {
-						await vt.ConfigureAwait(false);
+						try {
+							await vt.ConfigureAwait(false);
+						}
+						catch (Exception ex) {
+							_handler.OnError(ex);
+						}
 					}
-					catch (Exception ex) {
-						_handler.OnError(ex);
-					}
-				} else if (!await _core.WaitForItemAsync().ConfigureAwait(false)) {
-					break; // hard stop, or soft complete with the ring drained
+					while (!_core.IsStopped && ++head != available);
 				}
+
+				if (!await _core.WaitForItemAsync().ConfigureAwait(false))
+					break; // hard stop, or soft complete with the ring drained
 			}
 		}
 		finally {

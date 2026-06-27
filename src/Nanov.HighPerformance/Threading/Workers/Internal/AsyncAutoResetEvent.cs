@@ -13,12 +13,22 @@ using System.Threading.Tasks.Sources;
 ///   <para>
 ///     Lock-free, hand-rolled <see cref="IValueTaskSource{Boolean}" /> in the style of the BCL's
 ///     <c>System.Threading.Channels.AsyncOperation</c> / <c>SocketAsyncEventArgs</c>: a <b>single</b>
-///     state field (<see cref="_continuation" />) IS the state machine, resolved by one
-///     <see cref="Interlocked.CompareExchange{T}" />. No <c>ManualResetValueTaskSourceCore</c> +
-///     external latch (that composition has a desync seam — it deadlocked the cap-2 churn test).
-///     States: <see langword="null" /> = armed (a wait is outstanding, no signal yet);
-///     <see cref="s_signaled" /> = <see cref="Set" /> fired; any other delegate = the awaiter's
-///     registered continuation.
+///     state field (<see cref="_continuation" />) IS the state machine, resolved entirely by
+///     <see cref="Interlocked.CompareExchange{T}" /> (no blind writes — weak-memory-safe on ARM).
+///     States: <see langword="null" /> = armed (no waiter registered, no signal latched);
+///     <see cref="s_signaled" /> = <see cref="Set" /> fired with no waiter (latched signal);
+///     any other delegate = the awaiter's registered continuation.
+///   </para>
+///   <para>
+///     CORRECTNESS INVARIANT: <b>every <see cref="Set" /> is delivered as either a latch or a
+///     schedule — no signal is ever dropped.</b> When <see cref="Set" /> claims a registered waiter it
+///     CASes <see cref="_continuation" /> straight back to <see langword="null" /> (NOT
+///     <see cref="s_signaled" />) before scheduling, so any concurrent/subsequent <see cref="Set" />
+///     sees <see langword="null" /> and latches a fresh <see cref="s_signaled" /> for the next cycle
+///     rather than collapsing into a signal the wake path would erase. (The earlier "leave
+///     <c>s_signaled</c> until <c>GetResult</c> resets it" design dropped a concurrent setter's signal
+///     in that window — the lost-wakeup race this replaces.) <c>GetResult</c> therefore must not touch
+///     the state field at all — it cannot tell a leftover duplicate from a fresh concurrent latch.
 ///   </para>
 ///   <para>
 ///     Allocation: <see cref="WaitAsync" /> returns a struct <see cref="ValueTask{Boolean}" /> over
@@ -44,13 +54,25 @@ internal sealed class AsyncAutoResetEvent : IValueTaskSource<bool>, IThreadPoolW
 
 	/// <summary>Signal. Safe from multiple producer/stop threads.</summary>
 	public void Set() {
-		var prev = Interlocked.CompareExchange(ref _continuation, s_signaled, null);
-		if (prev is null || ReferenceEquals(prev, s_signaled))
-			return; // latched (no waiter registered) or already signaled — idempotent
+		while (true) {
+			var cur = Volatile.Read(ref _continuation);
+			if (ReferenceEquals(cur, s_signaled))
+				return; // already latched — signal coalesces (idempotent)
 
-		// prev is the awaiter's registered continuation: claim it (exactly one winner) and run it.
-		if (ReferenceEquals(Interlocked.CompareExchange(ref _continuation, s_signaled, prev), prev))
-			Schedule(prev);
+			if (cur is null) {
+				// No waiter registered — latch the signal for the next WaitAsync.
+				if (ReferenceEquals(Interlocked.CompareExchange(ref _continuation, s_signaled, null), null))
+					return;
+				continue; // lost the race; re-read and retry
+			}
+
+			// A waiter is registered: claim it and reset to null (NOT s_signaled), so a concurrent/later
+			// Set latches a fresh signal instead of being dropped. Exactly one setter wins the claim.
+			if (ReferenceEquals(Interlocked.CompareExchange(ref _continuation, null, cur), cur)) {
+				Schedule(cur);
+				return;
+			}
+		}
 	}
 
 	/// <summary>Wait for the next signal. Single consumer, serial. Result is always true ("woke").</summary>
@@ -70,18 +92,36 @@ internal sealed class AsyncAutoResetEvent : IValueTaskSource<bool>, IThreadPoolW
 	void IValueTaskSource<bool>.OnCompleted(Action<object?> continuation, object? state, short token,
 		ValueTaskSourceOnCompletedFlags flags) {
 		_continuationState = state;
-		var prev = Interlocked.CompareExchange(ref _continuation, continuation, null);
-		if (prev is null)
-			return; // registered — a Set will claim and schedule it
+		while (true) {
+			var cur = Volatile.Read(ref _continuation);
+			if (ReferenceEquals(cur, s_signaled)) {
+				// A Set already fired (latched) → consume it and run the continuation now.
+				if (ReferenceEquals(Interlocked.CompareExchange(ref _continuation, null, s_signaled), s_signaled)) {
+					Schedule(continuation);
+					return;
+				}
 
-		// prev == s_signaled: a Set already fired → consume it and run the continuation now.
-		Volatile.Write(ref _continuation, null);
-		Schedule(continuation);
+				continue; // lost the race; re-read and retry
+			}
+
+			if (cur is null) {
+				// Register — a Set will claim and schedule it.
+				if (ReferenceEquals(Interlocked.CompareExchange(ref _continuation, continuation, null), null))
+					return;
+				continue; // lost the race; re-read and retry
+			}
+
+			// A different continuation is already registered: violates the single-serial-waiter contract.
+			throw new InvalidOperationException("AsyncAutoResetEvent supports a single serial waiter.");
+		}
 	}
 
 	bool IValueTaskSource<bool>.GetResult(short token) {
-		// Reset for the next cycle — only if still signaled, so a fresh latch isn't clobbered.
-		Interlocked.CompareExchange(ref _continuation, null, s_signaled);
+		// Deliberately does NOT touch _continuation. The normal wake path already reset it to null at claim
+		// time (Set), and a concurrent Set may have since latched a fresh s_signaled here — clearing it would
+		// drop that distinct signal (the very lost-wakeup this design fixes). GetResult cannot tell a leftover
+		// duplicate (synchronous-success path) from a fresh concurrent latch, so it leaves the field alone; a
+		// leftover duplicate costs at most one spurious, self-healing recheck on the next WaitAsync.
 		_continuationState = null;
 		return true;
 	}

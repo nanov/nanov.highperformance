@@ -11,8 +11,8 @@
   <!-- NuGet packaging -->
   <PropertyGroup>
     <PackageId>Nanov.HighPerformance</PackageId>
-    <Description>High-performance, low-allocation building blocks for .NET: pooled writers, ref-struct collections, lock-free primitives, and span/binary helpers.</Description>
-    <PackageTags>high-performance;low-allocation;span;buffers;pooling;lock-free;ref-struct;simd;zero-alloc</PackageTags>
+    <Description>High-performance, low-allocation concurrency building blocks for .NET: the SPSC worker family (bounded-mailbox actors / pipeline stages) — zero per-message allocation, blocking backpressure, sync and async, copy and zero-copy.</Description>
+    <PackageTags>high-performance;low-allocation;concurrency;spsc;ring-buffer;worker;actor;channel;lock-free;zero-alloc</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>

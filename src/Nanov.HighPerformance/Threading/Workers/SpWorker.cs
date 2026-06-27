@@ -60,12 +60,19 @@ public sealed class SpWorker<T, THandler> : IDisposable, IWorkerQueue
 
 	private void RunLoop() {
 		try {
-			while (_core.TryDequeue(out var item)) {
-				try {
-					_handler.Handle(item);
-				}
-				catch (Exception ex) {
-					_handler.OnError(ex);
+			// Claim the whole available run, then drain it item-by-item, re-claiming (and only then
+			// re-parking when truly empty) once exhausted. Head still advances per item via
+			// TakeAndAdvance — eager slot-free, so backpressure stays tight (one item in-flight) and the
+			// space-signal edge stays per item — but the per-item emptiness _tail read a per-item claim
+			// pays is dropped: one _tail read per run instead of per item.
+			while (_core.TryClaimRun(out var head, out var available)) {
+				while (head != available && _core.TryTakeAndAdvance(head++, out var item)) {
+					try {
+						_handler.Handle(item);
+					}
+					catch (Exception ex) {
+						_handler.OnError(ex);
+					}
 				}
 			}
 		}

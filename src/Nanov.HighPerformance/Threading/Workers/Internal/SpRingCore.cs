@@ -2,6 +2,7 @@ namespace Nanov.HighPerformance.Threading.Workers.Internal;
 
 using System;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -44,6 +45,9 @@ internal sealed class SpRingCore<T> : IDisposable {
 
 	internal readonly T[] _buffer;
 	internal readonly int _mask;
+	// Bound by the value workers to run their handler's Clear(ref T) on a slot at release (see
+	// ClearAndAdvanceHead); stays default (inert) for the copy-based workers, which never create a HandleScope.
+	private SlotCleaner<T> _cleaner;
 	private readonly ManualResetEventSlim _itemEvt = new(false); // set when items available (dedicated-thread consumers)
 	private readonly ManualResetEventSlim _spaceEvt = new(false); // set when space freed
 	private readonly AsyncAutoResetEvent? _itemReadyAsync; // async item signal (ThreadPool-async consumers); null on the dedicated-thread path
@@ -59,12 +63,26 @@ internal sealed class SpRingCore<T> : IDisposable {
 	// item by a different core, so co-locating them ping-pongs the line. 128-byte stride covers Apple
 	// Silicon's 128-byte cache lines as well as x64's 64-byte ones.
 	private PaddedIndices _idx;
+	// Producer-private cached lower bound on the consumer's Head (LMAX "gating sequence"). Read/written
+	// ONLY by the single producer (TryReserve / WaitForSpaceSlow), so it needs no synchronization. Head
+	// only advances, so _cachedHead ≤ real Head always — it can only make the producer believe the ring is
+	// MORE full than it is (conservative: never overwrites a live slot). The producer re-reads the real
+	// Head only when the cached value says "full"; while the ring isn't full it never touches the
+	// consumer's cache line for the fullness check (mirrors the consumer's per-run Tail batching in
+	// TryClaimRun). Stays 0 until the first wrap — with Tail also 0, Tail − _cachedHead = 0 ≠ capacity,
+	// so the inert initial state is correct.
+	private int _cachedHead;
 #if DEBUG
 	private int _producing; // 0/1 — debug-only re-entrancy flag for the producer overlap guard
 #endif
 
 	// Dedicated-thread mode (sync workers + the dedicated-thread async workers).
-	internal SpRingCore(int capacity, string threadName, ThreadStart runLoop) {
+	internal SpRingCore(int capacity, string threadName, ThreadStart runLoop) : this(capacity, threadName, runLoop,
+		SlotCleaner<T>.NoOp) {
+	}
+
+	// Dedicated-thread mode (sync workers + the dedicated-thread async workers).
+	internal SpRingCore(int capacity, string threadName, ThreadStart runLoop, SlotCleaner<T> cleaner) {
 		capacity = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(capacity, 1));
 		_buffer = new T[capacity];
 		_mask = capacity - 1;
@@ -72,22 +90,30 @@ internal sealed class SpRingCore<T> : IDisposable {
 			IsBackground = true,
 			Name = threadName
 		};
+		_cleaner = cleaner;
 	}
 
 	// ThreadPool-async mode: no dedicated thread; the worker drives an async loop via Task and waits
 	// for items through the async signal.
-	internal SpRingCore(int capacity) {
+	internal SpRingCore(int capacity) : this(capacity, SlotCleaner<T>.NoOp) { }
+
+	// ThreadPool-async mode: no dedicated thread; the worker drives an async loop via Task and waits
+	// for items through the async signal.
+	internal SpRingCore(int capacity, SlotCleaner<T> cleaner) {
 		capacity = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(capacity, 1));
 		_buffer = new T[capacity];
 		_mask = capacity - 1;
 		_thread = null;
 		_itemReadyAsync = new AsyncAutoResetEvent();
+		_cleaner = cleaner;
 	}
 
 	internal Task Completion => _completionTcs.Task;
 	internal int QueuedApprox => _idx.Tail - _idx.Head;
 	internal int Capacity => _buffer.Length;
 	internal CancellationToken CancellationToken => _ct;
+
+	internal bool IsStopped => _stop;
 
 	internal void Start(CancellationToken ct) {
 		_ct = ct;
@@ -162,9 +188,15 @@ internal sealed class SpRingCore<T> : IDisposable {
 			return false;
 		}
 
-		if (_idx.Tail - Volatile.Read(ref _idx.Head) == _buffer.Length && !WaitForSpaceSlow()) {
-			tail = 0;
-			return false;
+		// Fullness check against the cached Head first — no cross-core read while the ring isn't full. Only
+		// when the cache says "full" do we refresh from the real Head (one acquire-read) and re-check; if
+		// still full, park in WaitForSpaceSlow (which also refreshes _cachedHead on exit).
+		if (_idx.Tail - _cachedHead == _buffer.Length) {
+			_cachedHead = Volatile.Read(ref _idx.Head);
+			if (_idx.Tail - _cachedHead == _buffer.Length && !WaitForSpaceSlow()) {
+				tail = 0;
+				return false;
+			}
 		}
 
 		tail = _idx.Tail;
@@ -175,13 +207,22 @@ internal sealed class SpRingCore<T> : IDisposable {
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	internal void CommitTail(int tail) {
 		Volatile.Write(ref _idx.Tail, tail + 1);
-		// Edge-triggered: signal only on the empty→non-empty transition (latching event; the consumer's
-		// post-Reset recheck re-reads _idx.Tail, so this lone Set cannot be lost). See SIGNALING INVARIANT.
-		// The signal branch only runs on the (rare) edge, so the async-mode check is off the hot path.
-		if (Volatile.Read(ref _idx.Head) == tail) {
-			if (_itemReadyAsync is null)
+		// Edge-triggered: signal only on the empty→non-empty transition. The edge test reads _idx.Head
+		// AFTER publishing _idx.Tail — a store then a load of a DIFFERENT location, which a weak memory model
+		// (ARM64) may reorder, letting the producer read a STALE _idx.Head and skip the wake for the item it
+		// just committed (a StoreLoad / Dekker lost-wakeup). The consumer's post-Reset / arm-then-recheck
+		// re-reads _idx.Tail published with release before the Set. See SIGNALING INVARIANT.
+		if (_itemReadyAsync is null) {
+			// Sync consumer: WaitForItemSlow spin-rechecks _idx.Tail (≈200×) before it parks, which drains the
+			// store buffer and masks the StoreLoad window — no per-commit fence needed.
+			if (Volatile.Read(ref _idx.Head) == tail)
 				_itemEvt.Set();
-			else
+		} else {
+			// Async consumer parks immediately (no spin), so the window is exposed. A full fence makes the
+			// Tail publish globally visible before the Head read, so the edge decision can't skip on a stale
+			// Head; paired with the arm-then-recheck in WaitForItemAsync this closes the lost-wakeup.
+			Interlocked.MemoryBarrier();
+			if (Volatile.Read(ref _idx.Head) == tail)
 				_itemReadyAsync.Set();
 		}
 	}
@@ -225,32 +266,27 @@ internal sealed class SpRingCore<T> : IDisposable {
 #endif
 	}
 
+	/// <summary>Writable ref to slot <paramref name="head" /> — the scope reads/writes the slot through this.</summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal ref T GetSlotRef(int head) => ref _buffer[head & _mask];
+
 	/// <summary>
-	///   Consumer claim. Fast-path inline emptiness check; parks on the cold path. Returns false to
-	///   exit the loop — hard stop (drops queued items) or soft complete with the ring drained. On
-	///   true, <paramref name="head" /> is the next item's index (<c>_buffer[head &amp; _mask]</c>).
+	///   Release-time fast path for the value scope: run the handler's <c>Clear(ref T)</c> on slot
+	///   <paramref name="head" />, then <see cref="AdvanceHead" /> (advance + edge-signal a blocked
+	///   producer) — one call from <see cref="HandleScope{T}.Release" />. The handler nulls the slot's
+	///   reference fields / returns pooled buffers, so the ring doesn't pin them and the zero-copy slot is
+	///   never overwritten with a full <c>default(T)</c>. <c>Clear</c> is a no-op when no cleaner is bound
+	///   (copy workers don't use this path).
 	/// </summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	internal bool TryClaim(out int head) {
-		if (_idx.Head == Volatile.Read(ref _idx.Tail) && !WaitForItemSlow()) {
-			head = 0;
-			return false;
-		}
-
-		// Hard stop drops items still in the ring; soft complete drains them (WaitForItemSlow exits
-		// above only once the ring is empty).
-		if (_stop) {
-			head = 0;
-			return false;
-		}
-
-		head = _idx.Head;
-		return true;
+	internal void ClearAndAdvanceHead(int head) {
+		_cleaner.Clear(ref _buffer[head & _mask]);
+		AdvanceHead(head);
 	}
 
 	/// <summary>Release the slot at <paramref name="head" /> and edge-signal a blocked producer.</summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	internal void AdvanceHead(int head) {
+	private void AdvanceHead(int head) {
 		Volatile.Write(ref _idx.Head, head + 1);
 		// Edge-triggered space signal, mirror of CommitTail: wake a blocked producer only on the
 		// full→non-full transition. Safe under SPSC (single producer). See SIGNALING INVARIANT.
@@ -258,51 +294,96 @@ internal sealed class SpRingCore<T> : IDisposable {
 			_spaceEvt.Set();
 	}
 
-	/// <summary>Claim + copy out + clear + advance in one shot (copy-based consumers). False to exit.</summary>
+	/// <summary>
+	///   Per-item run drain for the run-claim consumer: hard-stop check (drops the item on cancel/dispose),
+	///   then <see cref="TakeAndAdvance" />. False = the run is cut short by a hard stop; the loop exits.
+	/// </summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	internal bool TryDequeue(out T item) {
-		if (!TryClaim(out var head)) {
+	internal bool TryTakeAndAdvance(int head, out T item) {
+		if (_stop) {
 			item = default!;
 			return false;
 		}
 
+		item = TakeAndAdvance(head);
+		return true;
+	}
+
+	/// <summary>
+	///   Copy the item out of slot <paramref name="head" />, clear the slot, and advance + space-signal
+	///   the ring (<see cref="AdvanceHead" />) — i.e. free the slot eagerly, before the handler runs, so
+	///   a slow handler can never stall the producer (only one item is ever in-flight in the handler).
+	///   The clear is skipped for blittable <typeparamref name="T" />: <see cref="RuntimeHelpers.IsReferenceOrContainsReferences{T}" />
+	///   is a JIT intrinsic folded to a constant per closed generic, so the clear (and its write) vanishes
+	///   for e.g. <see cref="int" /> or a struct of primitives; reference (or ref-containing) <typeparamref name="T" />
+	///   is still cleared so the ring doesn't pin it.
+	/// </summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private T TakeAndAdvance(int head) {
 		ref var slot = ref _buffer[head & _mask];
-		item = slot;
-		slot = default!;
+		var item = slot;
+		if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+			slot = default!;
 		AdvanceHead(head);
+		return item;
+	}
+
+	/// <summary>
+	///   Consumer claim of the whole currently-available run <c>[head, available)</c>. One
+	///   <c>_idx.Tail</c> read on the hot (non-empty) path — the caller then drains the run with
+	///   <see cref="TakeAndAdvance" /> per item (head still advances per item, so backpressure stays
+	///   tight and the space-signal edge stays correct), and only re-claims (re-parking when truly
+	///   empty) once the run is exhausted. This drops the per-item emptiness <c>_idx.Tail</c> read that a
+	///   per-item claim would pay. Returns false to exit — hard stop (drops queued items) or soft
+	///   complete with the ring drained. Single consumer only.
+	/// </summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal bool TryClaimRun(out int head, out int available) {
+		var tail = Volatile.Read(ref _idx.Tail);
+		if (_idx.Head == tail) {
+			if (!WaitForItemSlow()) {
+				head = 0;
+				available = 0;
+				return false;
+			}
+
+			tail = Volatile.Read(ref _idx.Tail); // re-read the now-advanced tail after waking
+		}
+
+		// Hard stop drops items still in the ring; soft complete drains them (WaitForItemSlow exits
+		// above only once the ring is empty).
+		if (_stop) {
+			head = 0;
+			available = 0;
+			return false;
+		}
+
+		head = _idx.Head;
+		available = tail;
 		return true;
 	}
 
 	// --- ThreadPool-async consumer path -----------------------------------------------------------
 
 	/// <summary>
-	///   Non-blocking consumer claim for the async loop: false if the ring is empty or hard-stopped
-	///   (the caller then calls <see cref="WaitForItemAsync" /> to distinguish wait from exit). On
-	///   true, <paramref name="head" /> is the next item's index.
+	///   Non-blocking consumer run-claim for the async loop — the no-park twin of
+	///   <see cref="TryClaimRun" />. Returns false if the ring is empty or hard-stopped (the caller then
+	///   calls <see cref="WaitForItemAsync" /> to distinguish wait from exit). On true, the caller drains
+	///   <c>[head, available)</c> with <see cref="TryTakeAndAdvance" /> (copy) / <see cref="HandleScope{T}" />
+	///   (value) per item, then re-claims — one <c>_idx.Tail</c> read per run instead of per item, matching
+	///   the sync consumer. Single consumer only.
 	/// </summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	internal bool TryClaimNow(out int head) {
-		if (_idx.Head == Volatile.Read(ref _idx.Tail) || _stop) {
+	internal bool TryClaimRunNow(out int head, out int available) {
+		var tail = Volatile.Read(ref _idx.Tail);
+		if (_idx.Head == tail || _stop) {
 			head = 0;
+			available = 0;
 			return false;
 		}
 
 		head = _idx.Head;
-		return true;
-	}
-
-	/// <summary>Non-blocking copy-out dequeue for the async loop. False if empty or hard-stopped.</summary>
-	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	internal bool TryDequeueNow(out T item) {
-		if (!TryClaimNow(out var head)) {
-			item = default!;
-			return false;
-		}
-
-		ref var slot = ref _buffer[head & _mask];
-		item = slot;
-		slot = default!;
-		AdvanceHead(head);
+		available = tail;
 		return true;
 	}
 
@@ -311,8 +392,8 @@ internal sealed class SpRingCore<T> : IDisposable {
 	///   <see cref="ValueTask{Boolean}" />: completed-<see langword="false" /> on hard stop or
 	///   soft-complete-drained (caller exits); completed-<see langword="true" /> when an item is
 	///   already available; otherwise the <see cref="AsyncAutoResetEvent" />'s pending wait (result
-	///   <see langword="true" /> = "woke" — the caller re-checks via <see cref="TryDequeueNow" /> /
-	///   <see cref="TryClaimNow" /> on the next loop turn). Deliberately NOT an <c>async</c> method, so
+	///   <see langword="true" /> = "woke" — the caller re-checks via <see cref="TryClaimRunNow" /> on the
+	///   next loop turn). Deliberately NOT an <c>async</c> method, so
 	///   an empty wait allocates nothing — the suspension reuses the caller's single (one-time)
 	///   RunLoopAsync state machine. Hard stop is checked first, so queued items are dropped on stop.
 	///   Single logical consumer only.
@@ -320,15 +401,32 @@ internal sealed class SpRingCore<T> : IDisposable {
 	internal ValueTask<bool> WaitForItemAsync() {
 		if (_stop) return new ValueTask<bool>(false);
 		if (_idx.Head != Volatile.Read(ref _idx.Tail)) return new ValueTask<bool>(true);
-		if (_completed) return new ValueTask<bool>(false);
-		return _itemReadyAsync!.WaitAsync();
+		if (_completed) return DrainedOnComplete();
+
+		// Ring looks empty and we're about to park. Arm FIRST — the AsyncAutoResetEvent's Interlocked CAS is
+		// a full StoreLoad fence — THEN recheck. Paired with CommitTail's producer-side fence, a freshly
+		// committed item is globally visible here (Dekker), so we self-signal and let the loop drain it
+		// instead of parking on an edge the producer may have skipped. Also catches a late stop/complete.
+		var vt = _itemReadyAsync!.WaitAsync();
+		if (vt.IsCompleted) return vt; // a Set was latched between the empty check above and the arm
+		if (_stop || _completed || _idx.Head != Volatile.Read(ref _idx.Tail))
+			_itemReadyAsync.Set(); // self-signal: complete the armed wait so the loop re-evaluates
+		return vt;
 	}
+
+	// Soft-complete must drain everything already committed. _completed is published (release) AFTER the
+	// producer's final commit, so re-reading the ring after observing _completed (acquire) sees the final
+	// _idx.Tail — without this re-read a (possibly stale) empty check could abandon items committed right
+	// before completion. Returns true (an item is available → drain it) or false (drained → exit).
+	private ValueTask<bool> DrainedOnComplete() =>
+		_idx.Head != Volatile.Read(ref _idx.Tail) ? new ValueTask<bool>(true) : new ValueTask<bool>(false);
 
 	// Cold path: producer parks until space frees, or the worker stops/completes.
 	[MethodImpl(MethodImplOptions.NoInlining)]
 	private bool WaitForSpaceSlow() {
 		var spins = 0;
-		while (_idx.Tail - Volatile.Read(ref _idx.Head) == _buffer.Length) {
+		int head;
+		while (_idx.Tail - (head = Volatile.Read(ref _idx.Head)) == _buffer.Length) {
 			if (_stop || _completed) return false;
 			if (spins++ < SpinThreshold) {
 				Thread.SpinWait(10);
@@ -340,6 +438,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 			spins = 0;
 		}
 
+		_cachedHead = head; // refresh the gating cache with the Head that proved there is space
 		return true;
 	}
 
@@ -348,7 +447,10 @@ internal sealed class SpRingCore<T> : IDisposable {
 	private bool WaitForItemSlow() {
 		var spins = 0;
 		while (_idx.Head == Volatile.Read(ref _idx.Tail)) {
-			if (_stop || _completed) return false;
+			if (_stop) return false;
+			// Soft-complete drains: re-read _idx.Tail after observing _completed (acquire) so an item
+			// committed right before completion — not yet visible to the empty check above — is still drained.
+			if (_completed) return _idx.Head != Volatile.Read(ref _idx.Tail);
 			if (spins++ < SpinThreshold) {
 				Thread.SpinWait(10);
 				continue;

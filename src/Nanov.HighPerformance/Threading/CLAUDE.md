@@ -20,6 +20,33 @@ full→non-full transition, paired with a non-atomic `Wait();Reset()`. This is s
 silently.** If you touch `SpRingCore` producer/consumer/signaling code, preserve this exactly. The
 full write-up lives in the `SpRingCore<T>` XML doc.
 
+### Async-path StoreLoad fences (don't remove — ARM64 lost-wakeup)
+
+The edge test is a **store then a load of a different location** (`CommitTail`: `Volatile.Write(_tail)`
+then `Volatile.Read(_head)`; the parking consumer: `Volatile.Write(_head)` then `Volatile.Read(_tail)`).
+`Volatile` is release/acquire, which does **not** order StoreLoad — a weak memory model (Apple Silicon /
+ARM64) can hoist each load ahead of the other thread's store, so the producer reads a **stale `_head`**
+and skips the edge `Set` while the consumer reads a **stale `_tail`** and parks → permanent hang
+(classic Dekker lost-wakeup). The **sync** consumer hides this behind its ~200-iteration spin-recheck in
+`WaitForItemSlow` (the spin drains the store buffer before it blocks). The **async** consumer parks
+immediately, so it needs explicit fences, on **both** sides (one side alone is only probabilistic):
+
+- **Producer (`CommitTail`, async branch only):** `Interlocked.MemoryBarrier()` between the `_tail`
+  publish and the `_head` read — so the edge decision can't skip on a stale `_head`. Scoped to the
+  async branch (`_itemReadyAsync is not null`); the sync branch keeps its spin and pays no per-item fence.
+- **Consumer (`WaitForItemAsync`):** **arm-then-recheck** — call `_itemReadyAsync.WaitAsync()` (its
+  `Interlocked.CompareExchange` is a full fence), then recheck `_tail`/`_stop`/`_completed`; if work
+  appeared, self-`Set()` so the armed wait completes and the loop drains instead of parking on a skipped
+  edge. Don't collapse this back to a single check-then-`WaitAsync`.
+- **Soft-complete drain (`WaitForItemAsync` + `WaitForItemSlow`):** when the ring looks empty, re-read
+  `_tail` **after** observing `_completed` (it's published with release *after* the producer's last
+  commit, so the acquire-ordered re-read sees the final `_tail`). Without the re-read, a stale empty read
+  taken before `_completed` was visible silently drops the tail items. `_stop` (hard stop) still exits
+  without draining — that's the drop-on-cancel contract.
+
+The `AsyncAutoResetEventTests.Stress_EdgeGated_SingleProducer_NoLostWakeup` harness mirrors these fences;
+its earlier unfenced form reproduced this exact hang under parallel-TFM contention.
+
 - **Single consumer is structural** (the worker owns its one thread; `_head` only moves on it —
   including `HandleScope.Release`, which is a `ref struct` confined to the worker thread, called
   *before* an async handler returns its `ValueTask`).
@@ -36,8 +63,8 @@ full write-up lives in the `SpRingCore<T>` XML doc.
 - **Devirtualized struct handlers.** Workers are `…<T, THandler> where THandler : struct,
   I…Handler<T>`. Per-item `Handle`/`OnError`/`OnCompleted` go through the struct field so the JIT
   inlines them. Never store the handler as an interface reference or call it virtually.
-- **Fast/slow split.** Core producer/consumer fast paths (`TryReserve`/`TryClaim`/`CommitTail`/
-  `AdvanceHead`/`TryEnqueue`/`TryDequeue`) are `[AggressiveInlining]`; the parking loops
+- **Fast/slow split.** Core producer/consumer fast paths (`TryReserve`/`TryClaimRun`/`CommitTail`/
+  `AdvanceHead`/`TryEnqueue`/`TryTakeAndAdvance`) are `[AggressiveInlining]`; the parking loops
   (`WaitForSpaceSlow`/`WaitForItemSlow`) are `[NoInlining]`. Keep the hot path inlined and the cold
   park out of line.
 - **Cache-line-padded indices.** `_head` (consumer) and `_tail` (producer) live in a
@@ -46,20 +73,47 @@ full write-up lives in the `SpRingCore<T>` XML doc.
   generic types can't have `[StructLayout(LayoutKind.Explicit)]`. Don't fold the indices back into
   plain adjacent fields. (Local laptop benchmarks were too noisy — error > mean — to quantify the
   win; it's the standard Disruptor technique, correct and harmless, kept on that basis.)
-- **Hard stop drops, soft complete drains.** `TryClaim` rechecks `_stop` *after* the wait loop even
-  when the ring is non-empty — that's what makes cancel/dispose drop queued items. Don't remove it
-  (regression we already fixed once).
+- **Producer-cached gating sequence.** `TryReserve` checks fullness against `_cachedHead` (a
+  producer-private lower bound on the consumer's `Head`) and only re-reads the real `_idx.Head` — one
+  cross-core acquire — when the cache says "full"; `WaitForSpaceSlow` refreshes `_cachedHead` on exit.
+  `Head` only advances, so `_cachedHead ≤ Head` always — it can only over-estimate fullness
+  (conservative, never overwrites a live slot). Producer-only field ⇒ no synchronization. This is the
+  LMAX gating-sequence technique and the producer-side mirror of the consumer's per-run `Tail` batch
+  in `TryClaimRun`; it removes the per-enqueue read of the consumer's line while the ring isn't full.
+  Don't reintroduce a direct `Volatile.Read(_idx.Head)` on the `TryReserve` fast path. (Same
+  laptop-noise caveat as the padding above — kept on the standard-technique basis.)
+- **Hard stop drops, soft complete drains.** `TryClaimRun` rechecks `_stop` *after* the wait loop
+  even when the ring is non-empty (and `TryTakeAndAdvance` rechecks it per item mid-run) — that's
+  what makes cancel/dispose drop queued items. Don't remove it (regression we already fixed once).
 - **OnError is always synchronous**, on every variant including async ones. `OnCompleted` is the
   drain hook (sync for sync workers, `…Async` for async). Handler exceptions are reported to
   `OnError` and the worker continues.
+- **Value-worker slot clearing is handler-driven, not `= default`.** The value handlers
+  (`IValueWorkerHandler` / `IAsyncValueWorkerHandler`) carry a `void Clear(ref T value)` that runs on
+  **every** slot release — early (`HandleScope.Release` called mid-`Handle`, e.g. to free the slot for a
+  long-running task) *or* the loop's auto-release — via `SpRingCore.ClearAndAdvanceHead` (one call from
+  `Release`: clear then `AdvanceHead`). It replaced the old whole-struct `slot = default` (a wide write
+  that defeated the zero-copy point); the handler nulls just its reference fields / returns pooled
+  buffers. Reaching the (THandler-typed) `Clear` from the THandler-erased core/scope is the job of the
+  tiny `SlotCleaner<T>` struct (`Internal/SlotCleaner.cs`): a GC-tracked `object` holder (the worker) +
+  a `delegate*` to a **static** trampoline the worker supplies (`&ClearTrampoline`, which `Unsafe.As`-es
+  the holder back to the closed worker type and calls `_handler.Clear`). Nothing is a raw pointer into
+  the GC heap, so it survives compaction; the only `unsafe` lives in `SlotCleaner` + each worker's
+  one-line `MakeCleaner`. Copy workers never bind a cleaner (`Clear` no-ops) and never create a scope.
+  Don't reintroduce the `IsReferenceOrContainsReferences<T>` `= default` clear.
 - **Sync vs async use two different core paths — don't cross them.**
   - *Sync* (`SpWorker` / `ValueSpWorker`): dedicated-thread core ctor
-    (`new SpRingCore<T>(capacity, threadName, runLoop)`), blocking consumer (`TryClaim`/`TryDequeue` +
-    `WaitForItemSlow` parking on `_itemEvt`).
+    (`new SpRingCore<T>(capacity, threadName, runLoop)`), blocking run-claim consumer (`TryClaimRun`
+    per run + `TryTakeAndAdvance` (copy) / `HandleScope.Release` (value) per item, `WaitForItemSlow`
+    parking on `_itemEvt`).
   - *Async* (`AsyncSpWorker` / `AsyncValueSpWorker`): **ThreadPool** loop, no dedicated thread.
     `Start` launches `RunLoopAsync` (one `async Task`) via `Task.Run`, using the core's **no-thread**
-    ctor (`new SpRingCore<T>(capacity)`), `TryClaimNow`/`TryDequeueNow` (non-blocking), and
-    `WaitForItemAsync`. The continuation resumes on the pool — no thread parked per `await` — so it
+    ctor (`new SpRingCore<T>(capacity)`), `TryClaimRunNow` (non-blocking run-claim — the no-park twin
+    of `TryClaimRun`; drain `[head, available)` with `TryTakeAndAdvance` (copy) / `HandleScope` (value)
+    per item, one `_idx.Tail` read per run, then re-claim), and `WaitForItemAsync`. (This replaced the
+    old per-item `TryClaimNow`/`TryDequeueNow`, which read `_idx.Tail` every item; the run-claim mirrors
+    the sync consumer's batching for the sync-completing-handler case.) The continuation resumes on the
+    pool — no thread parked per `await` — so it
     matches/beats `Channel<T>` for truly-async serial handlers. The scope worker reads + `Release()`s
     the `HandleScope` **synchronously before any await** (ref struct can't cross await); `Dispose`
     `SignalStop()`s, `_loopTask?.Wait()`s, then `_core.Dispose()`. (We removed the old dedicated-thread
@@ -93,6 +147,16 @@ full write-up lives in the `SpRingCore<T>` XML doc.
     EC/scheduler capture (fine — the loop suppresses EC and uses `ConfigureAwait(false)`). Covered by
     `AsyncAutoResetEventTests` (unit + edge-gated 1M lost-wakeup stress + a per-cycle alloc guard);
     don't regress it.
+    - **Claim-reset-to-null invariant:** every `Set` is delivered as either a **latch** or a
+      **schedule** — never dropped. When `Set` claims a registered waiter it CASes `_continuation` back
+      to **`null`** (not `s_signaled`) before scheduling, so a concurrent/subsequent `Set` sees `null`
+      and latches a *fresh* `s_signaled` for the next cycle instead of collapsing into the one being
+      delivered (the earlier "leave `s_signaled` until `GetResult` resets it" form dropped that
+      concurrent setter's signal — a real lost-wakeup; `Second_Set_While_Claiming_A_Waiter_Survives_As_A_Latch`
+      guards it). Consequently `GetResult` must **not** touch `_continuation` (it can't tell a leftover
+      duplicate from a fresh concurrent latch). All transitions are `Interlocked.CompareExchange` —
+      **no blind `Volatile.Write`** (weak-memory-safe). This fixes signal-*drop*; it does **not** fix a
+      signal that's never *sent* — that's the StoreLoad fence work above, in `SpRingCore`.
 
 ## DEBUG-only producer overlap guard
 

@@ -29,8 +29,17 @@ public sealed class ValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 
 	public ValueSpWorker(THandler handler, int capacity, string? threadName = null) {
 		_handler = handler;
-		_core = new SpRingCore<T>(capacity, threadName ?? $"ValueSpWorker<{typeof(T).Name}>", RunLoop);
+		_core = new SpRingCore<T>(capacity, threadName ?? $"ValueSpWorker<{typeof(T).Name}>", RunLoop, MakeCleaner());
 	}
+
+	// Bridge for HandleScope.Release → SpRingCore.ClearSlot to reach this worker's strongly-typed handler
+	// without the (THandler-erased) core/scope naming THandler. The trampoline is a static method on this
+	// closed generic, so it can name THandler; the holder (this) is a GC-tracked object, so nothing is a
+	// raw pointer into the heap. _handler.Clear runs in-place on the field (state persists, devirtualized).
+	private unsafe SlotCleaner<T> MakeCleaner() => new(this, &ClearTrampoline);
+
+	private static void ClearTrampoline(object holder, ref T slot) =>
+		Unsafe.As<ValueSpWorker<T, THandler>>(holder)._handler.Clear(ref slot);
 
 	/// <summary>Completes when the worker has drained and exited (after Complete() or Dispose()).</summary>
 	public Task Completion => _core.Completion;
@@ -40,6 +49,7 @@ public sealed class ValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 
 	/// <summary>Ring capacity (rounded up to a power of two).</summary>
 	public int Capacity => _core.Capacity;
+
 
 	/// <summary>
 	///   Start the worker thread. Optionally pass a CancellationToken — when cancelled, the worker
@@ -78,18 +88,26 @@ public sealed class ValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 
 	private void RunLoop() {
 		try {
-			while (_core.TryClaim(out var head)) {
-				var scope = new HandleScope<T>(_core, head);
-				try {
-					_handler.Handle(ref scope);
+			// Claim the whole available run, then drain it scope-by-scope, re-claiming (and only then
+			// re-parking when truly empty) once exhausted — dropping the per-item emptiness _tail read
+			// a per-item claim pays (one _tail read per run instead of per item). HandleScope.Release still
+			// advances head per item (via ++head), so the early-release contract and tight backpressure
+			// are unchanged; IsStopped is rechecked per item so a hard stop drops the rest of the run.
+			while (_core.TryClaimRun(out var head, out var available)) {
+				do {
+					var scope = new HandleScope<T>(_core, head);
+					try {
+						_handler.Handle(ref scope);
+					}
+					catch (Exception ex) {
+						_handler.OnError(ex);
+					}
+					finally {
+						// Safety net: ensure the slot is released even if the handler didn't. Idempotent.
+						scope.Release();
+					}
 				}
-				catch (Exception ex) {
-					_handler.OnError(ex);
-				}
-				finally {
-					// Safety net: ensure the slot is released even if the handler didn't. Idempotent.
-					scope.Release();
-				}
+				while (!_core.IsStopped && ++head != available);
 			}
 		}
 		finally {

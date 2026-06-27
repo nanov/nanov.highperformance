@@ -1,32 +1,61 @@
 # Nanov.HighPerformance
 
-A collection of high-performance, low-allocation building blocks for .NET — pooled writers,
-ref-struct collections, lock-free primitives, span/binary helpers, and friends. The pieces were
-scattered across projects; this library consolidates them into one place with consistent
-conventions, benchmarks, and tests.
+High-performance, low-allocation concurrency building blocks for .NET. The current focus is the
+**SPSC worker family** under `Nanov.HighPerformance.Threading` — bounded-mailbox actors / pipeline
+stages backed by a power-of-two ring buffer, with **zero per-message allocation**, blocking
+backpressure, drain-on-complete, and cancellation.
 
 Targets **net9.0** and **net10.0**. AOT-compatible, `unsafe`-enabled, zero-allocation on hot paths.
+
+## SpWorker — single-producer ring-buffer workers
+
+An `SpWorker` is, in effect, *a bounded `Channel<T>` whose single consumer runs your handler* in
+FIFO order. A producer hands items to the worker; the worker pulls them and invokes your handler.
+Four variants cover sync/async × copy/zero-copy:
+
+| Type | Handler | Producer API | Use when |
+| --- | --- | --- | --- |
+| `SpWorker<T, THandler>` | `IWorkerHandler<T>` | `Dispatch(T)` | sync handler, copy-based |
+| `AsyncSpWorker<T, THandler>` | `IAsyncWorkerHandler<T>` | `Dispatch(T)` | async handler, copy-based |
+| `ValueSpWorker<T, THandler>` | `IValueWorkerHandler<T>` | `Publish()` → `ref` | `T : struct`, zero-copy |
+| `AsyncValueSpWorker<T, THandler>` | `IAsyncValueWorkerHandler<T>` | `Publish()` → `ref` | `T : struct`, zero-copy async |
+
+`THandler` is a **struct** constrained to the handler interface, so per-item `Handle` / `OnError` /
+`OnCompleted` calls devirtualize and inline — no virtual dispatch on the hot path.
+
+```csharp
+readonly struct PrintHandler : IWorkerHandler<int> {
+  public void Handle(int item) => Console.WriteLine(item);
+  public void OnError(Exception e) { /* log */ }
+  public void OnCompleted(Exception? e) { }
+}
+
+using var worker = new SpWorker<int, PrintHandler>(new PrintHandler(), capacity: 1024);
+worker.Start();
+
+for (var i = 0; i < 1000; i++)
+  worker.Dispatch(i);          // blocks if the ring is full (backpressure)
+
+worker.TryComplete();          // no more items; drain then exit
+await worker.Completion;       // resolves when drained (or faults / cancels)
+```
+
+The contract is **single-producer** (your responsibility — `Dispatch`/`Publish` must not run on two
+threads concurrently; serial cross-thread is fine) and **single-consumer** (structural — the worker
+owns its consumer). A `DEBUG`-only guard throws on overlapping producers; it compiles away in
+`Release`.
+
+See the [Threading concern README](src/Nanov.HighPerformance/Threading/README.md) for the full API:
+zero-copy scope usage, async-handler rules, lifecycle (`Start` / `TryComplete` / `Dispose` /
+`Completion`), error semantics, telemetry (`IWorkerQueue`), and performance notes.
 
 ## Layout
 
 | Path | Purpose |
 | --- | --- |
-| `src/Nanov.HighPerformance` | The library. |
+| `src/Nanov.HighPerformance` | The library (`Nanov.HighPerformance.Threading`). |
 | `tests/Nanov.HighPerformance.Tests` | NUnit tests (run on both target frameworks). |
 | `benchmarks/Nanov.HighPerformance.Benchmarks` | BenchmarkDotNet harness. |
-
-### Concerns (namespaces)
-
-Each folder under `src/Nanov.HighPerformance` maps to one sub-namespace:
-
-| Namespace | What lives here |
-| --- | --- |
-| `Nanov.HighPerformance.Buffers` | Pooled `IBufferWriter<byte>` writers, scratch buffers. |
-| `Nanov.HighPerformance.Collections` | Inline-array lists, ref-struct collections. |
-| `Nanov.HighPerformance.Memory` | `ArrayPool` helpers, native/unmanaged pools, span utilities. |
-| `Nanov.HighPerformance.Text` | `Ascii` comparison helpers, UTF-8 encoding/interning. |
-| `Nanov.HighPerformance.Threading` | Lock-free structures, async events, `ThreadStatic` caches. |
-| `Nanov.HighPerformance.Binary` | `BinaryPrimitives` codecs, enum reinterpret helpers. |
 
 ## Build, test, benchmark
 

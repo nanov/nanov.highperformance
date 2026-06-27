@@ -117,6 +117,24 @@ public readonly struct MixedAsyncRefHandler : IAsyncWorkerHandler<RefMsg> {
 	public ValueTask OnCompletedAsync(Exception? error) => default;
 }
 
+// Same MIXED workload, but the (every-3rd) suspending tail pools its state-machine box via
+// PoolingAsyncValueTaskMethodBuilder — only the truly-suspending items allocated in the first place,
+// so this drives that residual per-item alloc toward zero. The sync-completing 2/3 already allocate
+// nothing.
+public readonly struct MixedPooledAsyncRefHandler : IAsyncWorkerHandler<RefMsg> {
+	private readonly Box _box;
+	public MixedPooledAsyncRefHandler(Box box) => _box = box;
+	public ValueTask HandleAsync(RefMsg item, CancellationToken cancellationToken) {
+		_box.Sum += item.Key;
+		return ++_box.Calls % 3 == 0 ? HandleAsyncAwaiter() : default;
+	}
+	[AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+	private static async ValueTask HandleAsyncAwaiter() => await Task.Yield();
+
+	public void OnError(Exception error) { }
+	public ValueTask OnCompletedAsync(Exception? error) => default;
+}
+
 // --- zero-copy scope handlers (value items only) ------------------------------------------------
 
 public readonly struct ScopeSumHandler : IValueWorkerHandler<ValueMsg> {
@@ -126,6 +144,7 @@ public readonly struct ScopeSumHandler : IValueWorkerHandler<ValueMsg> {
 		_box.Sum += scope.Event().Key;
 		scope.Release();
 	}
+	public void Clear(ref ValueMsg value) { } // blittable slot — nothing to release
 	public void OnError(Exception error) { }
 	public void OnCompleted(Exception? error) { }
 }
@@ -140,6 +159,7 @@ public readonly struct AsyncScopeSumHandler : IAsyncValueWorkerHandler<ValueMsg>
 	}
 	private async ValueTask HandleAsyncAwaiter() => await Task.Yield();
 
+	public void Clear(ref ValueMsg value) { } // blittable slot — nothing to release
 	public void OnError(Exception error) { }
 	public ValueTask OnCompletedAsync(Exception? error) => default;
 }
@@ -153,10 +173,10 @@ public readonly struct AsyncScopeSumHandler : IAsyncValueWorkerHandler<ValueMsg>
 public class SyncValueBenchmarks {
 	private static readonly ValueMsg Msg = new() { Key = 1, Value = 2, Timestamp = 3, Flags = 4 };
 
-	[Params(24, 1024)]
+	[Params(24)]
 	public int Capacity;
 
-	[Params(1_000_000)]
+	[Params(10_000)]
 	public int ItemCount;
 
 	[Benchmark(Baseline = true)]
@@ -166,12 +186,13 @@ public class SyncValueBenchmarks {
 			SingleWriter = true
 		});
 
-		long sum = 0;
+		var box = new Box();
+		var handler = new ValueSumHandler(box);
 		var consumer = Task.Run(async () => {
 			var reader = channel.Reader;
 			while (await reader.WaitToReadAsync().ConfigureAwait(false))
 				while (reader.TryRead(out var item))
-					sum += item.Key;
+					handler.Handle(item);
 		});
 
 		var writer = channel.Writer;
@@ -181,11 +202,11 @@ public class SyncValueBenchmarks {
 		writer.Complete();
 
 		await consumer.ConfigureAwait(false);
-		return sum;
+		return box.Sum;
 	}
 
 	[Benchmark]
-	public long SpWorker_Value() {
+	public async Task<long> SpWorker_Value() {
 		var box = new Box();
 		using var w = new SpWorker<ValueMsg, ValueSumHandler>(new ValueSumHandler(box), Capacity);
 		w.Start();
@@ -195,12 +216,12 @@ public class SyncValueBenchmarks {
 			w.Dispatch(msg);
 
 		w.TryComplete();
-		w.Completion.GetAwaiter().GetResult();
+		await w.Completion.ConfigureAwait(false);
 		return box.Sum;
 	}
 
 	[Benchmark]
-	public long ValueSpWorker_Value() {
+	public async Task<long> ValueSpWorker_Value() {
 		var box = new Box();
 		using var w = new ValueSpWorker<ValueMsg, ScopeSumHandler>(new ScopeSumHandler(box), Capacity);
 		w.Start();
@@ -212,7 +233,7 @@ public class SyncValueBenchmarks {
 		}
 
 		w.TryComplete();
-		w.Completion.GetAwaiter().GetResult();
+		await w.Completion.ConfigureAwait(false); // .GetAwaiter().GetResult();
 		return box.Sum;
 	}
 }
@@ -225,7 +246,7 @@ public class AsyncValueBenchmarks {
 	[Params(24)]
 	public int Capacity;
 
-	[Params(1_000)]
+	[Params(10_000)]
 	public int ItemCount;
 
 	[Benchmark(Baseline = true)]
@@ -256,7 +277,7 @@ public class AsyncValueBenchmarks {
 	}
 
 	[Benchmark]
-	public long AsyncSpWorker_Value() {
+	public async Task<long> AsyncSpWorker_Value() {
 		var box = new Box();
 		using var w = new AsyncSpWorker<ValueMsg, AsyncValueSumHandler>(new AsyncValueSumHandler(box), Capacity);
 		w.Start();
@@ -266,12 +287,12 @@ public class AsyncValueBenchmarks {
 			w.Dispatch(msg);
 
 		w.TryComplete();
-		w.Completion.GetAwaiter().GetResult();
+		await w.Completion.ConfigureAwait(false); // GetAwaiter().GetResult();
 		return box.Sum;
 	}
 
 	[Benchmark]
-	public long AsyncValueSpWorker_Value() {
+	public async Task<long> AsyncValueSpWorker_Value() {
 		var box = new Box();
 		using var w = new AsyncValueSpWorker<ValueMsg, AsyncScopeSumHandler>(new AsyncScopeSumHandler(box), Capacity);
 		w.Start();
@@ -283,7 +304,7 @@ public class AsyncValueBenchmarks {
 		}
 
 		w.TryComplete();
-		w.Completion.GetAwaiter().GetResult();
+		await w.Completion.ConfigureAwait(false); // GetAwaiter().GetResult();
 		return box.Sum;
 	}
 }
@@ -293,10 +314,10 @@ public class AsyncValueBenchmarks {
 public class SyncRefBenchmarks {
 	private static readonly RefMsg Ref = new() { Key = 1, Value = 2, Timestamp = 3, Flags = 4 };
 
-	[Params(24, 1024)]
+	[Params(24)]
 	public int Capacity;
 
-	[Params(1_000_000)]
+	[Params(10_000)]
 	public int ItemCount;
 
 	[Benchmark(Baseline = true)]
@@ -325,7 +346,7 @@ public class SyncRefBenchmarks {
 	}
 
 	[Benchmark]
-	public long SpWorker_Ref() {
+	public async Task<long> SpWorker_Ref() {
 		var box = new Box();
 		using var w = new SpWorker<RefMsg, RefSumHandler>(new RefSumHandler(box), Capacity);
 		w.Start();
@@ -335,7 +356,8 @@ public class SyncRefBenchmarks {
 			w.Dispatch(msg);
 
 		w.TryComplete();
-		w.Completion.GetAwaiter().GetResult();
+
+		await w.Completion.ConfigureAwait(false); // GetAwaiter().GetResult();
 		return box.Sum;
 	}
 }
@@ -348,7 +370,7 @@ public class AsyncRefBenchmarks {
 	[Params(24)]
 	public int Capacity;
 
-	[Params(1_000)]
+	[Params(10_000)]
 	public int ItemCount;
 
 	[Benchmark(Baseline = true)]
@@ -378,7 +400,7 @@ public class AsyncRefBenchmarks {
 	}
 
 	[Benchmark]
-	public long AsyncSpWorker_Ref() {
+	public async Task<long> AsyncSpWorker_Ref() {
 		var box = new Box();
 		using var w = new AsyncSpWorker<RefMsg, AsyncRefSumHandler>(new AsyncRefSumHandler(box), Capacity);
 		w.Start();
@@ -388,7 +410,7 @@ public class AsyncRefBenchmarks {
 			w.Dispatch(msg);
 
 		w.TryComplete();
-		w.Completion.GetAwaiter().GetResult();
+		await w.Completion.ConfigureAwait(false); // GetAwaiter().GetResult();
 		return box.Sum;
 	}
 
@@ -420,7 +442,7 @@ public class AsyncRefBenchmarks {
 public class MixedRefBenchmarks {
 	private static readonly RefMsg Ref = new() { Key = 1, Value = 2, Timestamp = 3, Flags = 4 };
 
-	[Params(24)]
+	[Params(24, 1024)]
 	public int Capacity;
 
 	[Params(10_000)]
@@ -453,7 +475,7 @@ public class MixedRefBenchmarks {
 	}
 
 	[Benchmark]
-	public long AsyncSpWorker_Ref() {
+	public async Task<long> AsyncSpWorker_Ref() {
 		var box = new Box();
 		using var w = new AsyncSpWorker<RefMsg, MixedAsyncRefHandler>(new MixedAsyncRefHandler(box), Capacity);
 		w.Start();
@@ -463,7 +485,25 @@ public class MixedRefBenchmarks {
 			w.Dispatch(msg);
 
 		w.TryComplete();
-		w.Completion.GetAwaiter().GetResult();
+		await w.Completion;
+		return box.Sum;
+	}
+
+	// Same worker + mixed workload, but the suspending tail pools its state machine
+	// ([AsyncMethodBuilder(PoolingAsyncValueTaskMethodBuilder)]) — should report ~0 per-item allocation
+	// vs AsyncSpWorker_Ref, since only the every-3rd suspending items allocated to begin with.
+	[Benchmark]
+	public async Task<long> AsyncSpWorker_Ref_Pooled() {
+		var box = new Box();
+		using var w = new AsyncSpWorker<RefMsg, MixedPooledAsyncRefHandler>(new MixedPooledAsyncRefHandler(box), Capacity);
+		w.Start();
+
+		var msg = Ref;
+		for (var i = 0; i < ItemCount; i++)
+			w.Dispatch(msg);
+
+		w.TryComplete();
+		await w.Completion;
 		return box.Sum;
 	}
 }

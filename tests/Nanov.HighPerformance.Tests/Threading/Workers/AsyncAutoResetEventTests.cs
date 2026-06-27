@@ -73,6 +73,35 @@ public class AsyncAutoResetEventTests {
 		}
 	}
 
+	// Drop-on-claim regression. A waiter is registered, then TWO Sets fire: the first CLAIMS the waiter
+	// (schedules its resume), the second must NOT be dropped — it has to survive as a latch so the next
+	// WaitAsync completes from it. The old "leave s_signaled on claim, reset in GetResult" design dropped
+	// the second Set (it saw s_signaled → idempotent return, then GetResult erased the latch); the
+	// claim-reset-to-null design latches it. Drives the IValueTaskSource directly like the await machinery.
+	[Test]
+	public async Task Second_Set_While_Claiming_A_Waiter_Survives_As_A_Latch() {
+		var ev = new AsyncAutoResetEvent();
+		var src = (IValueTaskSource<bool>)ev;
+		var resumed = new int[1];
+		Action<object?> cont = static s => Volatile.Write(ref ((int[])s!)[0], 1);
+
+		_ = ev.WaitAsync(); // arm (no latch present)
+		src.OnCompleted(cont, resumed, 0, ValueTaskSourceOnCompletedFlags.None); // register the waiter
+
+		ev.Set(); // claims the waiter, schedules the resume, resets state to null
+		ev.Set(); // must latch a fresh signal (not collapse into the one being delivered)
+
+		var sw = new SpinWait();
+		while (Volatile.Read(ref resumed[0]) == 0) // wait for the scheduled continuation to run
+			sw.SpinOnce();
+		Assert.That(src.GetResult(0), Is.True);
+
+		var vt = ev.WaitAsync();
+		Assert.That(vt.IsCompletedSuccessfully, Is.True,
+			"the second Set must have latched — the next wait completes from it, not park (a dropped Set parks here)");
+		Assert.That(await vt, Is.True);
+	}
+
 	// The lost-wakeup guard. One serial consumer; several setters hammer Set concurrently. Models the
 	// worker: `items` is the producer counter (≈ Tail), the consumer drains it (≈ Head) and parks on
 	// the event when caught up. A lost wakeup leaves the consumer parked with items > consumed → the
@@ -120,6 +149,13 @@ public class AsyncAutoResetEventTests {
 	// One lost edge = permanent hang (the producer won't Set again until the consumer drains, but it's
 	// parked). Periodic yields force the consumer to catch up and park, hitting the arm-vs-Set window
 	// over and over. A lock-free event with a lost-wakeup bug hangs here; the lock-based one passes.
+	//
+	// The harness mirrors the FIXED SpRingCore signaling, including the two StoreLoad fences that close
+	// the Dekker lost-wakeup on weak memory (ARM64): the producer fences between publishing `tail` and
+	// reading `head` (else its `Read(head)` can be reordered ahead of the `Write(tail)`, read a stale head,
+	// and skip the edge `Set`), and the consumer arms then RECHECKS `tail` (the arm's CAS is a full fence),
+	// self-signaling if an item appeared so it never parks on an edge the producer skipped. Without these,
+	// the harness itself loses wakeups under contention — exactly the bug the SpRingCore fix addresses.
 	[Test]
 	public async Task Stress_EdgeGated_SingleProducer_NoLostWakeup() {
 		var ev = new AsyncAutoResetEvent();
@@ -131,6 +167,7 @@ public class AsyncAutoResetEventTests {
 			for (long i = 0; i < n; i++) {
 				var t = tail;
 				Volatile.Write(ref tail, t + 1); // publish
+				Interlocked.MemoryBarrier(); // StoreLoad fence: publish tail before reading head (mirrors CommitTail)
 				if (Volatile.Read(ref head) == t) // ring was empty → edge → signal (mirrors CommitTail)
 					ev.Set();
 				if ((i & 255) == 0) Thread.Yield(); // let the consumer drain & park
@@ -143,8 +180,12 @@ public class AsyncAutoResetEventTests {
 				if (h != Volatile.Read(ref tail)) {
 					Volatile.Write(ref head, h + 1);
 					h++;
-				} else if (!await ev.WaitAsync().ConfigureAwait(false)) {
-					break;
+				} else {
+					var vt = ev.WaitAsync(); // arm — the event's CAS is a full StoreLoad fence
+					if (h != Volatile.Read(ref tail)) // recheck after arming: an item committed in the gap
+						ev.Set(); // self-signal so the armed wait completes instead of parking on a skipped edge
+					if (!await vt.ConfigureAwait(false))
+						break;
 				}
 			}
 

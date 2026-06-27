@@ -1,6 +1,7 @@
 namespace Nanov.HighPerformance.Tests.Threading.Workers;
 
 using System.Linq;
+using System.Runtime.CompilerServices;
 using Nanov.HighPerformance.Threading.Workers;
 using NUnit.Framework;
 
@@ -437,6 +438,153 @@ public class ValueSpWorkerTests {
 		Assert.That(w.Processed, Is.EqualTo(new[] { 0, 1 }));
 	}
 
+	// A ref-containing struct T must still have its slot cleared on Release (HandleScope.Release clears
+	// when IsReferenceOrContainsReferences<T>), so a drained item is collectable and the ring doesn't pin
+	// it. The int-based tests only cover the skip-clear (blittable) side; this covers the clear side.
+	[Test]
+	public void Ref_Containing_Struct_Slots_Are_Cleared_After_Drain() {
+		var w = new ValueSpWorker<Boxed, BoxedHandler>(new BoxedHandler(), 8);
+		w.Start();
+
+		var weak = PublishTransient(w);
+		w.TryComplete();
+		Assert.That(w.Completion.Wait(2000), Is.True);
+
+		GC.Collect();
+		GC.WaitForPendingFinalizers();
+		GC.Collect();
+
+		Assert.That(weak.TryGetTarget(out _), Is.False,
+			"released slot must be cleared so the boxed reference is collectable");
+		GC.KeepAlive(w); // keep the buffer alive: proves the SLOT was cleared, not just the buffer freed
+		w.Dispose();
+	}
+
+	// The handler's Clear(ref T) runs once per slot at the moment of release — on BOTH the early-release
+	// path (handler frees the slot mid-Handle for a long task) and the loop's auto-release safety net —
+	// and it sees a live reference (proving it, not a library `= default`, does the clearing).
+	[TestCase(true, TestName = "Clear_Runs_On_Early_Release")]
+	[TestCase(false, TestName = "Clear_Runs_On_Auto_Release")]
+	public void Clear_Runs_On_Slot_Release(bool releaseEarly) {
+		var probe = new ClearProbe { ReleaseEarly = releaseEarly };
+		using var w = new ValueSpWorker<Boxed, ClearProbeHandler>(new ClearProbeHandler(probe), 8);
+		w.Start();
+
+		const int n = 5;
+		for (var i = 0; i < n; i++)
+			using (var s = w.Publish())
+				s.Event() = new Boxed { Ref = new object() };
+
+		w.TryComplete();
+		Assert.That(w.Completion.Wait(2000), Is.True);
+
+		Assert.That(probe.ClearCount, Is.EqualTo(n), "Clear must run once per released slot");
+		Assert.That(probe.SawAlreadyCleared, Is.False,
+			"Clear must see the live reference — it (not a library default-write) clears the slot");
+	}
+
+	private sealed class ClearProbe {
+		public int ClearCount;
+		public bool ReleaseEarly;
+		public bool SawAlreadyCleared;
+	}
+
+	private readonly struct ClearProbeHandler : IValueWorkerHandler<Boxed> {
+		private readonly ClearProbe _probe;
+		public ClearProbeHandler(ClearProbe probe) => _probe = probe;
+
+		public void Handle(ref HandleScope<Boxed> scope) {
+			_ = scope.Event().Ref;
+			if (_probe.ReleaseEarly) scope.Release();
+		}
+
+		// Runs on the worker thread only (single consumer), so the plain ++ is race-free.
+		public void Clear(ref Boxed value) {
+			_probe.ClearCount++;
+			if (value.Ref is null) _probe.SawAlreadyCleared = true;
+			value.Ref = null;
+		}
+
+		public void OnError(Exception error) { }
+		public void OnCompleted(Exception? error) { }
+	}
+
+	// The worker dispatches through its _handler FIELD, never a per-call copy — so a mutable (non-readonly)
+	// struct handler can keep state in its own value-type fields. A StatefulHandler accumulates counters
+	// across every Handle and Clear, and OnCompleted (the SAME instance) observes the full totals. If the
+	// handler were copied per call, the counters would never exceed 0/1.
+	[Test]
+	public void Handler_Struct_Value_State_Persists_Across_Calls() {
+		var sink = new int[2];
+		using var w = new ValueSpWorker<int, StatefulHandler>(new StatefulHandler(sink), 8);
+		w.Start();
+
+		const int n = 7;
+		for (var i = 0; i < n; i++)
+			using (var s = w.Publish())
+				s.Event() = i;
+
+		w.TryComplete();
+		Assert.That(w.Completion.Wait(2000), Is.True);
+
+		Assert.That(sink[0], Is.EqualTo(n),
+			"Handle's value-type counter must accumulate — calls go through the _handler field, not a copy");
+		Assert.That(sink[1], Is.EqualTo(n),
+			"Clear runs once per item on the same handler instance");
+	}
+
+	// Mutable struct (NOT readonly) holding value-type state in its own fields. The int[] sink is only how
+	// the test reads the final counters out of OnCompleted — the state under test is _handleCount/_clearCount.
+	private struct StatefulHandler : IValueWorkerHandler<int> {
+		private readonly int[] _sink;
+		private int _handleCount;
+		private int _clearCount;
+
+		public StatefulHandler(int[] sink) {
+			_sink = sink;
+			_handleCount = 0;
+			_clearCount = 0;
+		}
+
+		public void Handle(ref HandleScope<int> scope) {
+			_ = scope.Event();
+			_handleCount++;
+		}
+
+		public void Clear(ref int value) => _clearCount++;
+		public void OnError(Exception error) { }
+		public void OnCompleted(Exception? error) {
+			_sink[0] = _handleCount;
+			_sink[1] = _clearCount;
+		}
+	}
+
+	// Object created + published in a non-inlined frame so the only strong reference is the ring slot.
+	[MethodImpl(MethodImplOptions.NoInlining)]
+	private static WeakReference<object> PublishTransient(ValueSpWorker<Boxed, BoxedHandler> w) {
+		var obj = new object();
+		var weak = new WeakReference<object>(obj);
+		using (var s = w.Publish()) s.Event() = new Boxed { Ref = obj };
+		return weak;
+	}
+
+	private struct Boxed {
+		public object? Ref;
+	}
+
+	private readonly struct BoxedHandler : IValueWorkerHandler<Boxed> {
+		public void Handle(ref HandleScope<Boxed> scope) {
+			_ = scope.Event().Ref; // read but don't retain
+			scope.Release(); // early release → Clear runs here, nulling the slot's reference
+		}
+
+		// Handler-driven slot cleanup: null just the reference field so the ring doesn't pin it.
+		public void Clear(ref Boxed value) => value.Ref = null;
+
+		public void OnError(Exception error) { }
+		public void OnCompleted(Exception? error) { }
+	}
+
 	private static int CountOf(Rec w) {
 		lock (w.Processed) return w.Processed.Count;
 	}
@@ -469,6 +617,8 @@ public class ValueSpWorkerTests {
 			if (_state.ThrowOnProcess) throw new InvalidOperationException("bang");
 			lock (_state.Processed) _state.Processed.Add(value);
 		}
+
+		public void Clear(ref int value) { } // blittable slot — nothing to release
 
 		public void OnError(Exception error) {
 			lock (_state.Errors) _state.Errors.Add(error);

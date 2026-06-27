@@ -15,6 +15,9 @@ BenchmarkDotNet.Artifacts/
 .vs/
 .vscode/
 
+## Agent / tooling
+.serena/
+
 ## Test / coverage
 [Tt]est[Rr]esults/
 *.trx

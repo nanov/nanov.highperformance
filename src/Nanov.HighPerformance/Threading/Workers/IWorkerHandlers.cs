@@ -65,6 +65,16 @@ public interface IValueWorkerHandler<T> where T : struct {
 	/// <summary>Process one slot. Invoked in FIFO order on the worker thread.</summary>
 	void Handle(ref HandleScope<T> scope);
 
+	/// <summary>
+	///   Reset a slot when it is released — invoked at the moment of release, whether the handler
+	///   released early via <see cref="HandleScope{T}.Release" /> (e.g. to free the slot for the
+	///   producer while a long task runs) or the worker loop auto-released it. Null out the slot's
+	///   reference fields (so the ring doesn't pin them) or return pooled buffers, touching only what
+	///   matters — the zero-copy ring never writes a full <c>default(T)</c> back. Always runs for the
+	///   value worker; keep it allocation-free. A no-op body is fine for blittable <typeparamref name="T" />.
+	/// </summary>
+	void Clear(ref T value);
+
 	/// <summary>Invoked synchronously when <see cref="Handle" /> throws. See <see cref="IWorkerHandler{T}.OnError" />.</summary>
 	void OnError(Exception error);
 
@@ -91,6 +101,14 @@ public interface IValueWorkerHandler<T> where T : struct {
 public interface IAsyncValueWorkerHandler<T> where T : struct {
 	/// <summary>Process one slot. Invoked in FIFO order on the worker thread. Must not be <c>async</c> (see remarks).</summary>
 	ValueTask HandleAsync(ref HandleScope<T> scope, CancellationToken cancellationToken);
+
+	/// <summary>
+	///   Reset a slot when it is released. See <see cref="IValueWorkerHandler{T}.Clear" /> — same
+	///   contract: runs synchronously at the moment of release (typically the early
+	///   <see cref="HandleScope{T}.Release" /> the handler does before returning its
+	///   <see cref="ValueTask" />), nulls reference fields / returns pooled buffers, allocation-free.
+	/// </summary>
+	void Clear(ref T value);
 
 	/// <summary>Invoked synchronously when <see cref="HandleAsync" /> faults. See <see cref="IWorkerHandler{T}.OnError" />.</summary>
 	void OnError(Exception error);

@@ -101,6 +101,9 @@ readonly struct SumHandler : IValueWorkerHandler<long> {
     // ... use slot ...
     scope.Release();           // optional: free the slot for the producer early
   }
+  // Runs on every slot release (early Release() above OR the loop's auto-release): null the slot's
+  // reference fields / return pooled buffers so the ring doesn't pin them. Empty for blittable T.
+  public void Clear(ref long value) { }
   public void OnError(Exception e) { }
   public void OnCompleted(Exception? e) { }
 }

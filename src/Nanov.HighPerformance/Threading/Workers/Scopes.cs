@@ -33,7 +33,7 @@ public readonly ref struct PublishScope<T> where T : struct {
 	public ref T Event() {
 		if (_core is null)
 			throw new InvalidOperationException("Publish scope is closed; the worker rejected the claim.");
-		return ref _core._buffer[_tail & _core._mask];
+		return ref _core.GetSlotRef(_tail);
 	}
 
 	/// <summary>Publish the slot and signal the consumer. No-op on a closed scope.</summary>
@@ -71,17 +71,20 @@ public ref struct HandleScope<T> where T : struct {
 	public readonly ref T Event() {
 		if (IsReleased)
 			throw new InvalidOperationException("HandleScope already released; the slot may have been reused.");
-		return ref _core._buffer[_head & _core._mask];
+		return ref _core.GetSlotRef(_head);
 	}
 
 	/// <summary>
-	///   Release the slot — clear it, advance the ring, and wake a producer waiting for space.
-	///   After this call the slot's contents are not safe to read. Idempotent.
+	///   Release the slot — run the handler's <c>Clear</c> on it, advance the ring, and wake a producer
+	///   waiting for space. After this call the slot's contents are not safe to read. Idempotent.
 	/// </summary>
 	public void Release() {
 		if (IsReleased) return;
 		IsReleased = true;
-		_core._buffer[_head & _core._mask] = default;
-		_core.AdvanceHead(_head);
+		// Run the value handler's Clear(ref T) on the slot then advance the ring, in one core call —
+		// whether this is an early release (the handler freeing the slot mid-task) or the loop's
+		// auto-release. The handler nulls just its reference fields / returns pooled buffers; the zero-copy
+		// ring never writes a full default(T) back. Clear is a no-op when no cleaner is bound.
+		_core.ClearAndAdvanceHead(_head);
 	}
 }
