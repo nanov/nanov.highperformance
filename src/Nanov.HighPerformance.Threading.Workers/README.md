@@ -1,7 +1,21 @@
-# Nanov.HighPerformance.Threading
+# Nanov.HighPerformance.Threading.Workers
 
-Concurrency primitives. Today this concern contains the **SPSC worker family** under
-[`Workers/`](Workers) — `Nanov.HighPerformance.Threading.Workers`.
+The **SPSC worker family** — bounded-mailbox actors / pipeline stages backed by a power-of-two ring
+buffer, with **zero per-message allocation**, blocking backpressure, drain-on-complete, and
+cancellation. Six workers in one assembly:
+
+| Worker | Shape | One-liner |
+| --- | --- | --- |
+| `SpWorker` | FIFO, sync, copy | dedicated-thread mailbox for a sync handler |
+| `AsyncSpWorker` | FIFO, async, copy | ThreadPool loop for a truly-async serial handler |
+| `ValueSpWorker` | FIFO, sync, zero-copy | `T : struct` written in place via a scope |
+| `AsyncValueSpWorker` | FIFO, async, zero-copy | zero-copy struct mailbox, async handler |
+| `ConflationSpWorker` | keyed, **last-wins** | latest value per key (skip stale) |
+| `CoalescingSpWorker` | keyed, **exactly-once** | fold/sum per key (no loss, no double) |
+
+Targets **net9.0** and **net10.0**. AOT-compatible, `unsafe`-enabled, zero-allocation on hot paths.
+
+---
 
 ## SpWorker — single-producer, dedicated-thread ring-buffer workers
 
@@ -147,11 +161,13 @@ All workers implement `IWorkerQueue` — `QueuedApprox` (≈ `Tail − Head`, lo
 - Zero per-message allocation after construction (the ring is allocated once).
 - Devirtualized struct handlers; the producer/consumer fast paths are inlined, the cold parking
   loops are not (fast/slow split).
-- Composition over an internal `SpRingCore<T>` — the bases are not part of the public API; only the
-  four workers, the four handler interfaces, `PublishScope<T>`/`HandleScope<T>`, and `IWorkerQueue`
+- Composition over an internal `SpRingCore<T>` — the cores are not part of the public API; only the
+  six workers, their handler interfaces, `PublishScope<T>`/`HandleScope<T>`, and `IWorkerQueue`
   are public.
 
-## ConflationSpWorker — key-conflating worker
+---
+
+## ConflationSpWorker — key-conflating worker (last-wins)
 
 A `ConflationSpWorker<TKey, TValue, THandler>` is an SPSC worker that **conflates by key, last-wins**:
 you `Dispatch(key, value)`, and if a value with the same key is still queued, the new value **overrides**
@@ -182,8 +198,7 @@ override ring.
 - **Guaranteed-latest delivery.** The newest value per key is always delivered; the only artifact is a
   rare duplicate (older then newer) when a value is overwritten while its cell is mid-read — harmless
   because it's last-wins.
-  (Sync, reference-value, last-wins only — async / value-struct / combining variants are not in this
-  version.)
+  (Sync, reference-value, last-wins only — async / value-struct variants are not in this version.)
 
 ### The handler
 
@@ -226,4 +241,83 @@ await w.Completion;
 
 Lifecycle, errors, and telemetry (`IWorkerQueue`) are identical to the rest of the family.
 Benchmarked against the idiomatic `ConcurrentDictionary`-latest + `Channel<key>` baseline it runs
-~2–2.5× faster at ~0.4× the allocation.
+~2–5× faster at ~0.4× the allocation, and at/below its coalescing twin on pure throughput.
+
+---
+
+## CoalescingSpWorker — key-coalescing worker (exactly-once)
+
+A `CoalescingSpWorker<TKey, TValue, THandler>` is the **combine/additive sibling** of
+`ConflationSpWorker`. Instead of last-wins override, it **folds** values per key with **exactly-once**
+delivery: each key has a stable cell; the producer merges `incoming` into the cell via the handler's
+`Coalesce`; the worker thread takes-and-resets the cell and calls `Handle` with the coalesced total.
+A contribution is never double-counted and never lost — use it for "sum of deltas per account",
+"merge of partial updates per entity", or any running fold where every input must be accounted for
+exactly once.
+
+### Contract & constraints
+
+- Same single-producer / single-consumer contract; capacity rounds up to a power of two and equals
+  the max distinct *pending* keys (a new dirty key blocks when full; folding an already-dirty key
+  never blocks).
+- `where TKey : notnull, IEquatable<TKey>` — keyed by its own `GetHashCode` / `Equals`.
+- `TValue` is **unconstrained**. A per-cell 4-state lock (not any constraint on `TValue`) provides
+  exactly-once, so `TValue` may be a **value type** (zero per-item allocation — cells live inline in
+  pooled arrays, the dirty queue carries `int` indices) **or** a reference type (the handler's
+  `Coalesce` may allocate; the worker itself still doesn't).
+- `default(TValue)` is the **identity** (zero / null) — a freshly-taken cell starts from it.
+
+### The handler
+
+The handler adds one member over the conflation handler — `Coalesce`, the fold, which runs on the
+**producer** thread under the cell lock:
+
+```csharp
+public interface ICoalescingWorkerHandler<TKey, TValue> {
+  // Fold `incoming` into `current` and return the new accumulated value. May mutate `current` in
+  // place and return it, or return a fresh value. Runs on the producer thread, under the cell lock.
+  TValue Coalesce(ref TValue current, ref TValue incoming);
+  void Handle(TKey key, TValue value);   // worker thread; the coalesced total for the key
+  void OnError(Exception error);
+  void OnCompleted(Exception? error);
+}
+```
+
+### Usage
+
+```csharp
+struct Tally { public long Sum; }
+
+readonly struct SumHandler : ICoalescingWorkerHandler<int, Tally> {
+  public Tally Coalesce(ref Tally current, ref Tally incoming) {
+    current.Sum += incoming.Sum;        // fold in place
+    return current;
+  }
+  public void Handle(int key, Tally total) { /* total.Sum = exactly-once sum of deltas */ }
+  public void OnError(Exception e) { }
+  public void OnCompleted(Exception? e) { }
+}
+
+using var w = new CoalescingSpWorker<int, Tally, SumHandler>(new SumHandler(), capacity: 1024);
+w.Start();
+
+foreach (var d in deltas)
+  w.Dispatch(d.AccountId, new Tally { Sum = d.Amount }); // folds into the account's cell
+
+w.TryComplete();
+await w.Completion;
+```
+
+### Conflation vs coalescing — which one?
+
+| | `ConflationSpWorker` | `CoalescingSpWorker` |
+| --- | --- | --- |
+| Semantics | last-wins (latest per key) | combine/additive (fold per key) |
+| Delivery | guaranteed-latest (rare harmless dup) | **exactly-once** |
+| Handler | `Handle` only | `Handle` + `Coalesce` |
+| `TValue` | `class` (atomic ref overwrite) | unconstrained (value type ⇒ 0 alloc) |
+| Cell protocol | 3-state presence, no lock | 4-state lock |
+| Use for | latest price/state, skip stale | running sums/merges, no loss |
+
+Both share the same map + dirty-ring infrastructure; conflation is the slimmer last-wins
+specialization. Lifecycle, errors, and telemetry are identical across the whole family.

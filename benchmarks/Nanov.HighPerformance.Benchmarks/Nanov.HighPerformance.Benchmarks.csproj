@@ -12,7 +12,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../../src/Nanov.HighPerformance/Nanov.HighPerformance.csproj" />
+    <ProjectReference Include="../../src/Nanov.HighPerformance.Threading.Workers/Nanov.HighPerformance.Threading.Workers.csproj" />
   </ItemGroup>
 
 </Project>

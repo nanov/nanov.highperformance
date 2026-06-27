@@ -1,9 +1,9 @@
-# Threading — agent notes
+# Threading.Workers — agent notes
 
-Scope: `Nanov.HighPerformance.Threading` and below. Today that's the **SPSC worker family** in
-[`Workers/`](Workers) (`…Threading.Workers`, internal core in `…Threading.Workers.Internal`). Read
-[`README.md`](README.md) for the user-facing API. This file is the stuff to not get wrong when
-editing.
+Scope: the `Nanov.HighPerformance.Threading.Workers` library (its own project/assembly/package). The
+public workers live at the project root; the internal cores are in [`Internal/`](Internal)
+(`…Threading.Workers.Internal`). Read [`README.md`](README.md) for the user-facing API. This file is
+the stuff to not get wrong when editing.
 
 ## The one rule: SPSC SIGNALING INVARIANT
 

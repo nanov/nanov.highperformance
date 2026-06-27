@@ -65,22 +65,22 @@ public class CoalescingWorkerBenchmarks {
 	}
 
 	[Benchmark(Baseline = true)]
-	public void CoalescingSpWorker() {
+	public async Task CoalescingSpWorker() {
 		using var w = new CoalescingSpWorker<int, Tally, SumHandler>(new SumHandler(ConsumerWork), Capacity);
 		w.Start();
 		for (var i = 0; i < Messages; i++)
 			w.Dispatch(i % KeySpace, new Tally { Sum = i });
 		w.TryComplete();
-		w.Completion.Wait();
+		await w.Completion;
 	}
 
 	[Benchmark]
-	public void ConflationSpWorker() {
+	public async Task ConflationSpWorker() {
 		using var w = new ConflationSpWorker<int, Box, LastHandler>(new LastHandler(ConsumerWork), Capacity);
 		w.Start();
 		for (var i = 0; i < Messages; i++)
 			w.Dispatch(i % KeySpace, new Box { Value = i });
 		w.TryComplete();
-		w.Completion.Wait();
+		await w.Completion;
 	}
 }
