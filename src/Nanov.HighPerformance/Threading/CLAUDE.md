@@ -166,6 +166,42 @@ its earlier unfenced form reproduced this exact hang under parallel-TFM contenti
 (incl. two open scopes / a forgotten `using`), NOT thread identity (serial cross-thread is legal).
 Compiles to nothing in Release. If you add producer entry points, guard them the same way.
 
+## CompactingSpWorker (key-conflating worker) — invariants
+
+`CompactingSpWorker<TKey, TValue, THandler>` conflates by key: `Dispatch(key, value)` overrides an
+already-queued value for the same key **in place, keeping its position**, via the handler's
+`Merge`. It does **not** reuse `SpRingCore` — it has its own sibling core. Things to not get wrong:
+
+- **Sibling core, FIFO core stays pristine.** `CompactingSpRingCore<TKey, TValue, TMerger>` is a
+  separate file. The compacting producer writes a value slot **inside `[head, tail)`** (an override),
+  which the `SpRingCore` SPSC invariant explicitly forbids ("producer only writes `[tail, …)`"). Do
+  **not** merge the two cores or route compacting writes through `SpRingCore`.
+- **Core is generic over the merge facet, not the handler.** `TMerger : struct, IItemMerger<TValue>`
+  (not `THandler`). The core calls `_merger.Merge` directly (devirtualized, no `SlotCleaner`-style
+  trampoline) and **never** references `Handle` — `Handle` lives in the worker's run loop, so a future
+  `AsyncCompactingSpWorker` can reuse this exact core. Don't pull `Handle` into the core.
+- **The override Dekker (fenced on BOTH sides) — don't weaken it.** Producer: `Volatile.Write(slot,
+  merged)` → `Interlocked.MemoryBarrier()` → read **`_reading` THEN `Head`**; trust the in-place
+  override iff `Head − seq < 0` **or** (`Head == seq && _reading == 0`); otherwise enqueue the
+  **un-merged** `value` fresh. Consumer (`TryTake`): `_reading = 1` → `Interlocked.MemoryBarrier()` →
+  read slot → advance `Head` → `_reading = 0`. The consumer's per-item fence and the producer reading
+  `_reading` before `Head` are what make it both **lossless** (newest always delivered) and **clean**
+  (a merely-parked consumer conflates the head slot with no spurious duplicate). Removing either fence,
+  flipping the read order, or using `<=` for the trust test reintroduces a lost update or a
+  deterministic head-slot duplicate. The consumer **acquire-reads the value** (`Volatile.Read`) because
+  an override publishes without moving `Tail`.
+- **`Merge` runs on the PRODUCER thread; must be pure + replace-style.** Different thread from `Handle`
+  → sharing mutable handler state is a race. Replace-style only: the doubt-path delivers `current` then
+  `incoming` separately, so additive/accumulate would double-count. The worker passes the handler to
+  the core as `TMerger`; the core holds a copy used solely for `Merge` (purity makes the copy safe).
+- **`CompactingKeyMap<TKey>` is producer-thread-only.** `TKey → int seq` open-addressing map, no
+  per-key delete (eviction is the bulk `Compact`). Never read/write it from the consumer. Fresh-enqueue
+  records `key → tail`; the producer compacts (drops stale `seq < head`) when the map fills. `TValue`
+  is **not** stored in the map — values live in the ring; the map only dedupes keys.
+- **`TValue : class`** is load-bearing: the in-place override is a single atomic reference write (no
+  torn read, no double-buffer). A struct value would tear — don't relax the constraint without a new
+  publish mechanism.
+
 ## Naming
 
 `Sp` = single-producer (the part the caller must uphold); single-consumer is structural, so it's

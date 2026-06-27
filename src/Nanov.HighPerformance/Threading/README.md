@@ -150,3 +150,81 @@ All workers implement `IWorkerQueue` — `QueuedApprox` (≈ `Tail − Head`, lo
 - Composition over an internal `SpRingCore<T>` — the bases are not part of the public API; only the
   four workers, the four handler interfaces, `PublishScope<T>`/`HandleScope<T>`, and `IWorkerQueue`
   are public.
+
+## CompactingSpWorker — key-conflating worker
+
+A `CompactingSpWorker<TKey, TValue, THandler>` is an SPSC worker that **conflates by key**: you
+`Dispatch(key, value)`, and if a value with the same key is still queued, the new value is merged
+into the queued one **in place, keeping its original position**. The consumer sees, per key, the
+**latest** value dispatched before it was processed — never a stranded newer value. This is a
+conflation / coalescing queue (LMAX/Aeron territory): exactly what you want for "latest price per
+instrument", "newest state per entity", or any feed where a slow consumer should skip stale updates
+rather than fall behind.
+
+It reuses the worker shell (dedicated thread, lifecycle, backpressure, devirtualized struct handler)
+but has its own core — the producer writes a value slot inside the live `[head, tail)` window, which
+the strict-FIFO `SpWorker` core forbids.
+
+### Contract & constraints
+
+- Same single-producer (your responsibility, `DEBUG`-guarded) / single-consumer (structural) contract
+  as the rest of the family; capacity rounds up to a power of two.
+- `where TKey : notnull, IEquatable<TKey>` — keyed like a normal dictionary (its own `GetHashCode` /
+  `Equals`); the handler supplies **no** hash. Distinct keys that share a hash bucket are *not*
+  conflated.
+- `where TValue : class` — values are references. A single reference write is atomic, so an in-place
+  override is publish-safe with no torn read (this is what keeps the design lock-free and copy-free).
+- **Capacity = max distinct *pending* keys.** Conflating an already-queued key never blocks; a *new*
+  distinct key blocks when `Capacity` keys are already pending (backpressure).
+- **Guaranteed-latest delivery.** The newest value per key is always delivered; the only artifact is a
+  rare duplicate (older then newer) under a genuine at-head race. (Sync, reference-value, replace-style
+  merge only — async / value-struct / additive-merge variants are not in this version.)
+
+### The handler
+
+`ICompactingWorkerHandler<TKey, TValue>` inherits the producer-side merge facet
+`IItemMerger<TValue>` and adds the consumer side:
+
+```csharp
+public interface IItemMerger<TValue> {
+  TValue Merge(TValue current, TValue incoming);   // PRODUCER thread; pure; replace-style
+}
+
+public interface ICompactingWorkerHandler<TKey, TValue> : IItemMerger<TValue> {
+  void Handle(TKey key, TValue value);   // worker thread, first-seen key order
+  void OnError(Exception error);          // Handle threw — sync; worker continues
+  void OnCompleted(Exception? error);     // drained & exiting
+}
+```
+
+`Merge` is the conflation function: `return incoming;` for last-wins, or combine fields / keep the
+higher version. Two rules: it runs on the **producer** thread (not the worker thread), so it must be
+**pure** — read its two arguments, return a value, touch no mutable handler state; and it must be
+**replace-style** — each returned value self-contained (under a race the worker may deliver the
+previous value and then `incoming` separately, so additive/accumulate merges would double-count).
+
+### Usage
+
+```csharp
+sealed class Quote { public decimal Price; }
+
+readonly struct LatestQuote : ICompactingWorkerHandler<int, Quote> {
+  public Quote Merge(Quote current, Quote incoming) => incoming;      // keep the newest
+  public void Handle(int instrumentId, Quote q) => Publish(instrumentId, q.Price);
+  public void OnError(Exception e) { /* log */ }
+  public void OnCompleted(Exception? e) { }
+}
+
+using var w = new CompactingSpWorker<int, Quote, LatestQuote>(new LatestQuote(), capacity: 1024);
+w.Start();
+
+foreach (var tick in feed)
+  w.Dispatch(tick.InstrumentId, new Quote { Price = tick.Price }); // same id still queued → conflated
+
+w.TryComplete();
+await w.Completion;
+```
+
+Lifecycle, errors, and telemetry (`IWorkerQueue`) are identical to the rest of the family.
+Benchmarked against the idiomatic `ConcurrentDictionary`-latest + `Channel<key>` baseline it runs
+~2–2.5× faster at ~0.4× the allocation.
