@@ -1,9 +1,9 @@
-# Threading — agent notes
+# Threading.Workers — agent notes
 
-Scope: `Nanov.HighPerformance.Threading` and below. Today that's the **SPSC worker family** in
-[`Workers/`](Workers) (`…Threading.Workers`, internal core in `…Threading.Workers.Internal`). Read
-[`README.md`](README.md) for the user-facing API. This file is the stuff to not get wrong when
-editing.
+Scope: the `Nanov.HighPerformance.Threading.Workers` library (its own project/assembly/package). The
+public workers live at the project root; the internal cores are in [`Internal/`](Internal)
+(`…Threading.Workers.Internal`). Read [`README.md`](README.md) for the user-facing API. This file is
+the stuff to not get wrong when editing.
 
 ## The one rule: SPSC SIGNALING INVARIANT
 
@@ -55,11 +55,15 @@ its earlier unfenced form reproduced this exact hang under parallel-TFM contenti
 
 ## Architecture (don't regress these)
 
-- **Composition, not inheritance.** All machinery lives in `internal sealed SpRingCore<T>`; the four
-  public workers *own* one and forward to it. Do **not** reintroduce public base classes — a public
-  worker can't derive from an internal base (CS0060), and we deliberately keep the core internal.
-  Public surface is exactly: the 4 workers, the 4 `IWorkerHandler` interfaces, `PublishScope<T>`,
-  `HandleScope<T>`, `IWorkerQueue`. Keep it that way.
+- **Composition, not inheritance.** All machinery lives in internal sealed cores; the public workers
+  *own* one and forward to it. The four FIFO workers own a `SpRingCore<T>`; `ConflationSpWorker` and
+  `CoalescingSpWorker` are twins that each own a `SpRingCore<int>` dirty-index ring + a producer-private
+  `CoalescingKeyMap` (conflation = last-wins overwrite + 3-state presence; coalescing = additive merge +
+  4-state lock). Do **not** reintroduce public base classes — a public worker
+  can't derive from an internal base (CS0060), and we deliberately keep the cores internal. Public
+  surface: the six workers (the four FIFO + `ConflationSpWorker` + `CoalescingSpWorker`), their handler
+  interfaces (the four `IWorkerHandler` + `IConflationWorkerHandler` + `ICoalescingWorkerHandler`),
+  `PublishScope<T>`, `HandleScope<T>`, `IWorkerQueue`. Keep it tight.
 - **Devirtualized struct handlers.** Workers are `…<T, THandler> where THandler : struct,
   I…Handler<T>`. Per-item `Handle`/`OnError`/`OnCompleted` go through the struct field so the JIT
   inlines them. Never store the handler as an interface reference or call it virtually.
@@ -165,6 +169,82 @@ its earlier unfenced form reproduced this exact hang under parallel-TFM contenti
 `TryEnqueue`, scope path spans `Publish()`→`PublishScope.Dispose()`. It detects concurrency/overlap
 (incl. two open scopes / a forgotten `using`), NOT thread identity (serial cross-thread is legal).
 Compiles to nothing in Release. If you add producer entry points, guard them the same way.
+
+## ConflationSpWorker (key-conflating worker) — invariants
+
+`ConflationSpWorker<TKey, TValue, THandler>` conflates by key, **last-wins**: `Dispatch(key, value)`
+overrides an already-pending value for the same key — a plain override, **no merge or drop callback** —
+so the consumer sees only the latest value per key, in first-seen key order. It is the **last-wins twin
+of `CoalescingSpWorker`** and reuses the coalescer's two structures verbatim. Things to not get wrong:
+
+- **Twin on the coalescing infra — no bespoke core.** It owns a `SpRingCore<int>` (dirty-cell index
+  ring) + a producer-private `CoalescingKeyMap<TKey, TValue>` (stable cells `{Key, Value, State}` reached
+  by index), exactly like `CoalescingSpWorker`. The old `ConflationSpRingCore`/`ConflationKeyMap` (a
+  two-array ring with an in-place `[head, tail)` value override + a Dekker `_reading` protocol) were
+  **deleted** — they benchmarked 1.7–2.2× slower than the coalescer. Do **not** reintroduce a value-
+  carrying override ring.
+- **3-state presence, not a 4-state lock.** `State` ∈ `Free(0)`/`Available(1)`/`Consuming(2)`. There is
+  **no `Merging`** — last-wins has no read-modify-write to serialize, so the producer never locks. Only
+  `Free == 0` is "evictable" (the contract `CoalescingKeyMap.EvictFree` keys off); the other two are
+  arbitrary non-zero. Don't add a `Merging` state or a `Coalesce` call.
+- **`Value` is single-writer (the producer); the consumer only CASes it back to null.** Producer:
+  `Volatile.Write(ref cell.Value, value)` (atomic ref overwrite) → `Interlocked.Exchange(ref cell.State,
+  Available)`. If the exchange returns `Available` the index is already in the ring → conflated in place,
+  done. Otherwise (`Free` or `Consuming`) the index is not in the ring → enqueue once. Consumer: CAS
+  `Available→Consuming`, read `Value` (acquire — published before the producer's `Exchange`),
+  **conditionally** `Interlocked.CompareExchange(ref cell.Value, null, taken)` to release the ref for GC
+  iff the producer hasn't overwritten it since, then CAS `Consuming→Free`. The closing CAS **fails iff**
+  the producer re-dirtied during the read (state is now `Available`), in which case a fresh ring entry
+  already exists → leave the cell queued (latest redelivered). The `Interlocked` ops on `State` give a
+  total order on both sides: losslessness (latest always delivered) with at most a harmless duplicate of
+  the latest value — correct precisely **because** it's last-wins. Don't make the value clear
+  unconditional (it would clobber a concurrent override → lost update).
+- **Eviction is the coalescer's unchanged state-gated `EvictFree`** — producer-side, cold, tombstones
+  only `Free` cells. While an index is in the ring (`Available`) or being read (`Consuming`), the cell is
+  non-`Free`, so a handed-out index is never reused under the consumer (the slot-reuse race that killed a
+  2-state dirty-flag attempt cannot occur — 1 bit can't distinguish "claimed" from "done"). The consumer
+  touches only `State`/`Value`/`Key` by index via `RefAt`, never the map metadata.
+- **Hard-stop guard before the map.** `Dispatch` bails on `_ring.IsStopped` *before* touching the map
+  (Dispose/cancel tears the map down). The soft-complete path keeps the map valid and is rejected later
+  by `TryEnqueue` (→ rollback `State→Free` → false).
+- **`TValue : class`** is load-bearing: the overwrite and the null-clear are single atomic reference
+  writes. A struct value would tear — don't relax the constraint without a new publish mechanism.
+
+## CoalescingSpWorker (key-coalescing worker, exactly-once) — invariants
+
+`CoalescingSpWorker<TKey, TValue, THandler>` folds values per key with **exactly-once** delivery — the
+combine/additive sibling of `ConflationSpWorker` (last-wins). `Dispatch(key, value)` merges into the
+key's stable cell via the handler's `Coalesce`; the worker thread takes-and-resets the cell and calls
+`Handle` with the coalesced total. Things to not get wrong:
+
+- **Two structures: cell map + dirty-index ring.** `CoalescingKeyMap<TKey, TValue>` (producer-private,
+  fixed-capacity, no-relocation open-addressing; cell = `{Key, Value, State}` inline, reached by a
+  **stable slot index**) holds the accumulators; a separate `SpRingCore<int>` carries the dirty cell
+  indices (FIFO). Don't fuse them into a value-carrying ring — the in-place merge inside `[head, tail)`
+  would reintroduce the producer/consumer override race (that path was tried as a fused ring and
+  removed; it conflates too weakly anyway — per-batch, not global).
+- **Per-cell 4-state lock is the exactly-once mechanism.** `State` ∈ `Free`/`Available`/`Merging`/
+  `Consuming`, CAS'd. Producer-merge (`Merging`) and consumer-take (`Consuming`) are mutually exclusive,
+  so a contribution sits in the cell until **one** take copies it out and resets to `default` — never
+  double-counted, never lost. This lock — not any constraint on `TValue` — is what prevents torn reads,
+  so `TValue` is **unconstrained** (value type ⇒ zero per-item alloc; reference type ⇒ the handler's
+  `Coalesce` may allocate, the worker still doesn't).
+- **`Coalesce(ref TValue current, ref TValue incoming) → TValue` runs on the PRODUCER thread under the
+  cell lock.** Return-based: may fold `current` in place and return it, or return a fresh value. The
+  worker stores the return into the cell. `default(TValue)` is the identity (null for a reference type).
+- **Keys are producer-write-only.** The consumer touches a cell's `State`/`Value` only (by index via
+  `RefAt`), never the map metadata, and **never clears the key** — keys are written by the producer
+  (`Place`) and cleared producer-side (`EvictFree`), so the probe never races a consumer key-clear (the
+  bug that bit the fused ring doesn't exist here). State-gated eviction (`EvictFree` only tombstones
+  `Free` cells) means the producer never clears a cell the consumer holds.
+- **`QUEUED`/first-dirty gating.** A cell's index is enqueued to the dirty ring only on the
+  `Free → Available` (first-dirty) transition; re-dispatching an already-dirty key folds in place without
+  re-enqueuing. Backpressure: a new dirty key blocks when `Capacity` keys are already dirty; conflating
+  an already-dirty key never blocks. Hard stop drops queued cells; `TryComplete` drains them.
+
+(We evaluated and **removed** a consumer-side-conflation `BatchAccumulatingSpWorker`: under a lagging
+consumer it re-delivers each key once per batch — ~76–106× slower than this cell-map worker, which
+conflates globally. Don't reintroduce it.)
 
 ## Naming
 

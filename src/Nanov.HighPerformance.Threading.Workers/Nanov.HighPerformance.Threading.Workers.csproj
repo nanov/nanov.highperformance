@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net9.0;net10.0</TargetFrameworks>
+    <RootNamespace>Nanov.HighPerformance.Threading.Workers</RootNamespace>
+    <AssemblyName>Nanov.HighPerformance.Threading.Workers</AssemblyName>
+    <IsAotCompatible>true</IsAotCompatible>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- NuGet packaging -->
+  <PropertyGroup>
+    <PackageId>Nanov.HighPerformance.Threading.Workers</PackageId>
+    <Description>The SPSC worker family for .NET — bounded-mailbox actors / pipeline stages backed by a power-of-two ring buffer: sync and async, copy and zero-copy, plus key-conflating (last-wins) and key-coalescing (exactly-once) workers. Zero per-message allocation, blocking backpressure, drain-on-complete, cancellation.</Description>
+    <PackageTags>high-performance;low-allocation;concurrency;spsc;ring-buffer;worker;actor;channel;lock-free;zero-alloc;conflation;coalescing</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Nanov.HighPerformance.Tests" />
+  </ItemGroup>
+
+</Project>

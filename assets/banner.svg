@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400" font-family="&#39;JetBrains Mono&#39;,&#39;SFMono-Regular&#39;,Consolas,&#39;Liberation Mono&#39;,Menlo,monospace">
+  <defs>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#78A0FF" stroke-opacity="0.06" stroke-width="1"></path>
+    </pattern>
+    <pattern id="tilegrid" width="17.3" height="17.3" patternUnits="userSpaceOnUse">
+      <path d="M17.3 0H0V17.3" fill="none" stroke="#78A0FF" stroke-opacity="0.08" stroke-width="1"></path>
+    </pattern>
+  </defs>
+
+  <rect width="1280" height="400" fill="#0B1730"></rect>
+  <rect width="1280" height="400" fill="url(#grid)"></rect>
+
+  
+  <rect x="76" y="119" width="104" height="104" rx="24" fill="#0A152E"></rect>
+  <rect x="76" y="119" width="104" height="104" rx="24" fill="url(#tilegrid)"></rect>
+  <rect x="76.5" y="119.5" width="103" height="103" rx="23.5" fill="none" stroke="#78A0FF" stroke-opacity="0.2"></rect>
+  <text x="128" y="171" text-anchor="middle" dominant-baseline="central" font-size="40" font-weight="800" letter-spacing="-1.2"><tspan fill="#4D97FF">[</tspan><tspan fill="#EFF4FF">nv</tspan><tspan fill="#4D97FF">]</tspan></text>
+
+  
+  <text x="204" y="170" font-size="42" font-weight="800" letter-spacing="-0.84"><tspan fill="#EFF4FF">Nanov</tspan><tspan fill="#6E86B6" font-weight="500">.HighPerformance</tspan></text>
+  <text x="204" y="198" font-size="15" font-weight="500" fill="#7E96C4" letter-spacing="0.3">Low-level, memory-efficient data structures for .NET</text>
+
+  
+  <g font-size="11" font-weight="600" letter-spacing="0.33" fill="#9DB6E4">
+    <rect x="76" y="253" width="120" height="28" rx="14" fill="#4D97FF" fill-opacity="0.07" stroke="#78A0FF" stroke-opacity="0.22"></rect>
+    <text x="136" y="267" text-anchor="middle" dominant-baseline="central">low-allocation</text>
+    <rect x="207" y="253" width="86" height="28" rx="14" fill="#4D97FF" fill-opacity="0.07" stroke="#78A0FF" stroke-opacity="0.22"></rect>
+    <text x="250" y="267" text-anchor="middle" dominant-baseline="central">zero-copy</text>
+    <rect x="304" y="253" width="128" height="28" rx="14" fill="#4D97FF" fill-opacity="0.07" stroke="#78A0FF" stroke-opacity="0.22"></rect>
+    <text x="368" y="267" text-anchor="middle" dominant-baseline="central">Span&lt;T&gt; · char*</text>
+    <rect x="443" y="253" width="76" height="28" rx="14" fill="#4D97FF" fill-opacity="0.07" stroke="#78A0FF" stroke-opacity="0.22"></rect>
+    <text x="481" y="267" text-anchor="middle" dominant-baseline="central">.NET 9+</text>
+  </g>
+
+  
+  <g opacity="0.92">
+    <g font-size="10" font-weight="500" fill="#3E558A" letter-spacing="0.5">
+      <text x="1014" y="154">0x00</text>
+      <text x="1014" y="174">0x10</text>
+      <text x="1014" y="194">0x20</text>
+      <text x="1014" y="214">0x30</text>
+      <text x="1014" y="234">0x40</text>
+      <text x="1014" y="254">0x50</text>
+    </g>
+    <g>
+      <rect x="1048" y="144" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1064" y="144" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1080" y="144" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1096" y="144" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1112" y="144" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1128" y="144" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1144" y="144" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1160" y="144" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1176" y="144" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1192" y="144" width="12" height="12" rx="1.5" fill="#4D97FF"></rect>
+      <rect x="1048" y="164" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1064" y="164" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1080" y="164" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1096" y="164" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1112" y="164" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1128" y="164" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1144" y="164" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1160" y="164" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1176" y="164" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1192" y="164" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect>
+      <rect x="1048" y="184" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1064" y="184" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1080" y="184" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1096" y="184" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1112" y="184" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1128" y="184" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1144" y="184" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1160" y="184" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1176" y="184" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1192" y="184" width="12" height="12" rx="1.5" fill="#4D97FF"></rect>
+      <rect x="1048" y="204" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1064" y="204" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1080" y="204" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1096" y="204" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1112" y="204" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1128" y="204" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1144" y="204" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1160" y="204" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1176" y="204" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1192" y="204" width="12" height="12" rx="1.5" fill="#4D97FF"></rect>
+      <rect x="1048" y="224" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1064" y="224" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1080" y="224" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1096" y="224" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1112" y="224" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1128" y="224" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1144" y="224" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1160" y="224" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1176" y="224" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1192" y="224" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect>
+      <rect x="1048" y="244" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1064" y="244" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1080" y="244" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1096" y="244" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1112" y="244" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1128" y="244" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1144" y="244" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1160" y="244" width="12" height="12" rx="1.5" fill="#4D97FF"></rect><rect x="1176" y="244" width="12" height="12" rx="1.5" fill="#7DA5FF" fill-opacity="0.1"></rect><rect x="1192" y="244" width="12" height="12" rx="1.5" fill="#4D97FF"></rect>
+    </g>
+  </g>
+</svg>

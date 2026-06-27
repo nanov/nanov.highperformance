@@ -1,0 +1,120 @@
+name: release
+
+# Manual release. Pick the channel + bump; the version is derived from the latest GitHub release
+# (by semver precedence, official or prerelease) — see .github/scripts/compute_version.py:
+#   official:   none -> props VersionPrefix | last prerelease -> finalize (drop suffix) | last official -> bump
+#   prerelease: none -> props + '-<label>.1' | last prerelease -> next '<label>.N' | last official -> bump + '-<label>.1'
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Release channel"
+        type: choice
+        options: [prerelease, official]
+        default: prerelease
+      release_type:
+        description: "Semver part to bump (applies when bumping from an official release; ignored when continuing/finalizing a prerelease, or when there is no prior release)"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      prerelease_label:
+        description: "Prerelease label (channel=prerelease only)"
+        type: string
+        default: preview
+      dry_run:
+        description: "Compute + build + pack only; do NOT push to NuGet or create a GitHub release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # create the tag + GitHub release
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so tags/releases are visible
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            9.0.x
+            10.0.x
+
+      - name: Compute version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          LABEL: ${{ inputs.prerelease_label }}
+        run: python3 .github/scripts/compute_version.py >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          echo "### Release \`${{ steps.ver.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- channel: \`${{ inputs.channel }}\` · bump: \`${{ inputs.release_type }}\` · dry-run: \`${{ inputs.dry_run }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- version: \`${{ steps.ver.outputs.version }}\` (prefix \`${{ steps.ver.outputs.version_prefix }}\`, suffix \`${{ steps.ver.outputs.version_suffix }}\`)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore
+        run: dotnet restore
+
+      # Build ONCE with the computed version baked in; test + pack reuse it (--no-build).
+      - name: Build
+        run: >
+          dotnet build -c Release --no-restore
+          -p:VersionPrefix=${{ steps.ver.outputs.version_prefix }}
+          -p:VersionSuffix=${{ steps.ver.outputs.version_suffix }}
+
+      - name: Test
+        run: dotnet test -c Release --no-build --verbosity normal
+
+      - name: Pack
+        run: >
+          dotnet pack src/Nanov.HighPerformance.Threading.Workers/Nanov.HighPerformance.Threading.Workers.csproj
+          -c Release --no-build
+          -p:VersionPrefix=${{ steps.ver.outputs.version_prefix }}
+          -p:VersionSuffix=${{ steps.ver.outputs.version_suffix }}
+          -o artifacts
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg-${{ steps.ver.outputs.version }}
+          path: artifacts/*
+
+      - name: Push to NuGet
+        if: ${{ !inputs.dry_run }}
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo "::error::NUGET_API_KEY secret is not set"; exit 1
+          fi
+          # One freshly-versioned package; the matching .snupkg is pushed automatically.
+          # --skip-duplicate makes re-runs after a partial failure idempotent.
+          dotnet nuget push artifacts/*.nupkg \
+            --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
+
+      - name: Create GitHub release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=( "${{ steps.ver.outputs.tag }}" artifacts/*.nupkg
+                 --title "${{ steps.ver.outputs.tag }}"
+                 --generate-notes
+                 --target "${{ github.sha }}" )
+          if [ "${{ steps.ver.outputs.is_prerelease }}" = "true" ]; then
+            args+=( --prerelease )
+          fi
+          gh release create "${args[@]}"
