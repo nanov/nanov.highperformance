@@ -151,19 +151,22 @@ All workers implement `IWorkerQueue` — `QueuedApprox` (≈ `Tail − Head`, lo
   four workers, the four handler interfaces, `PublishScope<T>`/`HandleScope<T>`, and `IWorkerQueue`
   are public.
 
-## CompactingSpWorker — key-conflating worker
+## ConflationSpWorker — key-conflating worker
 
-A `CompactingSpWorker<TKey, TValue, THandler>` is an SPSC worker that **conflates by key**: you
-`Dispatch(key, value)`, and if a value with the same key is still queued, the new value is merged
-into the queued one **in place, keeping its original position**. The consumer sees, per key, the
-**latest** value dispatched before it was processed — never a stranded newer value. This is a
-conflation / coalescing queue (LMAX/Aeron territory): exactly what you want for "latest price per
-instrument", "newest state per entity", or any feed where a slow consumer should skip stale updates
-rather than fall behind.
+A `ConflationSpWorker<TKey, TValue, THandler>` is an SPSC worker that **conflates by key, last-wins**:
+you `Dispatch(key, value)`, and if a value with the same key is still queued, the new value **overrides**
+the queued one **in place, keeping its original position** — a plain override, no merge or drop
+callback. The consumer sees, per key, the **latest** value dispatched before it was processed — never a
+stranded newer value. This is a conflation queue (LMAX/Aeron territory): exactly what you want for
+"latest price per instrument", "newest state per entity", or any feed where a slow consumer should skip
+stale updates rather than fall behind. (For *combining* per key — sum/merge with exactly-once — use
+`CoalescingSpWorker`.)
 
-It reuses the worker shell (dedicated thread, lifecycle, backpressure, devirtualized struct handler)
-but has its own core — the producer writes a value slot inside the live `[head, tail)` window, which
-the strict-FIFO `SpWorker` core forbids.
+It is the **last-wins twin of `CoalescingSpWorker`** and shares its two structures: a producer-private
+map of stable per-key cells plus a `SpRingCore<int>` ring carrying dirty cell indices. The producer
+overwrites a key's cell value (a single atomic reference write) and flips a 3-state presence flag; the
+consumer drains the dirty ring, reading the latest value per cell. No bespoke core, no value-carrying
+override ring.
 
 ### Contract & constraints
 
@@ -172,78 +175,50 @@ the strict-FIFO `SpWorker` core forbids.
 - `where TKey : notnull, IEquatable<TKey>` — keyed like a normal dictionary (its own `GetHashCode` /
   `Equals`); the handler supplies **no** hash. Distinct keys that share a hash bucket are *not*
   conflated.
-- `where TValue : class` — values are references. A single reference write is atomic, so an in-place
-  override is publish-safe with no torn read (this is what keeps the design lock-free and copy-free).
+- `where TValue : class` — values are references. A single reference write is atomic, so the cell
+  overwrite is publish-safe with no torn read (this is what keeps the design lock-free and copy-free).
 - **Capacity = max distinct *pending* keys.** Conflating an already-queued key never blocks; a *new*
   distinct key blocks when `Capacity` keys are already pending (backpressure).
 - **Guaranteed-latest delivery.** The newest value per key is always delivered; the only artifact is a
-  rare duplicate (older then newer) under a genuine at-head race. (Sync, reference-value, replace-style
-  merge only — async / value-struct / additive-merge variants are not in this version.)
+  rare duplicate (older then newer) when a value is overwritten while its cell is mid-read — harmless
+  because it's last-wins.
+  (Sync, reference-value, last-wins only — async / value-struct / combining variants are not in this
+  version.)
 
 ### The handler
 
-`ICompactingWorkerHandler<TKey, TValue>` inherits the producer-side merge facet
-`IItemMerger<TValue>` and adds the consumer side:
+There is no merge or drop callback — conflation is an automatic override — so the handler is
+consumer-side only:
 
 ```csharp
-public interface IItemMerger<TValue> {
-  TValue Merge(TValue current, TValue incoming);   // PRODUCER thread; pure; replace-style
-  void Discarded(TValue value);                    // PRODUCER thread; release a dropped value
-}
-
-public interface ICompactingWorkerHandler<TKey, TValue> : IItemMerger<TValue> {
+public interface IConflationWorkerHandler<TKey, TValue> {
   void Handle(TKey key, TValue value);   // worker thread, first-seen key order
   void OnError(Exception error);          // Handle threw — sync; worker continues
   void OnCompleted(Exception? error);     // drained & exiting
 }
 ```
 
-`Merge` is the conflation function: `return incoming;` for last-wins, or combine fields / keep the
-higher version. Its guarantees:
-
-- **Called at most once per `Dispatch`, only when conflating** — i.e. the key is still pending (queued,
-  not yet consumed). Not called on a key's first dispatch, nor when its prior slot was already
-  consumed/evicted (those enqueue fresh). For a hot key, merges **chain** — `current` is the
-  accumulated result of prior merges.
-- **Runs on the producer thread** (concurrent with `Handle`), so it must be **pure**: read its two
-  arguments, return a value, touch no mutable handler state.
-- **Both arguments are read-only** — return `incoming` unchanged (last-wins) or build a **fresh** object
-  to combine; don't mutate either. `current` is the live queued value (never null), possibly read by the
-  consumer or delivered as-is, and only its reference write is atomic (mutating fields risks a torn
-  read). Mutating `incoming` is also unsafe: it can **alias** `current` (caller reusing a reference) and
-  is itself published as-is on the rare doubt path.
-- **Replace-style only** — each returned value self-contained. Under a rare race the worker may deliver
-  the previous value and then `incoming` separately, so additive/accumulate would double-count.
-- **The result may be discarded** under that race (the un-merged `incoming` is delivered instead). The
-  newest value is always delivered; the specific returned object is not guaranteed to reach `Handle`,
-  so don't put result-assuming side effects in `Merge`.
-
-`Discarded(value)` releases values the ring drops (pool-return, dispose, `ArrayPool.Return`). It's
-called for each input `Merge` did **not** return — last-wins (`return incoming`) → `Discarded(current)`;
-keep-existing (`return current`) → `Discarded(incoming)`; combine (fresh) → both. So in the common case
-**every dispatched value is released exactly once — via `Handle` (survivors) or `Discarded` (conflated
-away)**, which makes pooled payloads round-trip cleanly (last-wins *and* combine). Two caveats: it's
-**at-most-once** — under the rare doubt-race a superseded value may be delivered instead (never both), so
-keep cleanup tolerant (pool-return/dispose, not a hard exactly-once counter); and a **hard stop**
-(cancel/`Dispose`) drops queued values without `Discarded` — drain via `TryComplete` for full cleanup.
+`Handle` receives, per key, the latest value queued for it (in first-seen key order). If you need to
+release a *superseded* value (pooled / rented payloads), note that this worker does **not** surface the
+dropped value — it overwrites the slot. For pooled payloads where every value must round-trip, either
+keep the payload GC-managed, or use a design that delivers each value (e.g. a FIFO `SpWorker`).
 
 ### Usage
 
 ```csharp
 sealed class Quote { public decimal Price; }
 
-readonly struct LatestQuote : ICompactingWorkerHandler<int, Quote> {
-  public Quote Merge(Quote current, Quote incoming) => incoming;      // keep the newest
+readonly struct LatestQuote : IConflationWorkerHandler<int, Quote> {
   public void Handle(int instrumentId, Quote q) => Publish(instrumentId, q.Price);
   public void OnError(Exception e) { /* log */ }
   public void OnCompleted(Exception? e) { }
 }
 
-using var w = new CompactingSpWorker<int, Quote, LatestQuote>(new LatestQuote(), capacity: 1024);
+using var w = new ConflationSpWorker<int, Quote, LatestQuote>(new LatestQuote(), capacity: 1024);
 w.Start();
 
 foreach (var tick in feed)
-  w.Dispatch(tick.InstrumentId, new Quote { Price = tick.Price }); // same id still queued → conflated
+  w.Dispatch(tick.InstrumentId, new Quote { Price = tick.Price }); // same id still queued → overridden
 
 w.TryComplete();
 await w.Completion;

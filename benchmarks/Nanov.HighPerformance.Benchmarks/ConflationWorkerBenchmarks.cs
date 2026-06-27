@@ -8,14 +8,14 @@ using BenchmarkDotNet.Attributes;
 using Nanov.HighPerformance.Threading.Workers;
 
 // ================================================================================================
-//  CompactingSpWorker (key-conflating SPSC worker) vs the idiomatic "latest-per-key" baseline
+//  ConflationSpWorker (key-conflating SPSC worker) vs the idiomatic "latest-per-key" baseline
 //  (ConcurrentDictionary holding the latest value + a bounded Channel<int> of dirty keys). Pushes
 //  Messages updates across KeySpace distinct keys through a single consumer that keeps only the
 //  latest per key. The channel row is the baseline.
 // ================================================================================================
 [MemoryDiagnoser]
-public class CompactingWorkerBenchmarks {
-	private const int Capacity = 1024;
+public class ConflationWorkerBenchmarks {
+	private const int Capacity = 64;
 
 	[Params(100_000)]
 	public int Messages;
@@ -27,9 +27,7 @@ public class CompactingWorkerBenchmarks {
 		public long Value;
 	}
 
-	private readonly struct DropHandler : ICompactingWorkerHandler<int, Tick> {
-		public Tick Merge(Tick current, Tick incoming) => incoming; // latest-wins
-		public void Discarded(Tick value) { } // GC-managed payload — nothing to release
+	private readonly struct DropHandler : IConflationWorkerHandler<int, Tick> {
 		public void Handle(int key, Tick value) { _ = value.Value; }
 		public void OnError(Exception error) { }
 		public void OnCompleted(Exception? error) { }
@@ -58,8 +56,8 @@ public class CompactingWorkerBenchmarks {
 	}
 
 	[Benchmark]
-	public void CompactingSpWorker() {
-		using var w = new CompactingSpWorker<int, Tick, DropHandler>(new DropHandler(), Capacity);
+	public void ConflationSpWorker() {
+		using var w = new ConflationSpWorker<int, Tick, DropHandler>(new DropHandler(), Capacity);
 		w.Start();
 		for (var i = 0; i < Messages; i++)
 			w.Dispatch(i % KeySpace, new Tick { Value = i });

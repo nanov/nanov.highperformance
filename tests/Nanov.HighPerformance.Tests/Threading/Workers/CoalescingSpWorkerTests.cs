@@ -5,8 +5,8 @@ using Nanov.HighPerformance.Threading.Workers;
 using NUnit.Framework;
 
 [TestFixture]
-public class AccumulatingSpWorkerTests {
-	// Value-type accumulator: a delta on dispatch, a running total in the cell.
+public class CoalescingSpWorkerTests {
+	// Value-type current: a delta on dispatch, a running total in the cell.
 	private struct Tally {
 		public long Sum;
 	}
@@ -18,7 +18,7 @@ public class AccumulatingSpWorkerTests {
 		public int Handles;
 	}
 
-	private readonly struct SumHandler : IAccumulatingWorkerHandler<int, Tally> {
+	private readonly struct SumHandler : ICoalescingWorkerHandler<int, Tally> {
 		private readonly AccState _state;
 		private readonly Action<int>? _hook;
 
@@ -27,13 +27,16 @@ public class AccumulatingSpWorkerTests {
 			_hook = hook;
 		}
 
-		public void Accumulate(ref Tally accumulator, Tally incoming) => accumulator.Sum += incoming.Sum;
+		public Tally Coalesce(ref Tally current, ref Tally incoming) {
+			current.Sum += incoming.Sum;
+			return current;
+		}
 
-		public void Handle(int key, Tally accumulated) {
+		public void Handle(int key, Tally value) {
 			_hook?.Invoke(key);
 			lock (_state.Totals) {
 				_state.Totals.TryGetValue(key, out var cur);
-				_state.Totals[key] = cur + accumulated.Sum;
+				_state.Totals[key] = cur + value.Sum;
 				_state.Handles++;
 			}
 		}
@@ -48,11 +51,11 @@ public class AccumulatingSpWorkerTests {
 	}
 
 	private sealed class Rec : IDisposable {
-		private readonly AccumulatingSpWorker<int, Tally, SumHandler> _worker;
+		private readonly CoalescingSpWorker<int, Tally, SumHandler> _worker;
 		private readonly AccState _state = new();
 
 		public Rec(int capacity, Action<int>? hook = null) =>
-			_worker = new AccumulatingSpWorker<int, Tally, SumHandler>(new SumHandler(_state, hook), capacity);
+			_worker = new CoalescingSpWorker<int, Tally, SumHandler>(new SumHandler(_state, hook), capacity);
 
 		public Dictionary<int, long> Totals => _state.Totals;
 		public List<Exception> Errors => _state.Errors;
@@ -71,7 +74,7 @@ public class AccumulatingSpWorkerTests {
 	private static int HandlesOf(Rec w) => w.Handles;
 
 	[Test]
-	public void Single_Key_Accumulates_Sum_Exactly_Once() {
+	public void Single_Key_Coalesces_Sum_Exactly_Once() {
 		using var w = new Rec(16);
 		w.Start();
 		long expected = 0;
@@ -86,7 +89,7 @@ public class AccumulatingSpWorkerTests {
 	}
 
 	[Test]
-	public void Distinct_Keys_Accumulate_Independently() {
+	public void Distinct_Keys_Coalesce_Independently() {
 		using var w = new Rec(16);
 		w.Start();
 		for (var i = 0; i < 50; i++) {
@@ -108,7 +111,7 @@ public class AccumulatingSpWorkerTests {
 	public void Conflation_Collapses_Many_Into_Few_Deliveries() {
 		var entered = new ManualResetEventSlim(false);
 		var gate = new ManualResetEventSlim(false);
-		// First dispatch (key 0) blocks the consumer so key 7's deltas all accumulate into one cell.
+		// First dispatch (key 0) blocks the consumer so key 7's deltas all coalesce into one cell.
 		using var w = new Rec(16, hook: k => {
 			if (k == 0) {
 				entered.Set();
@@ -130,7 +133,7 @@ public class AccumulatingSpWorkerTests {
 		Assert.That(w.Handles, Is.LessThan(1000));
 	}
 
-	// The property CompactingSpWorker can't provide: additive exactly-once under heavy contention.
+	// The property ConflationSpWorker can't provide: coalescing exactly-once under heavy contention.
 	[TestCase(1)]
 	[TestCase(2)]
 	[TestCase(8)]
@@ -211,5 +214,54 @@ public class AccumulatingSpWorkerTests {
 		w.Start();
 		w.Dispose();
 		Assert.DoesNotThrow(() => w.Dispose());
+	}
+
+	// TValue is a REFERENCE type — proves the dropped `where TValue : struct` constraint. default(TValue)
+	// is null (the identity); Coalesce returns a fresh object; the cell lock still gives exactly-once.
+	private sealed class Bag {
+		public long Total;
+	}
+
+	private readonly struct BagHandler : ICoalescingWorkerHandler<int, Bag> {
+		private readonly Dictionary<int, long> _totals;
+		public BagHandler(Dictionary<int, long> totals) => _totals = totals;
+
+		// current is null for a key new to a generation (default(Bag)); produce a fresh combined Bag.
+		public Bag Coalesce(ref Bag current, ref Bag incoming) =>
+			new() { Total = (current?.Total ?? 0) + incoming.Total };
+
+		public void Handle(int key, Bag value) {
+			lock (_totals) {
+				_totals.TryGetValue(key, out var cur);
+				_totals[key] = cur + value.Total;
+			}
+		}
+
+		public void OnError(Exception error) { }
+		public void OnCompleted(Exception? error) { }
+	}
+
+	[Test]
+	public async Task Reference_TValue_Coalesces_Exactly_Once() {
+		var totals = new Dictionary<int, long>();
+		using var w = new CoalescingSpWorker<int, Bag, BagHandler>(new BagHandler(totals), 8);
+		w.Start();
+
+		const int keys = 16;
+		const int rounds = 100_000;
+		var sent = new long[keys];
+		await Task.Run(() => {
+			for (var r = 0; r < rounds; r++) {
+				var k = r % keys;
+				long delta = (r & 7) + 1;
+				sent[k] += delta;
+				while (!w.Dispatch(k, new Bag { Total = delta })) { }
+			}
+		});
+
+		w.TryComplete();
+		Assert.That(w.Completion.Wait(5000), Is.True);
+		for (var k = 0; k < keys; k++)
+			lock (totals) Assert.That(totals.GetValueOrDefault(k), Is.EqualTo(sent[k]), $"key {k}");
 	}
 }
