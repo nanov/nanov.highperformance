@@ -121,6 +121,7 @@ public sealed class ValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 				}
 				while (!_core.IsStopped && ++head != available);
 
+				// On a hard-stop exit head wasn't incremented past the current item, so this under-publishes by one — intentional and safe (slot already cleared; hard stop drops the ring). Don't "fix" it to head + 1.
 				if (pending > 0) _core.PublishHead(head);
 			}
 		}

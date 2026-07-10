@@ -21,8 +21,8 @@ the other index, and that recheck is ordered after the flag write — by an `Int
 before every kernel park (cold, sync side) or by the `WaitAsync` CAS in arm-then-recheck (async
 side). So either the committer sees the flag (and Sets — possibly spuriously while the waiter is
 still spinning: harmless, the events latch), or the waiter sees the fresh index and never parks.
-The sync consumer's ~200-iteration spin additionally masks the store-buffer window with no
-per-commit fence; the async consumer has no spin phase, so `CommitTail`'s async branch keeps its
+On the sync side (no per-commit fence in `CommitTail`), the consumer's ~200-iteration spin
+re-reading the index is the load-bearing mask for the store-buffer window; the async consumer has no spin phase, so `CommitTail`'s async branch keeps its
 per-commit `Interlocked.MemoryBarrier()` (StoreLoad — `Volatile` release/acquire does NOT order a
 store before a subsequent load of a different location on ARM64/Apple Silicon).
 

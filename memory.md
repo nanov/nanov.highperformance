@@ -22,6 +22,7 @@ this harness cannot exercise). Known overhead mechanism if it ever matters: the 
 reads ProducerParked twice per item (ShouldFlush + PublishHead).
 - Never remove the run-boundary flush (empty ring must imply all-published — deadlock otherwise).
 - Keyed workers stay on per-item TryTakeAndAdvance.
+- Backlog (pre-existing, found in final review): a Dispatch racing TryComplete can slip an item past the exiting consumer — WaitForSpaceSlow only rechecks _completed while the ring is still full, and TryComplete doesn't Set _spaceEvt. Pre-dates this branch; batching didn't widen it. Needs its own look.
 
 ## 2026-07-10 — Lock-step squeeze L2: parked-flag signaling replaces per-item cross-index edge reads
 

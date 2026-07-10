@@ -10,14 +10,14 @@ using System.Threading;
 
 /// <summary>
 ///   Internal single-producer / single-consumer ring buffer core, shared (by composition) across the
-///   whole SPSC worker family: the power-of-two ring, the edge-triggered wake events, the dedicated
+///   whole SPSC worker family: the power-of-two ring, the parked-flag wake signaling, the dedicated
 ///   worker thread, the lifecycle (<see cref="Start" />/<see cref="Dispose" />/<see cref="TryComplete" />/
 ///   cancellation/completion), and the producer/consumer wait + signal primitives. The public workers
 ///   own one of these and forward to it; the public scopes hold one to reach the slot. Not part of the
 ///   public API.
 ///   <para>
 ///     The producer/consumer FAST paths (the empty/full index checks, slot write/read, and the
-///     edge-triggered <c>Set()</c>) are <see cref="MethodImplOptions.AggressiveInlining" /> so they
+///     parked-flag-gated <c>Set()</c>) are <see cref="MethodImplOptions.AggressiveInlining" /> so they
 ///     inline into the callers' hot loops; only the COLD parking loops
 ///     (<see cref="WaitForSpaceSlow" />/<see cref="WaitForItemSlow" />) are
 ///     <see cref="MethodImplOptions.NoInlining" />, keeping the hot frame tight.
@@ -32,8 +32,9 @@ using System.Threading;
 ///     recheck of the other index, and that recheck is ordered after the flag write — by a full
 ///     fence before every kernel park (sync, cold) or by the <c>WaitAsync</c> CAS in
 ///     arm-then-recheck (async) — so either the committer sees the flag, or the waiter sees the
-///     fresh index and never parks. The sync consumer's ~200-iteration spin additionally masks the
-///     store-buffer window without any per-commit fence; the async consumer has no spin phase, so
+///     fresh index and never parks. On the sync side, where <c>CommitTail</c> pays no per-commit
+///     fence, the consumer's ~200-iteration spin re-reading the index is the load-bearing mask for
+///     the store-buffer window (not merely additional insurance); the async consumer has no spin phase, so
 ///     the async branch of <c>CommitTail</c> keeps a per-commit <c>Interlocked.MemoryBarrier()</c>
 ///     (StoreLoad — <c>Volatile</c> release/acquire does not order a store before a subsequent load
 ///     of a different location on ARM64). Shutdown rides <c>volatile _stop</c> / <c>_completed</c>;
@@ -192,7 +193,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 	/// <summary>
 	///   Producer reservation. Fast-path inline fullness check; parks on the cold path. Returns false
 	///   if the worker is no longer accepting. On true, <paramref name="tail" /> is the index to write
-	///   (<c>_buffer[tail &amp; _mask]</c>); the caller writes it then calls <see cref="CommitTail" />.
+	///   (via <see cref="GetSlotRef" /> / <see cref="SlotRef" />); the caller writes it then calls <see cref="CommitTail" />.
 	/// </summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	internal bool TryReserve(out int tail) {
@@ -297,8 +298,8 @@ internal sealed class SpRingCore<T> : IDisposable {
 
 	/// <summary>
 	///   Release-time fast path for the value scope: run the handler's <c>Clear(ref T)</c> on slot
-	///   <paramref name="head" />, then <see cref="AdvanceHead" /> (advance + edge-signal a blocked
-	///   producer) — one call from <see cref="HandleScope{T}.Release" />. The handler nulls the slot's
+	///   <paramref name="head" />, then <see cref="AdvanceHead" /> (advance + wake a parked producer)
+	///   — one call from <see cref="HandleScope{T}.Release" />. The handler nulls the slot's
 	///   reference fields / returns pooled buffers, so the ring doesn't pin them and the zero-copy slot is
 	///   never overwritten with a full <c>default(T)</c>. <c>Clear</c> is a no-op when no cleaner is bound
 	///   (copy workers don't use this path).
@@ -400,10 +401,11 @@ internal sealed class SpRingCore<T> : IDisposable {
 
 	/// <summary>
 	///   Consumer claim of the whole currently-available run <c>[head, available)</c>. One
-	///   <c>_idx.Tail</c> read on the hot (non-empty) path — the caller then drains the run with
-	///   <see cref="TakeAndAdvance" /> per item (head still advances per item, so backpressure stays
-	///   tight and the space-signal edge stays correct), and only re-claims (re-parking when truly
-	///   empty) once the run is exhausted. This drops the per-item emptiness <c>_idx.Tail</c> read that a
+	///   <c>_idx.Tail</c> read on the hot (non-empty) path — the caller then drains the run — keyed
+	///   workers per item via <see cref="TryTakeAndAdvance" /> (head advances per item); the FIFO
+	///   workers via <see cref="TryTake" /> with batched <see cref="PublishHead" /> flushes (always
+	///   flushed at the run boundary) — and only re-claims (re-parking when truly empty) once the run
+	///   is exhausted. This drops the per-item emptiness <c>_idx.Tail</c> read that a
 	///   per-item claim would pay. Returns false to exit — hard stop (drops queued items) or soft
 	///   complete with the ring drained. Single consumer only.
 	/// </summary>
@@ -439,8 +441,8 @@ internal sealed class SpRingCore<T> : IDisposable {
 	///   Non-blocking consumer run-claim for the async loop — the no-park twin of
 	///   <see cref="TryClaimRun" />. Returns false if the ring is empty or hard-stopped (the caller then
 	///   calls <see cref="WaitForItemAsync" /> to distinguish wait from exit). On true, the caller drains
-	///   <c>[head, available)</c> with <see cref="TryTakeAndAdvance" /> (copy) / <see cref="HandleScope{T}" />
-	///   (value) per item, then re-claims — one <c>_idx.Tail</c> read per run instead of per item, matching
+	///   <c>[head, available)</c> with <see cref="TryTake" /> (copy) / <see cref="HandleScope{T}" /> + deferred
+	///   release (value) under the batched head publish, then re-claims — one <c>_idx.Tail</c> read per run instead of per item, matching
 	///   the sync consumer. Single consumer only.
 	/// </summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
