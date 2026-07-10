@@ -23,17 +23,23 @@ using System.Threading;
 ///     <see cref="MethodImplOptions.NoInlining" />, keeping the hot frame tight.
 ///   </para>
 ///   <para>
-///     SIGNALING INVARIANT (strict SPSC). Exactly one producer thread reserves+commits slots; the
-///     single dedicated worker thread is the only consumer and the only writer of <c>_idx.Head</c>. The
-///     wake events use edge-triggered <c>Set()</c> (only on the empty→non-empty / full→non-full
-///     transition) paired with a non-atomic <c>Wait();Reset()</c>. This is correct ONLY under SPSC:
-///     while the consumer is parked, <c>_idx.Head</c> does not advance, so only the first item past
-///     <c>_idx.Head</c> satisfies <c>_idx.Head == tail</c> and fires the lone <c>Set</c> — no second signal a
-///     <c>Reset()</c> could lose. <see cref="ManualResetEventSlim" /> is latching (order-insensitive),
-///     and the <c>while (_idx.Head == Volatile.Read(ref _idx.Tail))</c> recheck acquire-reads <c>_idx.Tail</c>
-///     published with release before the <c>Set</c>. Shutdown rides the separate <c>volatile _stop</c>,
-///     re-checked before every park. WARNING: a second producer, or advancing <c>_idx.Head</c> off the
-///     worker thread, breaks this and hangs silently.
+///     SIGNALING INVARIANT (strict SPSC, parked-flag protocol). Exactly one producer thread
+///     reserves+commits slots; the single consumer is the only writer of <c>_idx.Head</c>. Wakeups
+///     are gated by parked-waiter flags, not by re-deriving the empty/full edge from the other
+///     side's index: a waiter raises its flag (<c>_idx.ConsumerParked</c> / <c>_idx.ProducerParked</c>)
+///     when it ENTERS its slow path and clears it on exit; the opposite side signals only when the
+///     flag is up. A signal may be SPURIOUS, never LOST: the flag goes up before the waiter's final
+///     recheck of the other index, and that recheck is ordered after the flag write — by a full
+///     fence before every kernel park (sync, cold) or by the <c>WaitAsync</c> CAS in
+///     arm-then-recheck (async) — so either the committer sees the flag, or the waiter sees the
+///     fresh index and never parks. The sync consumer's ~200-iteration spin additionally masks the
+///     store-buffer window without any per-commit fence; the async consumer has no spin phase, so
+///     the async branch of <c>CommitTail</c> keeps a per-commit <c>Interlocked.MemoryBarrier()</c>
+///     (StoreLoad — <c>Volatile</c> release/acquire does not order a store before a subsequent load
+///     of a different location on ARM64). Shutdown rides <c>volatile _stop</c> / <c>_completed</c>;
+///     <c>SignalStop</c>/<c>TryComplete</c> Set every event UNCONDITIONALLY (never flag-gated) and
+///     both slow paths recheck them before every park. WARNING: a second concurrent producer, or
+///     advancing <c>_idx.Head</c> off the worker thread, breaks this and hangs silently.
 ///   </para>
 /// </summary>
 internal sealed class SpRingCore<T> : IDisposable {
@@ -203,26 +209,29 @@ internal sealed class SpRingCore<T> : IDisposable {
 		return true;
 	}
 
-	/// <summary>Publish the slot at <paramref name="tail" /> and edge-signal the consumer.</summary>
+	/// <summary>Publish the slot at <paramref name="tail" /> and wake the consumer if it is parked.</summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	internal void CommitTail(int tail) {
 		Volatile.Write(ref _idx.Tail, tail + 1);
-		// Edge-triggered: signal only on the empty→non-empty transition. The edge test reads _idx.Head
-		// AFTER publishing _idx.Tail — a store then a load of a DIFFERENT location, which a weak memory model
-		// (ARM64) may reorder, letting the producer read a STALE _idx.Head and skip the wake for the item it
-		// just committed (a StoreLoad / Dekker lost-wakeup). The consumer's post-Reset / arm-then-recheck
-		// re-reads _idx.Tail published with release before the Set. See SIGNALING INVARIANT.
+		// Parked-flag signaling: wake the consumer only when its parked flag is up, instead of
+		// re-deriving the empty→non-empty edge from a per-commit cross-core read of _idx.Head. The
+		// flag's line changes only on slow-path entry/exit, so this read stays warm while the consumer
+		// is running. A signal may be SPURIOUS (flag up = consumer still in its spin phase — harmless,
+		// the events latch), never LOST: the consumer raises the flag BEFORE its spin-guarded (sync) /
+		// fenced (async) final recheck of _idx.Tail. See SIGNALING INVARIANT.
 		if (_itemReadyAsync is null) {
-			// Sync consumer: WaitForItemSlow spin-rechecks _idx.Tail (≈200×) before it parks, which drains the
-			// store buffer and masks the StoreLoad window — no per-commit fence needed.
-			if (Volatile.Read(ref _idx.Head) == tail)
+			// Sync consumer: no per-commit fence. The flag goes up before WaitForItemSlow's whole
+			// ~200-iteration spin phase (which re-reads _idx.Tail), so a commit whose — possibly
+			// store-buffer-hoisted — flag read missed the flag has its Tail store visible long before
+			// the consumer's fenced pre-park recheck.
+			if (Volatile.Read(ref _idx.ConsumerParked) != 0)
 				_itemEvt.Set();
 		} else {
-			// Async consumer parks immediately (no spin), so the window is exposed. A full fence makes the
-			// Tail publish globally visible before the Head read, so the edge decision can't skip on a stale
-			// Head; paired with the arm-then-recheck in WaitForItemAsync this closes the lost-wakeup.
+			// Async consumer parks without a spin phase, so the Dekker window is real: the full fence
+			// makes the Tail publish globally visible before the flag read, paired with the
+			// arm-then-recheck in WaitForItemAsync (whose WaitAsync CAS is the consumer-side fence).
 			Interlocked.MemoryBarrier();
-			if (Volatile.Read(ref _idx.Head) == tail)
+			if (Volatile.Read(ref _idx.ConsumerParked) != 0)
 				_itemReadyAsync.Set();
 		}
 	}
@@ -293,13 +302,14 @@ internal sealed class SpRingCore<T> : IDisposable {
 		AdvanceHead(head);
 	}
 
-	/// <summary>Release the slot at <paramref name="head" /> and edge-signal a blocked producer.</summary>
+	/// <summary>Release the slot at <paramref name="head" /> and wake the producer if it is parked.</summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	private void AdvanceHead(int head) {
 		Volatile.Write(ref _idx.Head, head + 1);
-		// Edge-triggered space signal, mirror of CommitTail: wake a blocked producer only on the
-		// full→non-full transition. Safe under SPSC (single producer). See SIGNALING INVARIANT.
-		if (Volatile.Read(ref _idx.Tail) - head == _buffer.Length)
+		// Parked-flag mirror of CommitTail: wake a blocked producer via its parked flag instead of a
+		// per-item cross-core read of _idx.Tail for the full→non-full edge. Spurious-never-lost: the
+		// producer raises the flag before WaitForSpaceSlow's spin phase, which re-reads _idx.Head.
+		if (Volatile.Read(ref _idx.ProducerParked) != 0)
 			_spaceEvt.Set();
 	}
 
@@ -401,8 +411,8 @@ internal sealed class SpRingCore<T> : IDisposable {
 	///   <see cref="ValueTask{Boolean}" />: completed-<see langword="false" /> on hard stop or
 	///   soft-complete-drained (caller exits); completed-<see langword="true" /> when an item is
 	///   already available; otherwise the <see cref="AsyncAutoResetEvent" />'s pending wait (result
-	///   <see langword="true" /> = "woke" — the caller re-checks via <see cref="TryClaimRunNow" /> on the
-	///   next loop turn). Deliberately NOT an <c>async</c> method, so
+	///   <see langword="true" /> = "woke" — the caller re-checks via <see cref="TryClaimRunNow" /> on
+	///   the next loop turn, after <see cref="AckWake" />). Deliberately NOT an <c>async</c> method, so
 	///   an empty wait allocates nothing — the suspension reuses the caller's single (one-time)
 	///   RunLoopAsync state machine. Hard stop is checked first, so queued items are dropped on stop.
 	///   Single logical consumer only.
@@ -412,16 +422,26 @@ internal sealed class SpRingCore<T> : IDisposable {
 		if (_idx.Head != Volatile.Read(ref _idx.Tail)) return new ValueTask<bool>(true);
 		if (_completed) return DrainedOnComplete();
 
-		// Ring looks empty and we're about to park. Arm FIRST — the AsyncAutoResetEvent's Interlocked CAS is
-		// a full StoreLoad fence — THEN recheck. Paired with CommitTail's producer-side fence, a freshly
-		// committed item is globally visible here (Dekker), so we self-signal and let the loop drain it
-		// instead of parking on an edge the producer may have skipped. Also catches a late stop/complete.
+		// Raise the parked flag BEFORE arming, then recheck. CommitTail's fenced flag read pairs with
+		// this: either the producer sees the flag (and Sets), or this recheck — ordered after the flag
+		// write by WaitAsync's Interlocked CAS (a full fence) — sees the fresh Tail and self-signals so
+		// the loop drains instead of parking on a skipped edge. Also catches a late stop/complete. The
+		// flag is cleared by the loop via AckWake once the wait completes, so it stays up while parked.
+		Volatile.Write(ref _idx.ConsumerParked, 1);
 		var vt = _itemReadyAsync!.WaitAsync();
 		if (vt.IsCompleted) return vt; // a Set was latched between the empty check above and the arm
 		if (_stop || _completed || _idx.Head != Volatile.Read(ref _idx.Tail))
 			_itemReadyAsync.Set(); // self-signal: complete the armed wait so the loop re-evaluates
 		return vt;
 	}
+
+	/// <summary>
+	///   Clear the async consumer's parked flag — called by the async loops once per wake, before
+	///   draining, so producers stop paying the (cheap, latching) spurious Set per commit while the
+	///   consumer is running. Clearing an already-0 flag is a harmless consumer-owned-line write.
+	/// </summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal void AckWake() => Volatile.Write(ref _idx.ConsumerParked, 0);
 
 	// Soft-complete must drain everything already committed. _completed is published (release) AFTER the
 	// producer's final commit, so re-reading the ring after observing _completed (acquire) sees the final
@@ -433,55 +453,86 @@ internal sealed class SpRingCore<T> : IDisposable {
 	// Cold path: producer parks until space frees, or the worker stops/completes.
 	[MethodImpl(MethodImplOptions.NoInlining)]
 	private bool WaitForSpaceSlow() {
-		var spins = 0;
-		int head;
-		while (_idx.Tail - (head = Volatile.Read(ref _idx.Head)) == _buffer.Length) {
-			if (_stop || _completed) return false;
-			if (spins++ < SpinThreshold) {
-				Thread.SpinWait(10);
-				continue;
+		// Parked flag mirrors WaitForItemSlow: raised for the whole slow path, read by AdvanceHead
+		// instead of a per-item _idx.Tail read. Spurious Sets while still spinning are harmless.
+		Volatile.Write(ref _idx.ProducerParked, 1);
+		try {
+			var spins = 0;
+			int head;
+			while (_idx.Tail - (head = Volatile.Read(ref _idx.Head)) == _buffer.Length) {
+				if (_stop || _completed) return false;
+				if (spins++ < SpinThreshold) {
+					Thread.SpinWait(10);
+					continue;
+				}
+
+				// About to kernel-park: full fence + final recheck (Dekker pairing with AdvanceHead's
+				// Head-write→flag-read), then park. See WaitForItemSlow.
+				Interlocked.MemoryBarrier();
+				if (_idx.Tail - Volatile.Read(ref _idx.Head) != _buffer.Length) continue;
+				_spaceEvt.Wait();
+				_spaceEvt.Reset();
+				spins = 0;
 			}
 
-			_spaceEvt.Wait();
-			_spaceEvt.Reset();
-			spins = 0;
+			_cachedHead = head; // refresh the gating cache with the Head that proved there is space
+			return true;
 		}
-
-		_cachedHead = head; // refresh the gating cache with the Head that proved there is space
-		return true;
+		finally {
+			Volatile.Write(ref _idx.ProducerParked, 0);
+		}
 	}
 
 	// Cold path: consumer parks until an item arrives, or the worker stops/completes-drained.
 	[MethodImpl(MethodImplOptions.NoInlining)]
 	private bool WaitForItemSlow() {
-		var spins = 0;
-		while (_idx.Head == Volatile.Read(ref _idx.Tail)) {
-			if (_stop) return false;
-			// Soft-complete drains: re-read _idx.Tail after observing _completed (acquire) so an item
-			// committed right before completion — not yet visible to the empty check above — is still drained.
-			if (_completed) return _idx.Head != Volatile.Read(ref _idx.Tail);
-			if (spins++ < SpinThreshold) {
-				Thread.SpinWait(10);
-				continue;
+		// Raise the parked flag for the WHOLE slow path (spin phase included): CommitTail may then fire
+		// a spurious Set while we're still spinning — harmless (latching event) — but a commit can never
+		// find the flag down while we end up parked. Cleared on every exit.
+		Volatile.Write(ref _idx.ConsumerParked, 1);
+		try {
+			var spins = 0;
+			while (_idx.Head == Volatile.Read(ref _idx.Tail)) {
+				if (_stop) return false;
+				// Soft-complete drains: re-read _idx.Tail after observing _completed (acquire) so an item
+				// committed right before completion — not yet visible to the empty check above — is still
+				// drained.
+				if (_completed) return _idx.Head != Volatile.Read(ref _idx.Tail);
+				if (spins++ < SpinThreshold) {
+					Thread.SpinWait(10);
+					continue;
+				}
+
+				// About to kernel-park. One full fence per park (cold): guarantees the flag write above is
+				// globally visible before this final emptiness recheck — the Dekker pairing with
+				// CommitTail's Tail-write→flag-read. If an item slipped in, drain it instead of parking.
+				Interlocked.MemoryBarrier();
+				if (_idx.Head != Volatile.Read(ref _idx.Tail)) return true;
+				_itemEvt.Wait();
+				_itemEvt.Reset();
+				spins = 0;
 			}
 
-			_itemEvt.Wait();
-			_itemEvt.Reset();
-			spins = 0;
+			return true;
 		}
-
-		return true;
+		finally {
+			Volatile.Write(ref _idx.ConsumerParked, 0);
+		}
 	}
 }
 
 /// <summary>
-///   Cache-line-separated SPSC ring indices. Non-generic on purpose — generic types can't have
-///   explicit layout. The consumer-written <see cref="Head" /> and producer-written <see cref="Tail" />
-///   sit 128 bytes apart (one full cache line on Apple Silicon, two on x64) so the two cores don't
-///   ping-pong a shared line every item.
+///   Cache-line-separated SPSC ring indices + parked-waiter flags. Non-generic on purpose — generic
+///   types can't have explicit layout. Each field sits on its own 128-byte stride (one full cache
+///   line on Apple Silicon, two on x64) so no two of them — nor any neighboring class field — share
+///   a line: <see cref="Head" /> is written per item by the consumer, <see cref="Tail" /> per item
+///   by the producer, and the parked flags are written only on slow-path entry/exit but read per
+///   item by the opposite side (see SIGNALING INVARIANT).
 /// </summary>
-[StructLayout(LayoutKind.Explicit, Size = 384)]
+[StructLayout(LayoutKind.Explicit, Size = 640)]
 internal struct PaddedIndices {
 	[FieldOffset(128)] public int Head;
 	[FieldOffset(256)] public int Tail;
+	[FieldOffset(384)] public int ConsumerParked; // 1 while the consumer is in WaitForItemSlow / armed via WaitForItemAsync
+	[FieldOffset(512)] public int ProducerParked; // 1 while the producer is in WaitForSpaceSlow
 }

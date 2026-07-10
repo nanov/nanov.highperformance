@@ -84,6 +84,7 @@ public sealed class AsyncSpWorker<T, THandler> : IDisposable, IWorkerQueue
 			// TryTakeAndAdvance (eager slot-free, tight backpressure, per-item hard-stop drop); only when a
 			// fresh claim finds the ring empty do we park on WaitForItemAsync.
 			do {
+				_core.AckWake(); // clear the parked flag once per wake, before draining
 				while (_core.TryClaimRunNow(out var head, out var available)) {
 					while (head != available && _core.TryTakeAndAdvance(head++, out var item)) {
 						try {

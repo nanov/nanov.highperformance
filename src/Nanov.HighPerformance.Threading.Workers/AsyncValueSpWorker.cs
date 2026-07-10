@@ -103,6 +103,7 @@ public sealed class AsyncValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 			// HandleScope.Release; IsStopped is rechecked per item so a hard stop drops the rest of the run.
 			// Only when a fresh claim finds the ring empty do we park on WaitForItemAsync.
 			while (true) {
+				_core.AckWake(); // clear the parked flag once per wake, before draining
 				while (_core.TryClaimRunNow(out var head, out var available)) {
 					do {
 						// The ref-struct scope is consumed synchronously (read + Release) before the await —

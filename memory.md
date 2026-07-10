@@ -9,6 +9,18 @@ implication ("so don't…"). If something becomes a permanent rule, move it into
 
 ---
 
+## 2026-07-10 — Lock-step squeeze L2: parked-flag signaling replaces per-item cross-index edge reads
+
+`CommitTail` no longer reads `Head` per commit and `AdvanceHead` no longer reads `Tail` per item:
+each side raises a padded parked flag on slow-path entry (before its spin/arm phase) and the
+committer signals only when the flag is up — "a signal may be spurious, never lost". Sync paths
+add one full fence per kernel park (cold); the async commit fence is unchanged. macOS perf delta
+vs L1: mean throughput SpWorker +420% (18.9→98.0 Mops), ValueSpWorker +321% (19.1→80.4),
+AsyncSpWorker +329% (15.1→65.0), AsyncValueSpWorker +205% (17.3→52.9); Coalescing flat (−3%,
+noise); latency flat-to-better (ping-pong median 0.83→0.50–0.63 µs).
+- Don't reintroduce the index-edge Set test; don't gate SignalStop/TryComplete on the flags; don't
+  collapse arm-then-recheck.
+
 ## 2026-07-10 — Lock-step squeeze L1: bounds-check elimination; lifecycle-flag fold dropped
 
 All ring-slot accesses now go through `SlotRef` (`MemoryMarshal.GetArrayDataReference` +
