@@ -151,6 +151,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 		_completeException = exception;
 		_completed = true;
 		_itemEvt.Set();
+		_spaceEvt.Set(); // wake a producer parked on a full ring so it observes _completed and stops
 		_itemReadyAsync?.Set();
 		return true;
 	}
@@ -528,6 +529,10 @@ internal sealed class SpRingCore<T> : IDisposable {
 				spins = 0;
 			}
 
+			// Space freed — but re-check lifecycle even when a slot is now available: a producer woken by
+			// TryComplete/SignalStop (or one that raced them to here) must refuse the reserve so a dispatch
+			// racing soft-complete is rejected, never committed into a ring whose consumer has exited.
+			if (_stop || _completed) return false;
 			_cachedHead = head; // refresh the gating cache with the Head that proved there is space
 			return true;
 		}

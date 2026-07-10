@@ -230,6 +230,28 @@ public class ConflationSpWorkerTests {
 		}
 	}
 
+	// Bug #1 repro: sustained last-wins load must NEVER deliver a null value to the handler. A fresh carrier
+	// is dispatched per message (exactly as the perf harness does). If the consumer's reference-identity
+	// null-clear can null a live value that a redelivered ring entry then reads, the handler dereferences
+	// null → NRE, surfaced via OnError. Assert zero handler errors.
+	[Test]
+	public async Task Sustained_Load_Never_Delivers_A_Null_Value() {
+		using var w = new Rec(4); // no handler delay — maximize raw throughput and the re-dispatch race window
+		w.Start();
+
+		const int keys = 4;
+		const int rounds = 5_000_000;
+		await Task.Run(() => {
+			for (var r = 0; r < rounds; r++)
+				while (!w.Dispatch(r % keys, r)) { } // fresh Boxed per dispatch (see Rec.Dispatch)
+		});
+		w.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => CountOf(w), keys);
+
+		Assert.That(w.Errors, Is.Empty,
+			"handler saw a null value — the reference-identity null-clear raced a re-dispatch");
+	}
+
 	// Backpressure: with capacity distinct keys pending and the consumer gated, a NEW distinct key blocks
 	// until space frees; conflating an EXISTING key never blocks.
 	[Test]
@@ -272,6 +294,46 @@ public class ConflationSpWorkerTests {
 		Assert.That(lastSeen.ContainsKey(3), Is.True);
 	}
 
+	// Bug #2 (Dispatch racing TryComplete): a producer parked on a FULL ring in WaitForSpaceSlow must
+	// observe a soft-complete and stop — TryComplete must wake it (Set _spaceEvt) and WaitForSpaceSlow
+	// must re-check _completed after waking, returning false. The consumer is gated on the first item so
+	// it never frees a slot; the ONLY thing that can wake the parked producer is TryComplete. If
+	// TryComplete doesn't Set _spaceEvt (the bug), the parked Dispatch hangs forever.
+	[Test]
+	public async Task TryComplete_Unblocks_A_Producer_Parked_On_A_Full_Ring() {
+		var entered = new ManualResetEventSlim(false);
+		var gate = new ManualResetEventSlim(false);
+		using var w = new Rec(2, hook: k => {
+			if (k == 0) {
+				entered.Set();
+				gate.Wait();
+			}
+		});
+		w.Start();
+
+		// Key 0 is taken and blocks in the handler → head advanced to 1; ring (cap 2) can hold keys 1, 2.
+		Assert.That(w.Dispatch(0, 0), Is.True);
+		Assert.That(entered.Wait(2000), Is.True);
+		Assert.That(w.Dispatch(1, 1), Is.True);
+		Assert.That(w.Dispatch(2, 2), Is.True); // ring now full (keys 1, 2 queued; consumer gated on key 0)
+
+		// Extra dispatch → producer parks in WaitForSpaceSlow (ring full, consumer can't free a slot).
+		var parked = Task.Run(() => w.Dispatch(3, 3));
+		Assert.That(parked.Wait(100), Is.False, "producer must park on a full ring");
+
+		// Soft-complete while the producer is parked and the consumer is gated: the drain cannot wake the
+		// producer, so only TryComplete's _spaceEvt.Set can. With the bug it never fires → the parked
+		// Dispatch hangs and the wait below times out.
+		Assert.That(w.TryComplete(), Is.True);
+		Assert.That(parked.Wait(2000), Is.True, "TryComplete must wake the producer parked on a full ring");
+		Assert.That(await parked, Is.False, "a dispatch racing soft-complete must be rejected, not stranded");
+
+		gate.Set();
+		WorkerTestUtil.AwaitCompletionOrStall(w.Completion, () => CountOf(w), 3);
+		// Keys 0, 1, 2 delivered; key 3 was rejected (never enqueued) so it is not delivered — no stranded item.
+		Assert.That(w.Processed.Select(p => p.Key), Is.EqualTo(new[] { 0, 1, 2 }));
+	}
+
 	// Deterministic wake of a parked consumer (mirrors SpWorkerTests).
 	[Test]
 	public void Dispatch_Wakes_An_Idle_Parked_Worker() {
@@ -305,22 +367,30 @@ public class ConflationSpWorkerTests {
 		Assert.That(w.Processed.Select(p => p.Key), Is.EqualTo(Enumerable.Range(0, n)));
 	}
 
-	// A drained reference value must be cleared from its ring slot so it's collectable (no pin).
+	// A drained reference value is released for GC when its cell is evicted by compaction. (The consumer
+	// does NOT null the slot eagerly on drain — that raced the producer's written-but-not-yet-published
+	// value and stranded the next ring entry with a null → NRE. Release now happens producer-side: on the
+	// key's next overwrite, or on eviction when the map compacts.) Here a one-shot key is freed by flooding
+	// enough distinct keys after it to force EvictFree to tombstone its drained (Free) cell.
 	[Test]
-	public void Ref_Value_Slots_Are_Cleared_After_Drain() {
+	public void Ref_Value_Slots_Are_Released_On_Eviction() {
 		var w = new ConflationSpWorker<int, object, NoopObjHandler>(new NoopObjHandler(), 8);
 		w.Start();
 
-		var weak = DispatchTransient(w);
+		var weak = DispatchTransient(w); // key 1, one-shot — drained, then its cell goes Free
+		// Flood distinct one-shot keys → map fills → EvictFree tombstones drained Free cells (incl. key 1's),
+		// resetting the cell (cell = default) so the transient is no longer pinned.
+		for (var k = 2; k < 100_000; k++) Assert.That(w.Dispatch(k, new object()), Is.True);
 		w.TryComplete();
-		Assert.That(w.Completion.Wait(2000), Is.True);
+		Assert.That(w.Completion.Wait(5000), Is.True);
 
 		GC.Collect();
 		GC.WaitForPendingFinalizers();
 		GC.Collect();
 
-		Assert.That(weak.TryGetTarget(out _), Is.False, "drained value slot must be cleared so the item is collectable");
-		GC.KeepAlive(w); // keep the ring alive: proves the SLOT was cleared, not just the worker freed
+		Assert.That(weak.TryGetTarget(out _), Is.False,
+			"a drained value must be released once its cell is evicted by compaction");
+		GC.KeepAlive(w); // keep the ring/map alive: proves the CELL was reset, not just the worker freed
 		w.Dispose();
 	}
 
