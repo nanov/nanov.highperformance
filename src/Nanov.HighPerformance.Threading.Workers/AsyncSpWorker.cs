@@ -80,18 +80,29 @@ public sealed class AsyncSpWorker<T, THandler> : IDisposable, IWorkerQueue
 		try {
 			var ct = _core.CancellationToken;
 			// Claim the whole available run, drain it item-by-item, then re-claim — one _idx.Tail read per
-			// run instead of per item (mirrors the sync SpWorker). Head still advances per item via
-			// TryTakeAndAdvance (eager slot-free, tight backpressure, per-item hard-stop drop); only when a
-			// fresh claim finds the ring empty do we park on WaitForItemAsync.
+			// run instead of per item (mirrors the sync SpWorker). Head publishes are batched (TryTake +
+			// PublishHead per ShouldFlush — every K items / run boundary / producer parked); slots are still
+			// copied out per item.
 			do {
+				_core.AckWake(); // clear the parked flag once per wake, before draining
 				while (_core.TryClaimRunNow(out var head, out var available)) {
-					while (head != available && _core.TryTakeAndAdvance(head++, out var item)) {
+					var pending = 0;
+					while (head != available && _core.TryTake(head, out var item)) {
+						head++;
+						pending++;
+						if (_core.ShouldFlush(pending)) {
+							_core.PublishHead(head);
+							pending = 0;
+						}
+
 						try {
 							await _handler.HandleAsync(item, ct).ConfigureAwait(false);
 						} catch (Exception ex) {
 							_handler.OnError(ex);
 						}
 					}
+
+					if (pending > 0) _core.PublishHead(head);
 				}
 			} while (await _core.WaitForItemAsync().ConfigureAwait(false));
 		}

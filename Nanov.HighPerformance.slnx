@@ -2,6 +2,9 @@
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/Nanov.HighPerformance.Benchmarks/Nanov.HighPerformance.Benchmarks.csproj" />
   </Folder>
+  <Folder Name="/perf-tests/">
+    <Project Path="perf-tests/Nanov.HighPerformance.Threading.Workers.PerfTests/Nanov.HighPerformance.Threading.Workers.PerfTests.csproj" />
+  </Folder>
   <Folder Name="/src/">
     <Project Path="src/Nanov.HighPerformance.Threading.Workers/Nanov.HighPerformance.Threading.Workers.csproj" />
   </Folder>

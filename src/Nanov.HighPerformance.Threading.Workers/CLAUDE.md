@@ -5,53 +5,73 @@ public workers live at the project root; the internal cores are in [`Internal/`]
 (`…Threading.Workers.Internal`). Read [`README.md`](README.md) for the user-facing API. This file is
 the stuff to not get wrong when editing.
 
-## The one rule: SPSC SIGNALING INVARIANT
+## The one rule: SPSC SIGNALING INVARIANT (parked-flag protocol)
 
-The whole design is correct **only** under strict single-producer / single-consumer. The wake
-events (`_itemEvt`, `_spaceEvt`) are edge-triggered: `Set()` fires *only* on the empty→non-empty /
-full→non-full transition, paired with a non-atomic `Wait();Reset()`. This is safe because:
+The whole design is correct **only** under strict single-producer / single-consumer. Wakeups are
+gated by **parked-waiter flags**, not by re-deriving the empty/full edge from the other side's
+index: each side raises its flag (`_idx.ConsumerParked` / `_idx.ProducerParked`, each on its own
+padded cache line) when it ENTERS its slow path — before the spin phase (`WaitForItemSlow` /
+`WaitForSpaceSlow`) or before arming the async wait (`WaitForItemAsync`) — and clears it on exit
+(sync: `finally`; async: `AckWake`, called by the loop once per wake). The opposite side signals
+(`_itemEvt` / `_spaceEvt` / `_itemReadyAsync`) only when it sees the flag up — a warm-line read,
+replacing the per-item cross-core read of the opposite index.
 
-- exactly one producer writes `_tail`; exactly one consumer (the dedicated thread) writes `_head`;
-- while the consumer is parked `_head` can't advance, so only the first item past `_head` fires the
-  lone `Set`; the post-`Reset` recheck acquire-reads `_tail` (released before the `Set`), so no
-  wakeup is lost; shutdown rides the separate `volatile _stop`, rechecked before every park.
+**A signal may be spurious, never lost.** The flag goes up *before* the waiter's final recheck of
+the other index, and that recheck is ordered after the flag write — by an `Interlocked.MemoryBarrier()`
+before every kernel park (cold, sync side) or by the `WaitAsync` CAS in arm-then-recheck (async
+side). So either the committer sees the flag (and Sets — possibly spuriously while the waiter is
+still spinning: harmless, the events latch), or the waiter sees the fresh index and never parks.
+On the sync side (no per-commit fence in `CommitTail`), the consumer's ~200-iteration spin
+re-reading the index is the load-bearing mask for the store-buffer window; the async consumer has no spin phase, so `CommitTail`'s async branch keeps its
+per-commit `Interlocked.MemoryBarrier()` (StoreLoad — `Volatile` release/acquire does NOT order a
+store before a subsequent load of a different location on ARM64/Apple Silicon).
+
+Things that must stay exactly as they are:
+
+- exactly one producer writes `_tail`; exactly one consumer writes `_head`; each flag is written
+  only by its own side.
+- `SignalStop` / `TryComplete` Set everything **unconditionally** — shutdown is never flag-gated.
+- **Arm-then-recheck in `WaitForItemAsync`**: raise flag → `WaitAsync()` (CAS = full fence) →
+  recheck `_tail`/`_stop`/`_completed` → self-`Set()` if anything appeared. Don't collapse it to a
+  single check-then-wait.
+- **Soft-complete drain** (`WaitForItemAsync` + `WaitForItemSlow`): when the ring looks empty,
+  re-read `_tail` **after** observing `_completed` (published with release after the producer's
+  last commit) — without the re-read a stale empty check silently drops the tail items. `_stop`
+  (hard stop) still exits without draining — that's the drop-on-cancel contract.
+- The pre-park fence + final recheck in both sync slow paths.
 
 **A second concurrent producer, or advancing `_head` off the worker thread, breaks this and hangs
 silently.** If you touch `SpRingCore` producer/consumer/signaling code, preserve this exactly. The
-full write-up lives in the `SpRingCore<T>` XML doc.
-
-### Async-path StoreLoad fences (don't remove — ARM64 lost-wakeup)
-
-The edge test is a **store then a load of a different location** (`CommitTail`: `Volatile.Write(_tail)`
-then `Volatile.Read(_head)`; the parking consumer: `Volatile.Write(_head)` then `Volatile.Read(_tail)`).
-`Volatile` is release/acquire, which does **not** order StoreLoad — a weak memory model (Apple Silicon /
-ARM64) can hoist each load ahead of the other thread's store, so the producer reads a **stale `_head`**
-and skips the edge `Set` while the consumer reads a **stale `_tail`** and parks → permanent hang
-(classic Dekker lost-wakeup). The **sync** consumer hides this behind its ~200-iteration spin-recheck in
-`WaitForItemSlow` (the spin drains the store buffer before it blocks). The **async** consumer parks
-immediately, so it needs explicit fences, on **both** sides (one side alone is only probabilistic):
-
-- **Producer (`CommitTail`, async branch only):** `Interlocked.MemoryBarrier()` between the `_tail`
-  publish and the `_head` read — so the edge decision can't skip on a stale `_head`. Scoped to the
-  async branch (`_itemReadyAsync is not null`); the sync branch keeps its spin and pays no per-item fence.
-- **Consumer (`WaitForItemAsync`):** **arm-then-recheck** — call `_itemReadyAsync.WaitAsync()` (its
-  `Interlocked.CompareExchange` is a full fence), then recheck `_tail`/`_stop`/`_completed`; if work
-  appeared, self-`Set()` so the armed wait completes and the loop drains instead of parking on a skipped
-  edge. Don't collapse this back to a single check-then-`WaitAsync`.
-- **Soft-complete drain (`WaitForItemAsync` + `WaitForItemSlow`):** when the ring looks empty, re-read
-  `_tail` **after** observing `_completed` (it's published with release *after* the producer's last
-  commit, so the acquire-ordered re-read sees the final `_tail`). Without the re-read, a stale empty read
-  taken before `_completed` was visible silently drops the tail items. `_stop` (hard stop) still exits
-  without draining — that's the drop-on-cancel contract.
-
-The `AsyncAutoResetEventTests.Stress_EdgeGated_SingleProducer_NoLostWakeup` harness mirrors these fences;
-its earlier unfenced form reproduced this exact hang under parallel-TFM contention.
+full write-up lives in the `SpRingCore<T>` XML doc. The regression net is
+`SignalingStressTests` + `AsyncAutoResetEventTests` — run them after any change here.
 
 - **Single consumer is structural** (the worker owns its one thread; `_head` only moves on it —
   including `HandleScope.Release`, which is a `ref struct` confined to the worker thread, called
   *before* an async handler returns its `ValueTask`).
 - **Single producer is the caller's contract** — not enforceable in Release. The DEBUG-only overlap
   guard (below) catches violations in dev/test.
+
+### Batched head publish (FIFO drain loops)
+
+The four FIFO workers release slots in batches: the drain loop keeps a LOCAL head cursor and
+publishes (`PublishHead`, absolute value) every `_flushThreshold` items
+(`max(1, min(32, capacity/4))`), at every run boundary, and IMMEDIATELY when `ProducerParked` is
+up (checked per item — warm line). Slots are still copied out / cleared per item (`TryTake` /
+`ReleaseDeferred`). Rules that keep this safe — don't break them:
+
+- **Flush at every run boundary, before every re-claim/park.** An empty ring must imply everything
+  is published, or producer and consumer deadlock on stale state. `TryClaimRun` /
+  `WaitForItemAsync` are only ever reached with the batch flushed.
+- **`HandleScope.Release` publishes immediately** (it's the handler-facing "free this slot NOW"
+  API); only the loops' automatic releases defer via the internal `ReleaseDeferred`. Worst-case
+  producer wait on a full ring is one handler duration (pre-handler flag check), not one batch —
+  the documented coarsening of the old per-item bound.
+- **`PublishHead(n)` requires every slot below `n` to be cleared/copied out already.** The loops
+  guarantee it by construction (clear-at-take / clear-at-deferral, in order).
+- The keyed workers still use the per-item `TryTakeAndAdvance`/`AdvanceHead` path — don't move
+  them to the batched API without revisiting their cell-state protocol.
+
+Regression net: `BatchedReleaseTests` (+ `SignalingStressTests` for the park churn).
 
 ## Architecture (don't regress these)
 
@@ -68,7 +88,8 @@ its earlier unfenced form reproduced this exact hang under parallel-TFM contenti
   I…Handler<T>`. Per-item `Handle`/`OnError`/`OnCompleted` go through the struct field so the JIT
   inlines them. Never store the handler as an interface reference or call it virtually.
 - **Fast/slow split.** Core producer/consumer fast paths (`TryReserve`/`TryClaimRun`/`CommitTail`/
-  `AdvanceHead`/`TryEnqueue`/`TryTakeAndAdvance`) are `[AggressiveInlining]`; the parking loops
+  `AdvanceHead`/`TryEnqueue`/`TryTakeAndAdvance`/`TryTake`/`PublishHead`/`ShouldFlush`) are
+  `[AggressiveInlining]`; the parking loops
   (`WaitForSpaceSlow`/`WaitForItemSlow`) are `[NoInlining]`. Keep the hot path inlined and the cold
   park out of line.
 - **Cache-line-padded indices.** `_head` (consumer) and `_tail` (producer) live in a
@@ -113,8 +134,9 @@ its earlier unfenced form reproduced this exact hang under parallel-TFM contenti
   - *Async* (`AsyncSpWorker` / `AsyncValueSpWorker`): **ThreadPool** loop, no dedicated thread.
     `Start` launches `RunLoopAsync` (one `async Task`) via `Task.Run`, using the core's **no-thread**
     ctor (`new SpRingCore<T>(capacity)`), `TryClaimRunNow` (non-blocking run-claim — the no-park twin
-    of `TryClaimRun`; drain `[head, available)` with `TryTakeAndAdvance` (copy) / `HandleScope` (value)
-    per item, one `_idx.Tail` read per run, then re-claim), and `WaitForItemAsync`. (This replaced the
+    of `TryClaimRun`; drain `[head, available)` with `TryTake` (copy) / `HandleScope`+`ReleaseDeferred`
+    (value) per item under the batched head publish, one `_idx.Tail` read per run, then re-claim), and
+    `WaitForItemAsync`. (This replaced the
     old per-item `TryClaimNow`/`TryDequeueNow`, which read `_idx.Tail` every item; the run-claim mirrors
     the sync consumer's batching for the sync-completing-handler case.) The continuation resumes on the
     pool — no thread parked per `await` — so it

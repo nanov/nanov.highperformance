@@ -87,4 +87,16 @@ public ref struct HandleScope<T> where T : struct {
 		// ring never writes a full default(T) back. Clear is a no-op when no cleaner is bound.
 		_core.ClearAndAdvanceHead(_head);
 	}
+
+	/// <summary>
+	///   Loop-internal deferred release: run the handler's <c>Clear</c> on the slot but leave the
+	///   <c>Head</c> publish to the drain loop's batch flush. The public <see cref="Release" /> — the
+	///   handler-facing "free this slot NOW" API — still publishes immediately: early release must
+	///   unblock a waiting producer without waiting for the batch.
+	/// </summary>
+	internal void ReleaseDeferred() {
+		if (IsReleased) return;
+		IsReleased = true;
+		_core.ClearSlot(_head);
+	}
 }

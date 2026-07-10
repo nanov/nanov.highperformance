@@ -18,6 +18,9 @@
 
     <!-- Benchmarks -->
     <PackageVersion Include="BenchmarkDotNet" Version="0.14.0" />
+
+    <!-- Perf tests (latency histograms) -->
+    <PackageVersion Include="HdrHistogram" Version="2.5.0" />
   </ItemGroup>
 
 </Project>

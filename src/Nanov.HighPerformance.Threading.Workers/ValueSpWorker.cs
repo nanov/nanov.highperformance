@@ -88,13 +88,21 @@ public sealed class ValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 
 	private void RunLoop() {
 		try {
-			// Claim the whole available run, then drain it scope-by-scope, re-claiming (and only then
-			// re-parking when truly empty) once exhausted — dropping the per-item emptiness _tail read
-			// a per-item claim pays (one _tail read per run instead of per item). HandleScope.Release still
-			// advances head per item (via ++head), so the early-release contract and tight backpressure
-			// are unchanged; IsStopped is rechecked per item so a hard stop drops the rest of the run.
+			// Claim the whole available run, drain it scope-by-scope with batched Head publishes. The
+			// pre-handler ShouldFlush check publishes PRIOR items only (head = this item's index — its
+			// slot is still owned by the scope), so a producer parked during the previous handler never
+			// also waits out this one. A handler that Releases early publishes immediately through the
+			// scope (Head is absolute, covering any deferred predecessors) — the batch restarts empty.
+			// Auto-releases defer via ReleaseDeferred (clear now, publish with the batch). Run-boundary
+			// flush before every re-claim/park: empty ring ⇒ all published — no deadlock.
 			while (_core.TryClaimRun(out var head, out var available)) {
+				var pending = 0;
 				do {
+					if (_core.ShouldFlush(pending)) {
+						_core.PublishHead(head);
+						pending = 0;
+					}
+
 					var scope = new HandleScope<T>(_core, head);
 					try {
 						_handler.Handle(ref scope);
@@ -103,11 +111,18 @@ public sealed class ValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 						_handler.OnError(ex);
 					}
 					finally {
-						// Safety net: ensure the slot is released even if the handler didn't. Idempotent.
-						scope.Release();
+						if (scope.IsReleased) {
+							pending = 0; // early release already published past this item
+						} else {
+							scope.ReleaseDeferred();
+							pending++;
+						}
 					}
 				}
 				while (!_core.IsStopped && ++head != available);
+
+				// On a hard-stop exit head wasn't incremented past the current item, so this under-publishes by one — intentional and safe (slot already cleared; hard stop drops the ring). Don't "fix" it to head + 1.
+				if (pending > 0) _core.PublishHead(head);
 			}
 		}
 		finally {

@@ -18,6 +18,9 @@ BenchmarkDotNet.Artifacts/
 ## Agent / tooling
 .serena/
 
+## Local perf captures (machine-specific, never committed)
+perf-local/
+
 ## Test / coverage
 [Tt]est[Rr]esults/
 *.trx
