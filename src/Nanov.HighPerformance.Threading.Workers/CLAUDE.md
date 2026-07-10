@@ -209,18 +209,23 @@ of `CoalescingSpWorker`** and reuses the coalescer's two structures verbatim. Th
   **no `Merging`** — last-wins has no read-modify-write to serialize, so the producer never locks. Only
   `Free == 0` is "evictable" (the contract `CoalescingKeyMap.EvictFree` keys off); the other two are
   arbitrary non-zero. Don't add a `Merging` state or a `Coalesce` call.
-- **`Value` is single-writer (the producer); the consumer only CASes it back to null.** Producer:
+- **`Value` has ONE writer — the producer. The consumer NEVER writes `Value`.** Producer:
   `Volatile.Write(ref cell.Value, value)` (atomic ref overwrite) → `Interlocked.Exchange(ref cell.State,
   Available)`. If the exchange returns `Available` the index is already in the ring → conflated in place,
   done. Otherwise (`Free` or `Consuming`) the index is not in the ring → enqueue once. Consumer: CAS
-  `Available→Consuming`, read `Value` (acquire — published before the producer's `Exchange`),
-  **conditionally** `Interlocked.CompareExchange(ref cell.Value, null, taken)` to release the ref for GC
-  iff the producer hasn't overwritten it since, then CAS `Consuming→Free`. The closing CAS **fails iff**
-  the producer re-dirtied during the read (state is now `Available`), in which case a fresh ring entry
-  already exists → leave the cell queued (latest redelivered). The `Interlocked` ops on `State` give a
-  total order on both sides: losslessness (latest always delivered) with at most a harmless duplicate of
-  the latest value — correct precisely **because** it's last-wins. Don't make the value clear
-  unconditional (it would clobber a concurrent override → lost update).
+  `Available→Consuming`, read `Value` (acquire — published before the producer's `Exchange`), then CAS
+  `Consuming→Free`. The closing CAS **fails iff** the producer re-dirtied during the read (state is now
+  `Available`), in which case a fresh ring entry already exists → leave the cell queued (latest
+  redelivered). The `Interlocked` ops on `State` give a total order on both sides: losslessness (latest
+  always delivered) with at most a harmless duplicate of the latest value — correct precisely **because**
+  it's last-wins.
+  - **Do NOT reintroduce a consumer-side `Value` null-clear** (conditional or not). The producer's
+    `Value` write and its `State` publish are two separate steps, so a consumer clear can null a value the
+    producer has written but not yet published (the read may even capture that value) — the redelivered
+    ring entry then reads `null` → NRE in the handler. This was a real bug. A drained reference is released
+    for GC by the producer instead: on the key's next overwrite, or when the cell is evicted (`EvictFree`
+    / `Place` reset the cell). Regression net: `Sustained_Load_Never_Delivers_A_Null_Value` +
+    `Ref_Value_Slots_Are_Released_On_Eviction`.
 - **Eviction is the coalescer's unchanged state-gated `EvictFree`** — producer-side, cold, tombstones
   only `Free` cells. While an index is in the ring (`Available`) or being read (`Consuming`), the cell is
   non-`Free`, so a handed-out index is never reused under the consumer (the slot-reuse race that killed a
@@ -229,8 +234,9 @@ of `CoalescingSpWorker`** and reuses the coalescer's two structures verbatim. Th
 - **Hard-stop guard before the map.** `Dispatch` bails on `_ring.IsStopped` *before* touching the map
   (Dispose/cancel tears the map down). The soft-complete path keeps the map valid and is rejected later
   by `TryEnqueue` (→ rollback `State→Free` → false).
-- **`TValue : class`** is load-bearing: the overwrite and the null-clear are single atomic reference
-  writes. A struct value would tear — don't relax the constraint without a new publish mechanism.
+- **`TValue : class`** is load-bearing: the producer's overwrite (and the consumer's acquire read) are
+  single atomic reference operations. A struct value would tear — don't relax the constraint without a new
+  publish mechanism.
 
 ## CoalescingSpWorker (key-coalescing worker, exactly-once) — invariants
 

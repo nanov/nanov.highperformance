@@ -9,6 +9,35 @@ implication ("so don't…"). If something becomes a permanent rule, move it into
 
 ---
 
+## 2026-07-10 — Two spotted concurrency bugs fixed (Conflation NRE + Dispatch/TryComplete race)
+
+Both pre-existing, surfaced during the throughput work; fixed TDD (red repro → fix → green), verified on
+net9.0 + net10.0 (Release + Debug), 5× flake check. Fable 5 reviewed bug #1's fix and CONFIRMED it.
+
+- **Bug #1 — `ConflationSpWorker` NRE (`taken == null` at the `Handle` call).** Root cause: the producer's
+  `Volatile.Write(cell.Value, v)` and its `Interlocked.Exchange(cell.State, Available)` are **two steps**,
+  and the consumer's per-drain **null-clear** (`CompareExchange(cell.Value, null, taken)`) could null a
+  value the producer had written but **not yet published** — the redelivered ring entry then read `null`.
+  Fires on both producer branches (`prev==Free` and `prev==Consuming`); reference-identity can't tell a
+  stale value from a written-but-unpublished one, so **no** consumer-side clear ordering is safe.
+  - **Fix:** the consumer **no longer writes `cell.Value` at all** (only CASes `State Consuming→Free`).
+    Delivery is state-machine-driven, so correctness is unchanged; `taken` is now provably non-null.
+  - **Trade-off (accepted):** dropped eager GC-null-on-drain. A drained reference is released when the
+    producer overwrites it (key re-dispatched) or the cell is evicted (`EvictFree`/`Place` reset). Fable's
+    3-leg protocol *can* restore eager clear but costs +1 interlocked CAS/item — **not worth it**, don't
+    add it without a measured reason. `TValue` carriers must still be per-dispatch fresh (same-ref reuse
+    is ABA-fragile and unsupported).
+  - Regression net: `Sustained_Load_Never_Delivers_A_Null_Value` + `Ref_Value_Slots_Are_Released_On_Eviction`.
+
+- **Bug #2 — Dispatch racing TryComplete stranded an item (was the L3 backlog note).** A producer parked in
+  `WaitForSpaceSlow` only re-checked `_stop`/`_completed` *inside* the while-full loop, and `TryComplete`
+  didn't `Set` `_spaceEvt` (violating the "shutdown Sets everything" invariant). So a soft-complete could
+  leave the parked producer hung, or let it wake on freed space and commit an item into a ring whose
+  consumer had already exited (silent loss).
+  - **Fix:** `TryComplete` now `_spaceEvt.Set()`s too; `WaitForSpaceSlow` re-checks `_stop || _completed`
+    after the wait loop and returns false. A dispatch racing soft-complete is rejected, never stranded.
+  - Regression net: `TryComplete_Unblocks_A_Producer_Parked_On_A_Full_Ring` (+ `SignalingStressTests`).
+
 ## 2026-07-10 — Lock-step squeeze L3: batched head publish in the FIFO drain loops
 
 The four FIFO workers publish Head every `max(1, min(32, capacity/4))` items / at run boundaries /
@@ -22,7 +51,7 @@ this harness cannot exercise). Known overhead mechanism if it ever matters: the 
 reads ProducerParked twice per item (ShouldFlush + PublishHead).
 - Never remove the run-boundary flush (empty ring must imply all-published — deadlock otherwise).
 - Keyed workers stay on per-item TryTakeAndAdvance.
-- Backlog (pre-existing, found in final review): a Dispatch racing TryComplete can slip an item past the exiting consumer — WaitForSpaceSlow only rechecks _completed while the ring is still full, and TryComplete doesn't Set _spaceEvt. Pre-dates this branch; batching didn't widen it. Needs its own look.
+- Backlog (pre-existing, found in final review): a Dispatch racing TryComplete can slip an item past the exiting consumer — WaitForSpaceSlow only rechecks _completed while the ring is still full, and TryComplete doesn't Set _spaceEvt. **RESOLVED 2026-07-10 (bug #2) — see the top entry.**
 
 ## 2026-07-10 — Lock-step squeeze L2: parked-flag signaling replaces per-item cross-index edge reads
 

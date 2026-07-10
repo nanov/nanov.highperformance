@@ -21,9 +21,13 @@ using Nanov.HighPerformance.Threading.Workers.Internal;
 ///     instead of a read-modify-write. Last-wins has no merge to serialize, so the producer just writes the
 ///     cell's <c>Value</c> (a single atomic reference write — hence <typeparamref name="TValue" /> is a
 ///     <see langword="class" />) and flips the state with one <see cref="Interlocked.Exchange(ref int, int)" />.
-///     <c>Value</c> has a single writer (the producer); the consumer only ever CASes it back to <c>null</c>, so
-///     there is no lost update. Eviction is the coalescer's unchanged producer-side, state-gated tombstone
-///     (a slot is reclaimed only while <c>Free</c>), which is what makes a handed-out index safe to reuse.
+///     <c>Value</c> has a <b>single writer, the producer</b> — the consumer never writes it (it only reads
+///     the latest and flips <c>State</c>). It must not: the producer's <c>Value</c> write and its
+///     <c>State</c> publish are not one atomic step, so a consumer clear can null a value the producer has
+///     written but not yet published, stranding the next ring entry with a <c>null</c>. The reference is
+///     released for GC when the producer overwrites it (the key's next dispatch) or the cell is evicted.
+///     Eviction is the coalescer's unchanged producer-side, state-gated tombstone (a slot is reclaimed only
+///     while <c>Free</c>, resetting the cell), which both frees the value and makes a handed-out index safe to reuse.
 ///   </para>
 ///   The handler is a <see langword="struct" /> constrained to <see cref="IConflationWorkerHandler{TKey, TValue}" />
 ///   so <c>Handle</c>/<c>OnError</c>/<c>OnCompleted</c> devirtualize and inline. Single producer is the caller's
@@ -133,13 +137,16 @@ public sealed class ConflationSpWorker<TKey, TValue, THandler> : IDisposable, IW
 					var key = cell.Key;
 					var taken = Volatile.Read(ref cell.Value); // latest (published before the producer's Exchange)
 
-					// Release the reference for GC, but ONLY if the producer hasn't overwritten the slot since we
-					// read it (CAS to null iff still == taken). Done while Consuming, so the producer's Free-only
-					// EvictFree can't race this slot. A racing override fails this CAS → its value survives.
-					Interlocked.CompareExchange(ref cell.Value, null!, taken);
-
 					// Release: Consuming -> Free. Fails iff the producer re-dirtied (set Available) during the read,
 					// in which case a fresh ring entry already exists → leave the cell queued (redelivered).
+					//
+					// The consumer does NOT null cell.Value: the producer is Value's single writer, and its
+					// Value-write and State-publish (Exchange) are not one atomic step, so any consumer clear can
+					// race a value the producer has written but not yet published — nulling it strands the next
+					// ring entry with a null (an NRE in the handler). A conditional clear can't distinguish that
+					// window (the read may already capture the to-be-published value). The reference is released
+					// for GC when the producer overwrites it (the key's next dispatch) or the cell is evicted
+					// (EvictFree/Place reset the cell) — never eagerly on drain. See CLAUDE.md invariants.
 					Interlocked.CompareExchange(ref cell.State, Free, Consuming);
 
 					try {
