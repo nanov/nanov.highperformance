@@ -9,6 +9,16 @@ implication ("so don't…"). If something becomes a permanent rule, move it into
 
 ---
 
+## 2026-07-10 — Lock-step squeeze L1: bounds-check elimination; lifecycle-flag fold dropped
+
+All ring-slot accesses now go through `SlotRef` (`MemoryMarshal.GetArrayDataReference` +
+`Unsafe.Add`), removing the per-access bounds check (safe by construction: `_mask = length − 1`,
+power-of-two length). macOS perf delta: mixed variance within noise (-17% to +4%). Kept on the
+standard-technique basis.
+- The spec'd optional fold of `_completed || _stop` into one bitfield was **dropped**: two volatile
+  bool loads on a warm line aren't worth converting the lifecycle writes to Interlocked bit ops.
+  Don't revisit without a measured reason.
+
 ## 2026-06-28 — Throughput gap vs Disruptor is architectural, not a bug
 
 Disruptor ~325 Mops vs worker ~35 Mops. Root cause: **design philosophy, not a missing

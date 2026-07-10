@@ -236,7 +236,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 			return false;
 		}
 
-		_buffer[tail & _mask] = item;
+		SlotRef(tail) = item;
 		CommitTail(tail);
 		DebugEndProduce();
 		return true;
@@ -266,9 +266,18 @@ internal sealed class SpRingCore<T> : IDisposable {
 #endif
 	}
 
+	/// <summary>
+	///   Ring slot ref without the array bounds check. The JIT can't prove
+	///   <c>(index &amp; _mask) &lt; _buffer.Length</c> across fields, but it holds by construction:
+	///   <c>_mask = Length − 1</c> with Length a power of two, so the masked index is always in range.
+	/// </summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private ref T SlotRef(int index) =>
+		ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_buffer), (nint)(uint)(index & _mask));
+
 	/// <summary>Writable ref to slot <paramref name="head" /> — the scope reads/writes the slot through this.</summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	internal ref T GetSlotRef(int head) => ref _buffer[head & _mask];
+	internal ref T GetSlotRef(int head) => ref SlotRef(head);
 
 	/// <summary>
 	///   Release-time fast path for the value scope: run the handler's <c>Clear(ref T)</c> on slot
@@ -280,7 +289,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 	/// </summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	internal void ClearAndAdvanceHead(int head) {
-		_cleaner.Clear(ref _buffer[head & _mask]);
+		_cleaner.Clear(ref SlotRef(head));
 		AdvanceHead(head);
 	}
 
@@ -320,7 +329,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 	/// </summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	private T TakeAndAdvance(int head) {
-		ref var slot = ref _buffer[head & _mask];
+		ref var slot = ref SlotRef(head);
 		var item = slot;
 		if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
 			slot = default!;
