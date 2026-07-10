@@ -99,13 +99,19 @@ public sealed class AsyncValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 		try {
 			var ct = _core.CancellationToken;
 			// Claim the whole available run, drain it scope-by-scope, then re-claim — one _idx.Tail read per
-			// run instead of per item (mirrors the sync ValueSpWorker). Head still advances per item via
-			// HandleScope.Release; IsStopped is rechecked per item so a hard stop drops the rest of the run.
-			// Only when a fresh claim finds the ring empty do we park on WaitForItemAsync.
+			// run instead of per item (mirrors the sync ValueSpWorker). Head publishes are batched
+			// (ReleaseDeferred + PublishHead per ShouldFlush); an early HandleScope.Release still publishes
+			// immediately. IsStopped is rechecked per item so a hard stop drops the rest of the run.
 			while (true) {
 				_core.AckWake(); // clear the parked flag once per wake, before draining
 				while (_core.TryClaimRunNow(out var head, out var available)) {
+					var pending = 0;
 					do {
+						if (_core.ShouldFlush(pending)) {
+							_core.PublishHead(head);
+							pending = 0;
+						}
+
 						// The ref-struct scope is consumed synchronously (read + Release) before the await —
 						// it never crosses the suspension. The handler returns a ValueTask for any async tail.
 						var vt = default(ValueTask);
@@ -118,7 +124,12 @@ public sealed class AsyncValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 							vt = default; // nothing to await; the finally still releases the slot
 						}
 						finally {
-							scope.Release(); // safety net; idempotent (handler should release before returning)
+							if (scope.IsReleased) {
+								pending = 0; // early release already published past this item
+							} else {
+								scope.ReleaseDeferred(); // clear now, publish with the batch
+								pending++;
+							}
 						}
 
 						try {
@@ -129,6 +140,8 @@ public sealed class AsyncValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 						}
 					}
 					while (!_core.IsStopped && ++head != available);
+
+					if (pending > 0) _core.PublishHead(head);
 				}
 
 				if (!await _core.WaitForItemAsync().ConfigureAwait(false))

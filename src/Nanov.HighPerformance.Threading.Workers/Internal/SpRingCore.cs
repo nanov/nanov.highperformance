@@ -78,6 +78,11 @@ internal sealed class SpRingCore<T> : IDisposable {
 	// TryClaimRun). Stays 0 until the first wrap — with Tail also 0, Tail − _cachedHead = 0 ≠ capacity,
 	// so the inert initial state is correct.
 	private int _cachedHead;
+	// Batched-release flush threshold for the FIFO drain loops: publish Head every this-many deferred
+	// releases (also always at run boundaries, and immediately when the producer is parked). max(1, …)
+	// disables batching for tiny rings; capacity/4 keeps at least ~3/4 of a small ring usable while a
+	// batch is pending; 32 caps the staleness for big rings.
+	private readonly int _flushThreshold;
 #if DEBUG
 	private int _producing; // 0/1 — debug-only re-entrancy flag for the producer overlap guard
 #endif
@@ -92,6 +97,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 		capacity = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(capacity, 1));
 		_buffer = new T[capacity];
 		_mask = capacity - 1;
+		_flushThreshold = Math.Max(1, Math.Min(32, capacity >> 2));
 		_thread = new Thread(runLoop) {
 			IsBackground = true,
 			Name = threadName
@@ -109,6 +115,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 		capacity = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(capacity, 1));
 		_buffer = new T[capacity];
 		_mask = capacity - 1;
+		_flushThreshold = Math.Max(1, Math.Min(32, capacity >> 2));
 		_thread = null;
 		_itemReadyAsync = new AsyncAutoResetEvent();
 		_cleaner = cleaner;
@@ -302,16 +309,60 @@ internal sealed class SpRingCore<T> : IDisposable {
 		AdvanceHead(head);
 	}
 
-	/// <summary>Release the slot at <paramref name="head" /> and wake the producer if it is parked.</summary>
+	/// <summary>
+	///   Batched-release twin of <see cref="TryTakeAndAdvance" />: hard-stop check + copy-out + slot
+	///   clear, WITHOUT publishing <c>Head</c>. The FIFO drain loops batch the publishes through
+	///   <see cref="PublishHead" /> per <see cref="ShouldFlush" /> — and ALWAYS flush at run
+	///   boundaries, i.e. before every re-claim/park: an empty ring implies everything is published
+	///   (the no-deadlock rule; see BATCHED HEAD PUBLISH in CLAUDE.md). The keyed workers keep the
+	///   per-item <see cref="TryTakeAndAdvance" /> path.
+	/// </summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	private void AdvanceHead(int head) {
-		Volatile.Write(ref _idx.Head, head + 1);
-		// Parked-flag mirror of CommitTail: wake a blocked producer via its parked flag instead of a
-		// per-item cross-core read of _idx.Tail for the full→non-full edge. Spurious-never-lost: the
-		// producer raises the flag before WaitForSpaceSlow's spin phase, which re-reads _idx.Head.
+	internal bool TryTake(int head, out T item) {
+		if (_stop) {
+			item = default!;
+			return false;
+		}
+
+		ref var slot = ref SlotRef(head);
+		item = slot;
+		if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+			slot = default!;
+		return true;
+	}
+
+	/// <summary>
+	///   Run the bound cleaner on slot <paramref name="head" /> without publishing — the deferred
+	///   (auto-release) half of the value path; <see cref="HandleScope{T}.ReleaseDeferred" /> calls
+	///   this, the loop publishes later per its flush policy.
+	/// </summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal void ClearSlot(int head) => _cleaner.Clear(ref SlotRef(head));
+
+	/// <summary>
+	///   Publish the consumer's head cursor (ABSOLUTE value, unlike <see cref="AdvanceHead" />'s
+	///   item index) and wake the producer if it is parked. Every slot below
+	///   <paramref name="nextHead" /> must already be cleared/copied out.
+	/// </summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal void PublishHead(int nextHead) {
+		Volatile.Write(ref _idx.Head, nextHead);
 		if (Volatile.Read(ref _idx.ProducerParked) != 0)
 			_spaceEvt.Set();
 	}
+
+	/// <summary>
+	///   Flush policy for the batched release: publish every <c>_flushThreshold</c> deferred items, or
+	///   immediately when the producer is parked (warm-line read, checked per item) — so a blocked
+	///   producer never waits on the batch, only on the one handler currently running.
+	/// </summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal bool ShouldFlush(int pending) =>
+		pending >= _flushThreshold || Volatile.Read(ref _idx.ProducerParked) != 0;
+
+	/// <summary>Release the slot at <paramref name="head" /> and wake the producer if it is parked.</summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private void AdvanceHead(int head) => PublishHead(head + 1);
 
 	/// <summary>
 	///   Per-item run drain for the run-claim consumer: hard-stop check (drops the item on cancel/dispose),

@@ -60,13 +60,23 @@ public sealed class SpWorker<T, THandler> : IDisposable, IWorkerQueue
 
 	private void RunLoop() {
 		try {
-			// Claim the whole available run, then drain it item-by-item, re-claiming (and only then
-			// re-parking when truly empty) once exhausted. Head still advances per item via
-			// TakeAndAdvance — eager slot-free, so backpressure stays tight (one item in-flight) and the
-			// space-signal edge stays per item — but the per-item emptiness _tail read a per-item claim
-			// pays is dropped: one _tail read per run instead of per item.
+			// Claim the whole available run, drain it item-by-item, batching the Head publishes: each
+			// slot is still copied out + cleared per item (TryTake), but Head is published only every
+			// _flushThreshold items, at the run boundary, or immediately when the producer is parked
+			// (ShouldFlush, warm-line read) — cutting the per-item volatile Head write and the
+			// producer-side fullness-refresh misses while keeping a parked producer's wait bounded by
+			// the one handler currently running. The run-boundary flush runs before every re-claim (and
+			// thus before every park): an empty ring implies everything is published — no deadlock.
 			while (_core.TryClaimRun(out var head, out var available)) {
-				while (head != available && _core.TryTakeAndAdvance(head++, out var item)) {
+				var pending = 0;
+				while (head != available && _core.TryTake(head, out var item)) {
+					head++;
+					pending++;
+					if (_core.ShouldFlush(pending)) {
+						_core.PublishHead(head);
+						pending = 0;
+					}
+
 					try {
 						_handler.Handle(item);
 					}
@@ -74,6 +84,8 @@ public sealed class SpWorker<T, THandler> : IDisposable, IWorkerQueue
 						_handler.OnError(ex);
 					}
 				}
+
+				if (pending > 0) _core.PublishHead(head);
 			}
 		}
 		finally {

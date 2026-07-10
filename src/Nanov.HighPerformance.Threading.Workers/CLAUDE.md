@@ -51,6 +51,28 @@ full write-up lives in the `SpRingCore<T>` XML doc. The regression net is
 - **Single producer is the caller's contract** — not enforceable in Release. The DEBUG-only overlap
   guard (below) catches violations in dev/test.
 
+### Batched head publish (FIFO drain loops)
+
+The four FIFO workers release slots in batches: the drain loop keeps a LOCAL head cursor and
+publishes (`PublishHead`, absolute value) every `_flushThreshold` items
+(`max(1, min(32, capacity/4))`), at every run boundary, and IMMEDIATELY when `ProducerParked` is
+up (checked per item — warm line). Slots are still copied out / cleared per item (`TryTake` /
+`ReleaseDeferred`). Rules that keep this safe — don't break them:
+
+- **Flush at every run boundary, before every re-claim/park.** An empty ring must imply everything
+  is published, or producer and consumer deadlock on stale state. `TryClaimRun` /
+  `WaitForItemAsync` are only ever reached with the batch flushed.
+- **`HandleScope.Release` publishes immediately** (it's the handler-facing "free this slot NOW"
+  API); only the loops' automatic releases defer via the internal `ReleaseDeferred`. Worst-case
+  producer wait on a full ring is one handler duration (pre-handler flag check), not one batch —
+  the documented coarsening of the old per-item bound.
+- **`PublishHead(n)` requires every slot below `n` to be cleared/copied out already.** The loops
+  guarantee it by construction (clear-at-take / clear-at-deferral, in order).
+- The keyed workers still use the per-item `TryTakeAndAdvance`/`AdvanceHead` path — don't move
+  them to the batched API without revisiting their cell-state protocol.
+
+Regression net: `BatchedReleaseTests` (+ `SignalingStressTests` for the park churn).
+
 ## Architecture (don't regress these)
 
 - **Composition, not inheritance.** All machinery lives in internal sealed cores; the public workers
@@ -66,7 +88,8 @@ full write-up lives in the `SpRingCore<T>` XML doc. The regression net is
   I…Handler<T>`. Per-item `Handle`/`OnError`/`OnCompleted` go through the struct field so the JIT
   inlines them. Never store the handler as an interface reference or call it virtually.
 - **Fast/slow split.** Core producer/consumer fast paths (`TryReserve`/`TryClaimRun`/`CommitTail`/
-  `AdvanceHead`/`TryEnqueue`/`TryTakeAndAdvance`) are `[AggressiveInlining]`; the parking loops
+  `AdvanceHead`/`TryEnqueue`/`TryTakeAndAdvance`/`TryTake`/`PublishHead`/`ShouldFlush`) are
+  `[AggressiveInlining]`; the parking loops
   (`WaitForSpaceSlow`/`WaitForItemSlow`) are `[NoInlining]`. Keep the hot path inlined and the cold
   park out of line.
 - **Cache-line-padded indices.** `_head` (consumer) and `_tail` (producer) live in a
@@ -111,8 +134,9 @@ full write-up lives in the `SpRingCore<T>` XML doc. The regression net is
   - *Async* (`AsyncSpWorker` / `AsyncValueSpWorker`): **ThreadPool** loop, no dedicated thread.
     `Start` launches `RunLoopAsync` (one `async Task`) via `Task.Run`, using the core's **no-thread**
     ctor (`new SpRingCore<T>(capacity)`), `TryClaimRunNow` (non-blocking run-claim — the no-park twin
-    of `TryClaimRun`; drain `[head, available)` with `TryTakeAndAdvance` (copy) / `HandleScope` (value)
-    per item, one `_idx.Tail` read per run, then re-claim), and `WaitForItemAsync`. (This replaced the
+    of `TryClaimRun`; drain `[head, available)` with `TryTake` (copy) / `HandleScope`+`ReleaseDeferred`
+    (value) per item under the batched head publish, one `_idx.Tail` read per run, then re-claim), and
+    `WaitForItemAsync`. (This replaced the
     old per-item `TryClaimNow`/`TryDequeueNow`, which read `_idx.Tail` every item; the run-claim mirrors
     the sync consumer's batching for the sync-completing-handler case.) The continuation resumes on the
     pool — no thread parked per `await` — so it
