@@ -15,18 +15,11 @@ The four FIFO workers publish Head every `max(1, min(32, capacity/4))` items / a
 immediately when `ProducerParked` is up, instead of per item (slots still cleared per item).
 `HandleScope.Release` still publishes immediately; only auto-releases defer. Worst-case producer
 wait coarsened from one slot-free to ONE HANDLER DURATION (accepted trade-off, documented).
-macOS perf delta vs L2 (7 runs/test, `--target SpWorker`, saturated-throughput harness — ring
-stays full so batching degenerates toward the per-item `ProducerParked` flush trigger, per design):
-mean/median regressed on every FIFO worker — SpWorker mean 98.0→76.0 Mops (−22%, median
-65.4→47.0, −28%); ValueSpWorker mean 80.4→39.3 Mops (−51%, median 77.3→22.3, −71%); AsyncSpWorker
-mean 65.0→41.8 Mops (−36%, median 66.0→31.1, −53%); AsyncValueSpWorker mean 52.9→45.2 Mops (−14%,
-median 47.7→32.1, −33%); Coalescing (unaffected code path) +17%/+5% — noise, confirms the harness's
-per-run variance dwarfs the signal (max-of-7 tells a milder story: SpWorker 163→129 Mops −21%,
-ValueSpWorker 94→91 −3%, AsyncSpWorker 102→69 −32%, AsyncValueSpWorker 77→82 +7%). Latency
-(OneWay/PingPong median) flat. This contradicts the "saturated regime ⇒ no regression" expectation
-at face value, but every earlier layer's laptop numbers already showed error > mean on this same
-harness (see L1) — recorded as observed, not blessed; re-measure on quieter hardware or with more
-runs before trusting the sign of the L3 delta.
+Interleaved L2↔L3 A/B: deltas within the ±10–15% noise floor (untouched tests moved as much); no
+confirmed regression, no measurable win in the saturated harness regime — kept on the
+standard-technique basis (Disruptor batch-release; the win regime is streaming consumers, which
+this harness cannot exercise). Known overhead mechanism if it ever matters: the saturated path
+reads ProducerParked twice per item (ShouldFlush + PublishHead).
 - Never remove the run-boundary flush (empty ring must imply all-published — deadlock otherwise).
 - Keyed workers stay on per-item TryTakeAndAdvance.
 
@@ -38,7 +31,8 @@ committer signals only when the flag is up — "a signal may be spurious, never 
 add one full fence per kernel park (cold); the async commit fence is unchanged. macOS perf delta
 vs L1: mean throughput SpWorker +420% (18.9→98.0 Mops), ValueSpWorker +321% (19.1→80.4),
 AsyncSpWorker +329% (15.1→65.0), AsyncValueSpWorker +205% (17.3→52.9); Coalescing flat (−3%,
-noise); latency flat-to-better (ping-pong median 0.83→0.50–0.63 µs).
+noise); latency flat-to-better (ping-pong median 0.83→0.50–0.63 µs). Confirmed by interleaved
+L2↔L3 runs: SpWorker ~126 Mops mean at L2 vs ~19 Mops at L1 — the layer with the step-change win.
 - Don't reintroduce the index-edge Set test; don't gate SignalStop/TryComplete on the flags; don't
   collapse arm-then-recheck.
 
