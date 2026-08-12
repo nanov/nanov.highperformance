@@ -2386,18 +2386,43 @@ Replace the `Harvest` stub in `ActorSystem.cs`:
 				continue;
 			}
 
-			_handler.OnChunkReclaimed(_slab.ChunkSpan(cell.ChunkBase));
+			// A throwing hook must not leave the cell stuck in Reclaiming — nothing can ever move it
+			// again (every transition requires Free), so the key strands and the chunk leaks forever.
+			try {
+				_handler.OnChunkReclaimed(_slab.ChunkSpan(cell.ChunkBase));
+			}
+			catch (Exception ex) {
+				SafeOnError(ex);
+			}
+
 			_slab.Return(cell.ChunkBase);
 			cell.ChunkBase = Chunk.None;
-			cell.Head = 0;
-			cell.Tail = 0;
-			cell.CachedHead = 0;
+			// Do NOT reset Head/Tail/CachedHead here. The worker's release recheck is not state-gated:
+			// it reads cell.Tail with a stale local `head`, then CASes. Resetting the cursors under a
+			// mid-release worker makes `Tail != head` read as "not empty", so it schedules a cell whose
+			// ChunkBase is now Chunk.None — and SlotRef is unchecked, so draining that is a wild
+			// pointer. The reset is redundant anyway: BindChunk re-zeroes all three on rebind.
 			Volatile.Write(ref cell.State, CellState.Free);
 			freed = true;
 		}
 
 		return freed;
 	}
+```
+
+**Also guard `Activate` against a chunkless cell.** This is the belt to the previous braces: it makes
+a spurious schedule inert no matter how long a worker's release recheck is delayed. In `Activate`,
+right after `var chunk = cell.ChunkBase;`, insert:
+
+```csharp
+		if (chunk == Chunk.None) {
+			// Spurious schedule: the producer harvested this cell's chunk while we were between our
+			// State release and our Tail recheck. Nothing to drain and no chunk to drain it from —
+			// release and move on. Without this, the drain loop indexes the slab at Chunk.None (-1),
+			// and SlotRef is deliberately unchecked.
+			ReleaseAndMaybeSchedule(index, ref cell, cell.Head, fromWorker: true);
+			return;
+		}
 ```
 
 `ReleaseAndMaybeSchedule` writes `cell.Head` and publishes the processed count — neither is correct
