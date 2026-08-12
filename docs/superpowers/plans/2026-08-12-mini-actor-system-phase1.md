@@ -1794,7 +1794,17 @@ Change `RunLoop` to run the completion hooks on exit:
 		}
 		finally {
 			PublishProcessed();
-			Exception? error = _stopped && !_completed ? new OperationCanceledException() : _completionError;
+
+			// `_completed` means a drain was REQUESTED, not that it finished. A Dispose racing an
+			// in-flight TryComplete — the ordinary graceful-shutdown-with-timeout pattern — drops
+			// messages, so the exit is clean only if we actually reached quiescence. Testing
+			// `_stopped && !_completed` instead reports RanToCompletion on a shutdown that lost data.
+			// Read `_completed` BEFORE the counters: same acquire ordering rule as IsQuiescent, and
+			// `&&` short-circuits in the right order.
+			var drainedCleanly = _completed &&
+				Volatile.Read(ref _processedPublished) == Volatile.Read(ref _dispatchedFinal);
+			var hardStopped = _stopped && !drainedCleanly;
+			Exception? error = hardStopped ? new OperationCanceledException() : _completionError;
 			try {
 				_handler.OnCompleted(error);
 			}
@@ -1802,8 +1812,11 @@ Change `RunLoop` to run the completion hooks on exit:
 				SafeOnError(ex);
 			}
 
-			if (error is null) _completion.TrySetResult();
-			else _completion.TrySetException(error);
+			// Hard stop CANCELS (as the worker family does); a soft complete carrying an exception
+			// genuinely faults.
+			if (hardStopped) _completion.TrySetCanceled();
+			else if (error is not null) _completion.TrySetException(error);
+			else _completion.TrySetResult();
 		}
 	}
 ```
