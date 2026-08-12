@@ -1046,7 +1046,11 @@ internal sealed class RecordingState {
 	public int CompletedCalls;
 	public int SlotReuseCalls;
 	public int ChunkReclaimCalls;
-	public Func<int, int, bool>? Throw;
+
+	// An auto-property, not a field: nothing assigns it until Task 6, and an unassigned field trips
+	// CS0649, which is a build error here. The counters above stay fields — they are passed by ref to
+	// Interlocked.Increment, which both requires a field and counts as an assignment.
+	public Func<int, int, bool>? Throw { get; set; }
 
 	public int HandledCount => Volatile.Read(ref Handled);
 
@@ -1122,13 +1126,13 @@ public class ActorSystemTests {
 		var chunkBase = cell.ChunkBase;
 		var tail = cell.Tail;
 		var head = cell.Head;
-		var state = cell.State;
+		var cellState = cell.State; // NOT `state` — that name is already the RecordingState above (CS0128)
 
 		Assert.Multiple(() => {
 			Assert.That(chunkBase, Is.Not.EqualTo(Chunk.None));
 			Assert.That(tail, Is.EqualTo(1));
 			Assert.That(head, Is.EqualTo(0));
-			Assert.That(state, Is.EqualTo(CellState.Scheduled));
+			Assert.That(cellState, Is.EqualTo(CellState.Scheduled));
 			Assert.That(system.ScheduledCountApprox, Is.EqualTo(1));
 		});
 	}
