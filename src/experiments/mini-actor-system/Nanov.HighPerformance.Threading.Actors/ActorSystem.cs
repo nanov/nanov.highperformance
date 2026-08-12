@@ -27,6 +27,17 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 
 	private int _dispatched; // producer-private; no atomics
 
+	private readonly int[] _local; // worker-private reschedule stack — never touched by the producer
+	private int _localCount;
+	private Thread? _worker;
+
+	// Explicit initializer, not just the implicit default: nothing else assigns this field until
+	// Dispose (Task 8), and an unassigned field trips CS0649, which is a build error here.
+	private volatile bool _stopped = false;
+
+	private long _processedLocal;    // worker-private running count
+	private long _processedPublished; // published for the quiescence check (Task 7)
+
 	/// <param name="handler">Struct handler; copied into each worker.</param>
 	/// <param name="keyCapacity">Max live keys.</param>
 	/// <param name="chunkCount">Max concurrently-dirty keys.</param>
@@ -48,6 +59,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 				"raise keyCapacity or lower chunkCount.");
 
 		_scheduled = new KeyRing(_map.SlotCount);
+		_local = new int[_map.SlotCount];
 		_batchBound = batchBound > 0 ? batchBound : _chunkSize;
 	}
 
@@ -93,6 +105,105 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		if (!_scheduled.TryEnqueue(index))
 			throw new InvalidOperationException(
 				"scheduler ring full — it is sized to the map, so this indicates a key index was scheduled twice.");
+	}
+
+	/// <summary>Start the worker thread.</summary>
+	public void Start() {
+		_worker = new Thread(RunLoop) { IsBackground = true, Name = $"Actor<{typeof(TKey).Name}>" };
+		_worker.Start();
+	}
+
+	private void RunLoop() {
+		while (!_stopped) {
+			if (TryAcquire(out var index)) {
+				Activate(index);
+				continue;
+			}
+
+			if (!WaitForWork()) break;
+		}
+	}
+
+	/// <summary>
+	///   Take the next key. The worker-private local stack has priority over the producer's ring, which
+	///   keeps a busy key pinned to this worker (affinity) and — critically — keeps the ring
+	///   single-producer, since self-rescheduled keys never enter it.
+	/// </summary>
+	private bool TryAcquire(out int index) {
+		if (_localCount > 0) {
+			index = _local[--_localCount];
+			return true;
+		}
+
+		return _scheduled.TryDequeue(out index);
+	}
+
+	private void Activate(int index) {
+		ref var cell = ref _map.RefAt(index);
+		Interlocked.Exchange(ref cell.State, CellState.Owned);
+
+		var chunk = cell.ChunkBase;
+		var head = cell.Head;
+		var n = 0;
+		while (n < _batchBound && head != Volatile.Read(ref cell.Tail)) {
+			if (_stopped) break;
+			try {
+				_handler.Handle(cell.Key, _slab.SlotRef(chunk, head & _chunkMask));
+			}
+			catch (Exception ex) {
+				SafeOnError(ex);
+			}
+
+			head++;
+			n++;
+			_processedLocal++;
+		}
+
+		ReleaseAndMaybeSchedule(index, ref cell, head, fromWorker: true);
+	}
+
+	/// <summary>
+	///   Release ownership, and reschedule if the mailbox is not empty. The ordering here is
+	///   load-bearing — see §5.3. Shared by the worker and by the producer's cold paths (Task 10), which
+	///   is why it takes <paramref name="fromWorker" /> rather than being open-coded twice.
+	/// </summary>
+	private void ReleaseAndMaybeSchedule(int index, ref KeyCell<TKey> cell, int head, bool fromWorker) {
+		Volatile.Write(ref cell.Head, head);
+		PublishProcessed();
+
+		// FULL FENCE, deliberately not Volatile.Write: the Tail load below must not be hoisted above
+		// this store. Producer and worker each store to their own variable then load the other's, with a
+		// full fence between (Dekker) — so they cannot both miss each other, and the State CAS (never
+		// the emptiness check) is the arbiter of who reschedules.
+		Interlocked.Exchange(ref cell.State, CellState.Free);
+
+		if (Volatile.Read(ref cell.Tail) == head) return;
+		// else: drained. The chunk is now reclaimable, but we must NOT touch ChunkBase — it is
+		// producer-owned. The producer discovers it on its next cold harvest scan (Task 10).
+
+		if (Interlocked.CompareExchange(ref cell.State, CellState.Scheduled, CellState.Free) != CellState.Free)
+			return; // the producer got there first and already scheduled it — no double-schedule
+
+		if (fromWorker) PushLocal(index);
+		else ScheduleFromProducer(index);
+	}
+
+	private void PushLocal(int index) => _local[_localCount++] = index;
+
+	private void PublishProcessed() => Volatile.Write(ref _processedPublished, _processedLocal);
+
+	private void SafeOnError(Exception error) {
+		try {
+			_handler.OnError(error);
+		}
+		catch {
+			// A throwing OnError must not kill the worker.
+		}
+	}
+
+	private bool WaitForWork() {
+		Thread.SpinWait(64); // replaced by real parking in Task 7
+		return !_stopped;
 	}
 
 	public void Dispose() { }
