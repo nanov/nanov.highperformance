@@ -518,10 +518,12 @@ public class KeyCellMapTests {
 		first.Tail = 7;
 
 		ref var again = ref map.GetOrAddRef(42, out var existingAgain, out var indexAgain);
+		var tail = again.Tail;
+
 		Assert.Multiple(() => {
 			Assert.That(existingAgain, Is.True);
 			Assert.That(indexAgain, Is.EqualTo(index));
-			Assert.That(again.Tail, Is.EqualTo(7));
+			Assert.That(tail, Is.EqualTo(7));
 		});
 	}
 
@@ -530,12 +532,18 @@ public class KeyCellMapTests {
 		var map = new KeyCellMap<int>(16);
 		ref var cell = ref map.GetOrAddRef(1, out _, out _);
 
+		var state = cell.State;
+		var chunkBase = cell.ChunkBase;
+		var head = cell.Head;
+		var tail = cell.Tail;
+		var cachedHead = cell.CachedHead;
+
 		Assert.Multiple(() => {
-			Assert.That(cell.State, Is.EqualTo(CellState.Free));
-			Assert.That(cell.ChunkBase, Is.EqualTo(Chunk.None));
-			Assert.That(cell.Head, Is.EqualTo(0));
-			Assert.That(cell.Tail, Is.EqualTo(0));
-			Assert.That(cell.CachedHead, Is.EqualTo(0));
+			Assert.That(state, Is.EqualTo(CellState.Free));
+			Assert.That(chunkBase, Is.EqualTo(Chunk.None));
+			Assert.That(head, Is.EqualTo(0));
+			Assert.That(tail, Is.EqualTo(0));
+			Assert.That(cachedHead, Is.EqualTo(0));
 		});
 	}
 
@@ -1109,12 +1117,18 @@ public class ActorSystemTests {
 
 		Assert.That(system.Dispatch(1, 100), Is.True);
 
+		// Copy out before asserting: a ref local cannot be captured in Assert.Multiple's lambda (CS8175).
 		ref var cell = ref system.CellOf(1);
+		var chunkBase = cell.ChunkBase;
+		var tail = cell.Tail;
+		var head = cell.Head;
+		var state = cell.State;
+
 		Assert.Multiple(() => {
-			Assert.That(cell.ChunkBase, Is.Not.EqualTo(Chunk.None));
-			Assert.That(cell.Tail, Is.EqualTo(1));
-			Assert.That(cell.Head, Is.EqualTo(0));
-			Assert.That(cell.State, Is.EqualTo(CellState.Scheduled));
+			Assert.That(chunkBase, Is.Not.EqualTo(Chunk.None));
+			Assert.That(tail, Is.EqualTo(1));
+			Assert.That(head, Is.EqualTo(0));
+			Assert.That(state, Is.EqualTo(CellState.Scheduled));
 			Assert.That(system.ScheduledCountApprox, Is.EqualTo(1));
 		});
 	}
