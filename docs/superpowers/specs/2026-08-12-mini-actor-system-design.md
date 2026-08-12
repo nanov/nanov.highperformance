@@ -101,11 +101,12 @@ contract, with the accumulator replaced by mailbox cursors.
 
 ```csharp
 struct KeyCell<TKey> {
-  public TKey Key;      // producer-write-only
-  public int State;     // Free | Scheduled | Owned | Reclaiming | Tombstone  — Interlocked
-  public int ChunkBase; // producer-assigned; -1 = no storage bound
-  public int Head;      // consumer cursor, absolute
-  public int Tail;      // producer cursor, absolute
+  public TKey Key;       // producer-write-only
+  public int State;      // Free | Scheduled | Owned | Reclaiming | Tombstone  — Interlocked
+  public int ChunkBase;  // producer-assigned; -1 = no storage bound
+  public int Head;       // consumer cursor, absolute
+  public int Tail;       // producer cursor, absolute
+  public int CachedHead; // producer-private lower bound on Head — see §4.5
 }
 ```
 
@@ -113,10 +114,16 @@ Access discipline — this preserves the existing family invariant:
 
 | Field | Written by |
 | --- | --- |
-| `Key`, `ChunkBase` | producer only (probe / insert / evict) |
+| `Key`, `ChunkBase`, `CachedHead` | producer only (probe / insert / evict) |
 | `State` | producer + workers, always `Interlocked` |
 | `Tail` | producer only |
 | `Head` | the current owner only |
+
+**Layout: array-of-structs, no per-cell padding.** The producer touches the cell every message, but
+the worker touches it only once per batch (publishing `Head`) and once per activation (`State`) —
+its per-message work is entirely inside the *chunk*. So producer/consumer false sharing on the cell
+line is amortized across a whole batch and does not warrant splitting into parallel arrays, which
+would cost more cache lines per dispatch than it saves.
 
 Workers never touch map metadata, so the probe path never races a key clear. Capacity should be
 sized to *live* keys, not pending ones — see §4.4.
@@ -179,6 +186,40 @@ the worker drops the hint and the LRU sweep harvests that chunk later.
 > helper used by both the worker release path and the producer cold paths; do not open-code it
 > twice.
 
+### 4.5 Cost model — where the per-message cost actually is
+
+Per message, versus a plain `SpWorker` dispatch:
+
+| | `SpWorker` | here |
+| --- | --- | --- |
+| fullness check | `_cachedHead`, producer-private, L1 | must not read `cell.Head` per message — see below |
+| slot write | sequential in one ring, perfect prefetch | into the key's chunk — **random** |
+| publish `Tail` | `Volatile.Write` | same |
+| schedule gate | — | `State` transition |
+| lookup | — | map probe — **random** |
+
+The map is **not** the expensive part. `ConflationSpWorker` pays the identical probe per dispatch
+and still benchmarks 2–5× faster at ~0.4× the allocation against the
+`ConcurrentDictionary` + `Channel<key>` baseline.
+
+Two costs are removable, both with techniques already in `SpRingCore`:
+
+- **Producer-cached gating sequence, per cell.** Never read `cell.Head` on the dispatch fast path.
+  Check fullness against `cell.CachedHead` (producer-private lower bound; `Head` only advances, so
+  it can only over-estimate fullness — conservative, never overwrites a live slot) and re-read the
+  real `Head` only when the cache says full. This is the LMAX gating-sequence technique already
+  used by `TryReserve`, applied per key.
+- **Test-then-CAS on `State`.** The CAS only needs to succeed on the `Free → Scheduled` edge, and
+  under load a hot key is almost always already `Scheduled` or `Owned`. Fence, read `State`, and
+  CAS only if it reads `Free`. **The fence is not optional** — a plain read breaks the Dekker
+  argument in §5.3 and strands messages. Expected saving is the RMW instruction, not the cache-line
+  ownership (the producer already holds the line exclusively for its `Tail` write), so treat this
+  as a measured optimization rather than an assumption.
+
+What remains is irreducible: **two random accesses per message** (the cell, and the key's chunk)
+against `SpWorker`'s single sequential stream. That is the price of key affinity itself — any
+design that routes by key pays it — not of the map implementation.
+
 ## 5. Protocols
 
 ### 5.1 Dispatch (producer)
@@ -186,12 +227,20 @@ the worker drops the hint and the LRU sweep harvests that chunk later.
 ```
 cell = map.GetOrAdd(key)                        // producer-private probe
 if (cell.ChunkBase < 0) cell.ChunkBase = RentChunk()      // may block: slab exhausted
-while (cell.Tail - Volatile.Read(cell.Head) >= chunkSize) // may block: this key's ring full
-    WaitForSpace(cell)
+
+if (cell.Tail - cell.CachedHead >= chunkSize) {           // producer-private — no cross-core read
+    cell.CachedHead = Volatile.Read(ref cell.Head);       // only on the "looks full" edge
+    while (cell.Tail - cell.CachedHead >= chunkSize)      // may block: this key's ring full
+        WaitForSpace(cell);                               // refreshes CachedHead on exit
+}
+
 slab[cell.ChunkBase + (cell.Tail & mask)] = message
 Volatile.Write(ref cell.Tail, cell.Tail + 1)              // release: publishes the slot
-if (Interlocked.CompareExchange(ref cell.State, Scheduled, Free) == Free)
-    scheduler.Schedule(cellIdx)                           // first-dirty gating
+
+Interlocked.MemoryBarrier()                               // StoreLoad — required by §5.3's Dekker
+if (Volatile.Read(ref cell.State) == Free)                // test-then-CAS (§4.5)
+    if (Interlocked.CompareExchange(ref cell.State, Scheduled, Free) == Free)
+        scheduler.Schedule(cellIdx)                       // first-dirty gating
 ```
 
 `Schedule` fires only on the `Free → Scheduled` edge — roughly **once per activation, not once per
@@ -242,8 +291,12 @@ store is followed by a full fence:
 
 | | store | fence | load |
 | --- | --- | --- | --- |
-| producer | `Tail` | the `CompareExchange` on `State` | `State` |
-| worker | `State` | the `Exchange` itself | `Tail` |
+| producer | `Tail` | `Interlocked.MemoryBarrier()` (§5.1) | `State` |
+| worker | `State` | the `Interlocked.Exchange` itself | `Tail` |
+
+The producer's fence is explicit because of the test-then-CAS in §4.5: once the common path is a
+plain *read* of `State` rather than a CAS, the RMW is no longer there to supply the StoreLoad
+ordering. Drop that barrier and the design strands messages on ARM64.
 
 So both sides cannot miss each other. The three outcomes:
 
@@ -438,9 +491,15 @@ Baselines: **N statically hash-sharded `SpWorker`s** (the design this must beat)
 Axes: worker count; key cardinality; **key skew** (uniform → Zipf → single hot key); per-message
 handler cost (constant → high variance). Report throughput, p99 latency, and steal rate.
 
-The honest expectation: this substrate is **more expensive per message than a single `SpWorker`** —
-it has to be, dynamic ownership is what is being bought. The question is not whether it beats one
-worker, but whether N-way dynamic balancing beats N statically sharded workers under skew.
+The honest expectation: this substrate is **more expensive per message than a single `SpWorker`**,
+and per §4.5 the cost is **two random accesses per message** (cell + chunk) against `SpWorker`'s one
+sequential stream — the price of key affinity, not of the map. The question is therefore not whether
+it beats one worker, but whether N-way dynamic balancing beats N statically sharded workers under
+skew.
+
+Because the gap is memory-access-shaped, key cardinality is the axis that will move it most: at low
+cardinality the cells and chunks stay resident and the gap should mostly close; at high cardinality
+it will not. Measure cardinality independently of skew for that reason.
 
 ## 11. Known limitations and upgrade path
 
