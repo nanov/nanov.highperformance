@@ -96,8 +96,8 @@ Create `…/Internal/Chunk.cs`:
 namespace Nanov.HighPerformance.Threading.Actors.Internal;
 
 /// <summary>
-///   Non-generic home for the "no chunk bound" sentinel, so <see cref="ChunkSlab{T}" /> (generic over
-///   the message type) and <c>KeyCell</c> (generic over the key type) can share it without coupling.
+///   Non-generic home for the "no chunk bound" sentinel, so the chunk slab (generic over the message
+///   type) and the key cell (generic over the key type) can share it without coupling.
 /// </summary>
 internal static class Chunk {
 	/// <summary>No chunk is bound to this cell.</summary>
@@ -437,6 +437,12 @@ A fork of `CoalescingKeyMap` (`src/Nanov.HighPerformance.Threading.Workers/Inter
   - `internal ref KeyCell<TKey> RefAt(int index)`
   - `internal ref KeyCell<TKey> GetOrAddRef(TKey key, out bool existing, out int index)`
   - `internal bool IsOccupied(int slot)`
+
+> **Build note.** `KeyCell.cs` (Step 1) `cref`s `KeyCellMap{TKey}`, which Step 4 creates. Because
+> `GenerateDocumentationFile=true` and warnings are errors, building between Step 1 and Step 4 fails
+> with **CS1574** — that is expected and is not a defect. Create both files before building. Never
+> silence CS1574 with `NoWarn` or an `.editorconfig` suppression; if a `cref` must point at something
+> that will not exist, reword the comment to plain text instead.
 
 - [ ] **Step 1: Write the cell and state constants**
 
