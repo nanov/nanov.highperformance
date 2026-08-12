@@ -1876,9 +1876,18 @@ Append to `ActorSystemTests.cs`:
 	[Test]
 	public void Dispose_Drops_Queued_Messages() {
 		var state = new RecordingState();
+		var started = new ManualResetEventSlim(false);
 		var gate = new ManualResetEventSlim(false);
 		state.Throw = (_, value) => {
-			if (value == 0) gate.Wait(TimeSpan.FromSeconds(5));
+			if (value == 0) {
+				// Signal entry BEFORE blocking. HandledCount only increments once Handle returns — i.e.
+				// AFTER gate.Wait unblocks — so synchronising on it instead would race Dispose against
+				// the un-gated messages 1..49, which can all drain before Dispose sets _stopped.
+				// `started` pins the sync point to the instant the worker is parked inside message 0.
+				started.Set();
+				gate.Wait(TimeSpan.FromSeconds(5));
+			}
+
 			return false;
 		};
 
@@ -1887,7 +1896,7 @@ Append to `ActorSystemTests.cs`:
 		for (var i = 0; i < 50; i++)
 			system.Dispatch(1, i);
 
-		WorkerTestUtil.AwaitProgress(() => state.HandledCount, 1); // worker is inside message 0
+		Assert.That(started.Wait(TimeSpan.FromSeconds(5)), Is.True, "worker never reached message 0");
 		system.Dispose();
 		gate.Set();
 
@@ -1903,7 +1912,9 @@ Append to `ActorSystemTests.cs`:
 		WorkerTestUtil.AwaitProgress(() => state.HandledCount, 1);
 
 		system.Dispose();
-		Assert.ThrowsAsync<OperationCanceledException>(async () => await system.Completion);
+		// CatchAsync, not ThrowsAsync: NUnit's ThrowsAsync matches the EXACT type, and awaiting a
+		// cancelled task throws TaskCanceledException (a subclass). ThrowsAsync would fail here.
+		Assert.CatchAsync<OperationCanceledException>(async () => await system.Completion);
 	}
 
 	[Test]
