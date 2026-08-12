@@ -6,18 +6,31 @@ using NUnit.Framework;
 
 /// <summary>
 ///   Race guards. Each targets a named interleaving from the design spec; a regression here is a real
-///   concurrency bug, not a flake. All run under the stall watchdogs so a lost wakeup fails fast.
+///   concurrency bug, not a flake.
 ///   <para>
-///     Every test carries an explicit <see cref="CancelAfterAttribute" />. Without one, a wedged
-///     <c>Dispatch</c> parks the TEST THREAD itself — before <see cref="WorkerTestUtil" />'s stall
-///     watchdog is ever reached — so a lost wakeup hangs the whole suite instead of failing it. There is
-///     no <c>.runsettings</c> global timeout anywhere in this repo, so this is the only backstop.
-///     <c>CancelAfter</c>, not the older <c>Timeout</c>: this repo's NUnit (4.3.2) marks
-///     <c>TimeoutAttribute</c> <c>[Obsolete]</c> — <c>TreatWarningsAsErrors</c> turns that into a build
-///     failure — because .NET no longer supports safely aborting a blocked thread. Practically the two
-///     behave the same way here: neither forcibly kills a parked producer/worker thread; both let the test
-///     runner mark the test failed once the budget elapses instead of waiting on it forever, which is the
-///     property this file actually needs.
+///     <b><see cref="CancelAfterAttribute" /> is NOT the safety net here — read this before trusting it.</b>
+///     This repo's NUnit (4.3.2) marks the older <c>TimeoutAttribute</c> <c>[Obsolete]</c> (and
+///     <c>TreatWarningsAsErrors</c> turns that into a build failure), so <c>CancelAfter</c> is the only
+///     attribute available. But <c>CancelAfterCommand.Execute</c> runs the test body <b>synchronously, on
+///     the calling thread</b>, and merely arms a <see cref="System.Threading.CancellationTokenSource" /> —
+///     NUnit's own docs say the test has to observe that token itself. Nothing in
+///     <see cref="ActorSystem{TKey,T,THandler}" /> does: <c>Dispatch</c>, <c>WaitForMailboxSpace</c>,
+///     <c>WaitForChunk</c> and <c>TryComplete</c> all block on a plain
+///     <see cref="System.Threading.ManualResetEventSlim" /><c>.Wait(TimeSpan)</c> poll with no token in
+///     sight. So a wedged <c>Dispatch</c> on the TEST thread would sail straight through its
+///     <c>CancelAfter</c> budget and hang the run forever — confirmed empirically (NUnit 4.3.2,
+///     <c>[CancelAfter(2000)]</c> around a tight polling loop, process still alive 27+ seconds later).
+///   </para>
+///   <para>
+///     The actual protection: every test that dispatches enough volume to risk blocking runs its
+///     <c>Dispatch</c> calls on a dedicated producer <see cref="Thread" /> and joins it with an explicit
+///     bounded <see cref="Thread.Join(TimeSpan)" /> on the TEST thread — a genuine bounded wait, unlike
+///     <c>CancelAfter</c>. A progress counter (<c>Volatile.Write</c>/<c>Volatile.Read</c>), not an
+///     in-thread <c>Assert</c>, carries the result back: an assertion failing on a non-test thread throws
+///     off-thread and can crash the process instead of producing a red test. After the join,
+///     <c>TryComplete</c> + <see cref="WorkerTestUtil.AwaitCompletionOrStall" /> — the stall watchdog —
+///     covers the drain phase the same way it always did. <c>CancelAfter</c> is left in place anyway: it
+///     is harmless, and it does bound whichever parts of a test run on the test thread itself.
 ///   </para>
 /// </summary>
 [TestFixture]
@@ -39,8 +52,22 @@ public class ActorSystemStressTests {
 		using var system = New(state, chunkSize: 8, batchBound: 1); // batchBound 1 ⇒ maximum release churn
 		system.Start();
 
-		for (var i = 0; i < count; i++)
-			Assert.That(system.Dispatch(1, i), Is.True, $"message {i}");
+		// Dispatch runs on its own thread so the test thread can bound the wait with a real Join — see the
+		// class doc comment for why CancelAfter alone cannot catch a wedged Dispatch. No Assert inside the
+		// producer thread: a failure there throws off-thread and can crash the process instead of failing
+		// the test, so a plain progress counter carries the result back instead.
+		var dispatched = 0;
+		var producer = new Thread(() => {
+			for (var i = 0; i < count; i++) {
+				if (!system.Dispatch(1, i)) return;
+				Volatile.Write(ref dispatched, i + 1);
+			}
+		}) { IsBackground = true };
+		producer.Start();
+
+		Assert.That(producer.Join(TimeSpan.FromSeconds(90)), Is.True,
+			$"producer wedged after {Volatile.Read(ref dispatched)}/{count} dispatches — likely a stranded key");
+		Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(count), "a Dispatch was rejected mid-run");
 
 		system.TryComplete();
 		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, count);
@@ -66,8 +93,19 @@ public class ActorSystemStressTests {
 			system.Start();
 
 			const int count = 64;
-			for (var i = 0; i < count; i++)
-				system.Dispatch(i % 4, i);
+			// Bounded producer thread, not the test thread — see the class doc comment.
+			var dispatched = 0;
+			var producer = new Thread(() => {
+				for (var i = 0; i < count; i++) {
+					if (!system.Dispatch(i % 4, i)) return;
+					Volatile.Write(ref dispatched, i + 1);
+				}
+			}) { IsBackground = true };
+			producer.Start();
+
+			Assert.That(producer.Join(TimeSpan.FromSeconds(5)), Is.True,
+				$"round {round}: producer wedged after {Volatile.Read(ref dispatched)}/{count} dispatches");
+			Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(count), $"round {round}: a Dispatch was rejected");
 
 			system.TryComplete();
 			WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, count);
@@ -81,18 +119,32 @@ public class ActorSystemStressTests {
 	public void Harvest_Racing_Release_Never_Strands() {
 		const int keys = 64;
 		const int perKey = 2_000;
+		const int total = keys * perKey;
 		var state = new RecordingState();
 		using var system = New(state, keyCapacity: 256, chunkCount: 8, chunkSize: 4, batchBound: 2);
 		system.Start();
 
-		for (var i = 0; i < perKey; i++)
-			for (var k = 0; k < keys; k++)
-				Assert.That(system.Dispatch(k, i), Is.True);
+		// Bounded producer thread, not the test thread — see the class doc comment.
+		var dispatched = 0;
+		var producer = new Thread(() => {
+			var n = 0;
+			for (var i = 0; i < perKey; i++) {
+				for (var k = 0; k < keys; k++) {
+					if (!system.Dispatch(k, i)) return;
+					Volatile.Write(ref dispatched, ++n);
+				}
+			}
+		}) { IsBackground = true };
+		producer.Start();
+
+		Assert.That(producer.Join(TimeSpan.FromSeconds(90)), Is.True,
+			$"producer wedged after {Volatile.Read(ref dispatched)}/{total} dispatches — likely a stranded key");
+		Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(total), "a Dispatch was rejected mid-run");
 
 		system.TryComplete();
-		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, keys * perKey);
+		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, total);
 
-		Assert.That(state.HandledCount, Is.EqualTo(keys * perKey));
+		Assert.That(state.HandledCount, Is.EqualTo(total));
 		foreach (var (key, values) in state.ByKey())
 			Assert.That(values, Is.EqualTo(Enumerable.Range(0, perKey).ToList()), $"key {key} out of order");
 	}
@@ -103,16 +155,30 @@ public class ActorSystemStressTests {
 	public void Sustained_Mixed_Load_Preserves_Order_And_Loses_Nothing() {
 		const int keys = 32;
 		const int perKey = 5_000;
+		const int total = keys * perKey;
 		var state = new RecordingState();
 		using var system = New(state, keyCapacity: 256, chunkCount: 16, chunkSize: 16, batchBound: 3);
 		system.Start();
 
-		for (var i = 0; i < perKey; i++)
-			for (var k = 0; k < keys; k++)
-				Assert.That(system.Dispatch(k, i), Is.True);
+		// Bounded producer thread, not the test thread — see the class doc comment.
+		var dispatched = 0;
+		var producer = new Thread(() => {
+			var n = 0;
+			for (var i = 0; i < perKey; i++) {
+				for (var k = 0; k < keys; k++) {
+					if (!system.Dispatch(k, i)) return;
+					Volatile.Write(ref dispatched, ++n);
+				}
+			}
+		}) { IsBackground = true };
+		producer.Start();
+
+		Assert.That(producer.Join(TimeSpan.FromSeconds(90)), Is.True,
+			$"producer wedged after {Volatile.Read(ref dispatched)}/{total} dispatches — likely a stranded key");
+		Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(total), "a Dispatch was rejected mid-run");
 
 		system.TryComplete();
-		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, keys * perKey);
+		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, total);
 
 		var byKey = state.ByKey();
 		Assert.That(byKey, Has.Count.EqualTo(keys));
@@ -136,8 +202,11 @@ public class ActorSystemStressTests {
 			system.Dispatch(i % 8, i);
 		WorkerTestUtil.AwaitProgress(() => state.HandledCount, 2_000);
 
-		// RecordingHandler allocates (ConcurrentQueue nodes), so measure the PRODUCER only, with the
-		// worker idle: this isolates Dispatch's own allocation.
+		// RecordingHandler allocates (ConcurrentQueue nodes) and the worker is very much still running —
+		// concurrently draining and calling Handle() while the loop below executes, not idle. That's fine:
+		// GC.GetAllocatedBytesForCurrentThread() is inherently per-thread, so the worker's allocations were
+		// never going to be counted on the test thread regardless. This isolates Dispatch's own allocation
+		// by construction, not because anything else is quiesced.
 		var before = GC.GetAllocatedBytesForCurrentThread();
 		for (var i = 0; i < 10_000; i++)
 			system.TryDispatch(1, i);
@@ -164,9 +233,11 @@ public class ActorSystemStressTests {
 	///     Still honest disclosure: there is no hook to pin the producer's harvest CAS against the
 	///     worker's release-recheck at the exact instant §5.3/§4.4 describe, so this samples scheduler
 	///     jitter across many rounds rather than forcing the interleaving. A stranded message here does
-	///     not report a wrong count — it reports a HANG, because <c>IsQuiescent</c> never sees
-	///     processed == dispatched, which is exactly what the stall watchdog and the <see cref="CancelAfterAttribute" />
-	///     backstop above exist to turn into a failure instead of a silent gap in coverage.
+	///     not report a wrong count — it reports a HANG. Unlike the four tests above, the risky call here
+	///     (<c>Dispatch(1, 0)</c>, below) is exactly the one this test exists to force into the race
+	///     window, so it gets the same bounded-thread treatment described in the class doc comment rather
+	///     than running on the test thread — a real strand here would otherwise wedge the test thread
+	///     forever inside <c>WaitForChunk</c>, which <c>CancelAfter</c> cannot interrupt.
 	///   </para>
 	/// </summary>
 	[Test]
@@ -178,16 +249,30 @@ public class ActorSystemStressTests {
 			system.Start();
 
 			const int burst = 3;
+			// Provably non-blocking: nothing else holds this system's one chunk yet, and burst (3) never
+			// reaches chunkSize (4), so these three calls never touch backpressure or Harvest — safe on
+			// the test thread.
 			for (var i = 0; i < burst; i++)
 				Assert.That(system.Dispatch(0, i), Is.True, $"round {round}: burst message {i}");
 			WorkerTestUtil.AwaitProgress(() => state.HandledCount, burst, TimeSpan.FromSeconds(5));
 
 			// Key 0's absolute final message this round — nothing dispatches to key 0 again after this.
+			// Still provably non-blocking for the same reason as the burst above (Tail only reaches 4, the
+			// chunk limit, never exceeds it).
 			Assert.That(system.Dispatch(0, burst), Is.True, $"round {round}: final message");
-			// Only one chunk exists in this system, and it's held by key 0: this can only succeed once
-			// key 0's chunk is harvestable, which forces Harvest() to scan key 0's cell right around the
-			// final message's release.
-			Assert.That(system.Dispatch(1, 0), Is.True, $"round {round}: forces Harvest against key 0");
+
+			// Only one chunk exists in this system, and it's held by key 0: this can only succeed once key
+			// 0's chunk is harvestable, which forces Harvest() to scan key 0's cell right around the final
+			// message's release — THIS is the one call in the test that can genuinely block forever if the
+			// reclaim-revert path strands key 0, so it runs on a bounded thread rather than the test thread.
+			var forcedHarvest = 0;
+			var racer = new Thread(() => {
+				if (system.Dispatch(1, 0)) Volatile.Write(ref forcedHarvest, 1);
+			}) { IsBackground = true };
+			racer.Start();
+			Assert.That(racer.Join(TimeSpan.FromSeconds(5)), Is.True,
+				$"round {round}: Dispatch(1, 0) wedged — key 0's final message was likely stranded");
+			Assert.That(Volatile.Read(ref forcedHarvest), Is.EqualTo(1), $"round {round}: Dispatch(1, 0) was rejected");
 
 			system.TryComplete();
 			WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, burst + 2,
