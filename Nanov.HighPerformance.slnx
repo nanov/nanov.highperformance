@@ -8,6 +8,9 @@
   <Folder Name="/src/">
     <Project Path="src/Nanov.HighPerformance.Threading.Workers/Nanov.HighPerformance.Threading.Workers.csproj" />
   </Folder>
+  <Folder Name="/src/experiments/">
+    <Project Path="src/experiments/mini-actor-system/Nanov.HighPerformance.Threading.Actors/Nanov.HighPerformance.Threading.Actors.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Nanov.HighPerformance.Tests/Nanov.HighPerformance.Tests.csproj" />
   </Folder>
