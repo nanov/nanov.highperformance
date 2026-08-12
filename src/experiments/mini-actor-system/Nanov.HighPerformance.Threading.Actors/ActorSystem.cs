@@ -139,7 +139,14 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		}
 		finally {
 			PublishProcessed();
-			var hardStopped = _stopped && !_completed;
+
+			// _completed means a drain was REQUESTED, not that it finished. A Dispose racing an
+			// in-flight TryComplete drops messages, so the exit is only clean if we actually reached
+			// quiescence. Read _completed BEFORE the counters — same acquire ordering rule as
+			// IsQuiescent, and && short-circuits in the right order.
+			var drainedCleanly = _completed &&
+				Volatile.Read(ref _processedPublished) == Volatile.Read(ref _dispatchedFinal);
+			var hardStopped = _stopped && !drainedCleanly;
 			Exception? error = hardStopped ? new OperationCanceledException() : _completionError;
 			try {
 				_handler.OnCompleted(error);
@@ -151,8 +158,8 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 			// Hard stop cancels — mirrors the worker family (SpRingCore.SetCompletion). A genuine
 			// soft-complete-with-exception is the only case that actually faults Completion.
 			if (hardStopped) _completion.TrySetCanceled();
-			else if (error is null) _completion.TrySetResult();
-			else _completion.TrySetException(error);
+			else if (error is not null) _completion.TrySetException(error);
+			else _completion.TrySetResult();
 		}
 	}
 

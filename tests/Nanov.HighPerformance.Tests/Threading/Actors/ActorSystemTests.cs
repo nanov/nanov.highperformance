@@ -308,6 +308,34 @@ public class ActorSystemTests {
 		Assert.That(system.Dispatch(1, 1), Is.False);
 	}
 
+	[Test]
+	public void Dispose_After_TryComplete_With_Work_Outstanding_Cancels_Completion() {
+		var state = new RecordingState();
+		var started = new ManualResetEventSlim(false);
+		var gate = new ManualResetEventSlim(false);
+		state.Throw = (_, value) => {
+			if (value == 0) {
+				started.Set();
+				gate.Wait(TimeSpan.FromSeconds(5));
+			}
+
+			return false;
+		};
+
+		var system = New(state, chunkSize: 64);
+		system.Start();
+		for (var i = 0; i < 50; i++)
+			system.Dispatch(1, i);
+
+		Assert.That(started.Wait(TimeSpan.FromSeconds(5)), Is.True, "worker never reached message 0");
+		system.TryComplete(); // graceful shutdown requested...
+		system.Dispose();     // ...then forced before the drain could finish
+		gate.Set();
+
+		Assert.CatchAsync<OperationCanceledException>(async () => await system.Completion);
+		Assert.That(state.HandledCount, Is.LessThan(50), "messages should have been dropped");
+	}
+
 	// Regression guards for a carried-over defect: a system that was constructed but Start() was never
 	// called has no worker thread, so RunLoop's finally — the only other place Completion resolves —
 	// never runs. Without the _worker-is-null branch in TryComplete/Dispose, await system.Completion
@@ -319,7 +347,10 @@ public class ActorSystemTests {
 		using var system = New(state);
 
 		Assert.That(system.TryComplete(), Is.True);
-		Assert.DoesNotThrowAsync(async () => await system.Completion);
+		// Bounded, not a bare `await`: a regression here (the _worker-is-null branch missing) means
+		// Completion never resolves, and an unbounded wait would hang the suite instead of failing it.
+		Assert.That(system.Completion.Wait(TimeSpan.FromSeconds(5)), Is.True,
+			"Completion did not resolve for a never-started system");
 	}
 
 	[Test]
@@ -328,6 +359,14 @@ public class ActorSystemTests {
 		using var system = New(state);
 
 		system.Dispose();
-		Assert.CatchAsync<OperationCanceledException>(async () => await system.Completion);
+
+		// Bounded, not a bare `await`, for the same reason as above. Task.Wait throws (rather than
+		// returning true/false) once the task is in a non-success terminal state, so — unlike the
+		// TryComplete case above — the bound here is expressed as Assert.Throws<AggregateException>
+		// around Wait(TimeSpan), matching the existing TryComplete_With_An_Exception_Faults_Completion
+		// idiom: it throws promptly if Completion is already Canceled, or times out (no exception, test
+		// fails) after 5s if a regression left Completion unresolved — never hangs.
+		var agg = Assert.Throws<AggregateException>(() => system.Completion.Wait(TimeSpan.FromSeconds(5)));
+		Assert.That(agg!.InnerException, Is.InstanceOf<OperationCanceledException>());
 	}
 }
