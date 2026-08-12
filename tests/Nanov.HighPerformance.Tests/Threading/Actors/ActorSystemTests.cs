@@ -369,4 +369,69 @@ public class ActorSystemTests {
 		var agg = Assert.Throws<AggregateException>(() => system.Completion.Wait(TimeSpan.FromSeconds(5)));
 		Assert.That(agg!.InnerException, Is.InstanceOf<OperationCanceledException>());
 	}
+
+	[Test]
+	public void TryDispatch_Returns_False_When_The_Key_Mailbox_Is_Full() {
+		var state = new RecordingState();
+		using var system = New(state, chunkSize: 4); // never started — nothing drains
+
+		for (var i = 0; i < 4; i++)
+			Assert.That(system.TryDispatch(1, i), Is.True, $"message {i}");
+
+		Assert.Multiple(() => {
+			Assert.That(system.TryDispatch(1, 99), Is.False);
+			Assert.That(system.DispatchedCount, Is.EqualTo(4), "a rejected TryDispatch must not be counted");
+		});
+	}
+
+	[Test]
+	public void TryDispatch_Returns_False_When_The_Slab_Is_Exhausted() {
+		var state = new RecordingState();
+		using var system = New(state, keyCapacity: 64, chunkCount: 4, chunkSize: 4);
+
+		for (var k = 0; k < 4; k++)
+			Assert.That(system.TryDispatch(k, k), Is.True, $"key {k}");
+
+		Assert.That(system.TryDispatch(99, 99), Is.False, "5th distinct key should find no chunk");
+	}
+
+	[Test]
+	public void Dispatch_Blocks_Until_The_Worker_Drains_Then_Proceeds() {
+		var state = new RecordingState();
+		using var system = New(state, chunkSize: 4);
+		const int count = 200;
+
+		var producer = new Thread(() => {
+			for (var i = 0; i < count; i++)
+				system.Dispatch(1, i);
+		}) { IsBackground = true };
+		producer.Start();
+
+		Thread.Sleep(50);
+		system.Start(); // producer is blocked on a full mailbox until now
+
+		Assert.That(producer.Join(TimeSpan.FromSeconds(10)), Is.True, "producer never unblocked");
+		WorkerTestUtil.AwaitProgress(() => state.HandledCount, count);
+		Assert.That(state.ByKey()[1], Is.EqualTo(Enumerable.Range(0, count).ToList()));
+	}
+
+	[Test]
+	public void Dispatch_Blocked_On_A_Full_Mailbox_Is_Released_By_Dispose() {
+		var state = new RecordingState();
+		var system = New(state, chunkSize: 4);
+		var finished = 0;
+
+		var producer = new Thread(() => {
+			for (var i = 0; i < 1_000; i++)
+				if (!system.Dispatch(1, i)) break;
+			Volatile.Write(ref finished, 1);
+		}) { IsBackground = true };
+		producer.Start();
+
+		Thread.Sleep(100);
+		system.Dispose();
+
+		Assert.That(producer.Join(TimeSpan.FromSeconds(5)), Is.True, "producer stayed parked after Dispose");
+		Assert.That(Volatile.Read(ref finished), Is.EqualTo(1));
+	}
 }

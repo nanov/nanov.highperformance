@@ -42,6 +42,8 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	private readonly TaskCompletionSource _completion =
 		new(TaskCreationOptions.RunContinuationsAsynchronously);
 	private readonly ManualResetEventSlim _workAvailable = new(false);
+	private readonly ManualResetEventSlim _spaceAvailable = new(false);
+	private volatile bool _producerParked;
 	private long _dispatchedFinal;
 	private volatile bool _completed;
 	private Exception? _completionError;
@@ -77,14 +79,40 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	public int BatchBound => _batchBound;
 
 	/// <summary>
-	///   Enqueue a message for <paramref name="key" />. Single-producer: never call concurrently.
-	///   Returns false if the system is completed or disposed.
+	///   Enqueue a message for <paramref name="key" />, <b>blocking</b> if the key's mailbox is full or
+	///   the slab is exhausted. Single-producer: never call concurrently. Returns false if the system is
+	///   completed or disposed.
 	/// </summary>
-	public bool Dispatch(TKey key, T message) {
+	public bool Dispatch(TKey key, T message) => DispatchCore(key, message, blocking: true);
+
+	/// <summary>
+	///   Enqueue a message, returning <c>false</c> immediately instead of blocking when the key's mailbox
+	///   is full or the slab is exhausted. A rejected message is not enqueued and is not counted.
+	///   <para>
+	///     Because a full key blocks the single producer for <i>all</i> keys, the difference between this
+	///     and <see cref="Dispatch" /> is exactly the cost of the bounded per-key mailbox — which is what
+	///     makes that cost measurable.
+	///   </para>
+	/// </summary>
+	public bool TryDispatch(TKey key, T message) => DispatchCore(key, message, blocking: false);
+
+	private bool DispatchCore(TKey key, T message, bool blocking) {
 		if (_completed || _stopped) return false;
 
 		ref var cell = ref _map.GetOrAddRef(key, out _, out var index);
-		if (cell.ChunkBase == Chunk.None && !TryBindChunk(ref cell)) return false;
+		if (cell.ChunkBase == Chunk.None && !BindChunk(ref cell, blocking)) return false;
+
+		// Fullness is checked against the producer-private CachedHead; the real Head — which the worker
+		// writes — is re-read only on the "looks full" edge. Head only advances, so CachedHead can only
+		// over-estimate fullness: conservative, never overwrites a live slot.
+		if (cell.Tail - cell.CachedHead >= _chunkSize) {
+			cell.CachedHead = Volatile.Read(ref cell.Head);
+			while (cell.Tail - cell.CachedHead >= _chunkSize) {
+				if (!blocking) return false;
+				if (!WaitForProgress()) return false;
+				cell.CachedHead = Volatile.Read(ref cell.Head);
+			}
+		}
 
 		ref var slot = ref _slab.SlotRef(cell.ChunkBase, cell.Tail & _chunkMask);
 		_handler.OnSlotReused(ref slot);
@@ -103,13 +131,49 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		return true;
 	}
 
-	private bool TryBindChunk(ref KeyCell<TKey> cell) {
-		if (!_slab.TryRent(out var chunk)) return false; // backpressure lands here in Task 9
+	private bool BindChunk(ref KeyCell<TKey> cell, bool blocking) {
+		int chunk;
+		while (!_slab.TryRent(out chunk)) {
+			if (Harvest()) continue;              // cold: reclaim drained keys' chunks (Task 10)
+			if (!blocking) return false;
+			if (!WaitForProgress()) return false; // park until a worker drains something
+		}
+
 		cell.ChunkBase = chunk;
 		cell.Head = 0;
 		cell.Tail = 0;
 		cell.CachedHead = 0;
 		return true;
+	}
+
+	private bool Harvest() => false;
+
+	/// <summary>
+	///   Park until the worker makes progress — either freeing a mailbox slot, or draining a key whose
+	///   chunk the producer can then harvest. One helper serves both backpressure sources (§5.4) because
+	///   both are relieved by the same event: the worker advancing.
+	///   <para>
+	///     Returns false if the system stopped or completed while parked, so a dispatch racing shutdown
+	///     is <b>rejected, never stranded</b> — that stranding is exactly bug #2 in <c>memory.md</c>.
+	///   </para>
+	///   <para>
+	///     The bounded wait is deliberate for v1: a missed wake self-heals within 20 ms rather than
+	///     hanging. Phase 2 replaces it with the family's parked-flag protocol once there are N workers
+	///     to signal.
+	///   </para>
+	/// </summary>
+	private bool WaitForProgress() {
+		_producerParked = true;
+		try {
+			_spaceAvailable.Reset();
+			Interlocked.MemoryBarrier(); // flag visible before we re-test, so the worker cannot miss us
+			if (_stopped || _completed) return false;
+			_spaceAvailable.Wait(TimeSpan.FromMilliseconds(20));
+			return !_stopped && !_completed;
+		}
+		finally {
+			_producerParked = false;
+		}
 	}
 
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -200,6 +264,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 			if ((n & 31) == 0) {
 				Volatile.Write(ref cell.Head, head);
 				PublishProcessed();
+				if (_producerParked) _spaceAvailable.Set();
 			}
 		}
 
@@ -214,6 +279,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	private void ReleaseAndMaybeSchedule(int index, ref KeyCell<TKey> cell, int head, bool fromWorker) {
 		Volatile.Write(ref cell.Head, head);
 		PublishProcessed();
+		if (_producerParked) _spaceAvailable.Set();
 
 		// FULL FENCE, deliberately not Volatile.Write: the Tail load below must not be hoisted above
 		// this store. Producer and worker each store to their own variable then load the other's, with a
@@ -266,6 +332,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		// drained and parked when TryComplete arrives would never be woken by anything: no further
 		// message will ever be processed, so no worker will ever re-evaluate the predicate.
 		WakeAll();
+		_spaceAvailable.Set();
 
 		// A system that was constructed but never started has no worker thread, so RunLoop's finally
 		// — the only other place Completion resolves — will never run. Resolve it here instead;
@@ -336,6 +403,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		if (Interlocked.Exchange(ref _disposeGate, 1) != 0) return;
 		_stopped = true;
 		WakeAll();
+		_spaceAvailable.Set();
 		if (_worker is null) _completion.TrySetCanceled();
 		else _worker.Join(TimeSpan.FromSeconds(1));
 		// The events are deliberately NOT disposed: the producer is a caller-owned thread that may be
