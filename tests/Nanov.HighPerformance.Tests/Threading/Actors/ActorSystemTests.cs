@@ -504,8 +504,17 @@ public class ActorSystemTests {
 		Assert.That(Volatile.Read(ref state.SlotReuseCalls), Is.EqualTo(count));
 	}
 
+	// Originally named Harvest_Leaves_A_Redirtied_Key_Scheduled and written to catch the reclaim-revert
+	// stranding bug on Harvest's "went dirty between check and claim" path (§4.4). It doesn't actually
+	// guard that: a strand SELF-HEALS here, because every round below redispatches to all 6 keys, so the
+	// very next dispatch to a stranded key sees State == Free and reschedules it through DispatchCore's
+	// own test-then-CAS — only a strand on a key's absolute LAST message would ever survive to fail the
+	// assertion, and nothing here guarantees landing that interleaving. Renamed to describe what it
+	// actually is: a probabilistic liveness smoke test for harvest-under-churn, not a targeted race guard.
+	// A targeted guard that forces the exact interleaving (rather than hoping for it) lives in
+	// ActorSystemStressTests.Harvest_Race_On_A_Keys_Final_Message_Is_Never_Stranded.
 	[Test]
-	public void Harvest_Leaves_A_Redirtied_Key_Scheduled() {
+	public void Harvest_Under_Churn_Loses_No_Messages() {
 		var state = new RecordingState();
 		using var system = New(state, keyCapacity: 64, chunkCount: 4, chunkSize: 4);
 		system.Start();
