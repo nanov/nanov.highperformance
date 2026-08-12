@@ -115,7 +115,13 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		}
 
 		ref var slot = ref _slab.SlotRef(cell.ChunkBase, cell.Tail & _chunkMask);
-		_handler.OnSlotReused(ref slot);
+		try {
+			_handler.OnSlotReused(ref slot);
+		}
+		catch (Exception ex) {
+			SafeOnError(ex);
+		}
+
 		slot = message;
 		Volatile.Write(ref cell.Tail, cell.Tail + 1); // release: publishes the slot write
 		_dispatched++;
@@ -182,12 +188,21 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 				continue;
 			}
 
-			_handler.OnChunkReclaimed(_slab.ChunkSpan(cell.ChunkBase));
+			// Cursors are deliberately left untouched here (BindChunk zeroes Head/Tail/CachedHead on
+			// rebind). A worker mid-release reads Tail unconditionally, before it ever consults State —
+			// zeroing Tail/Head here would make its stale local `head` compare unequal against a
+			// zeroed Tail, spuriously reschedule a chunkless cell, and hand Activate a Chunk.None to
+			// index into an unchecked SlotRef. See Activate's Chunk.None guard for the other half of
+			// this fix.
+			try {
+				_handler.OnChunkReclaimed(_slab.ChunkSpan(cell.ChunkBase));
+			}
+			catch (Exception ex) {
+				SafeOnError(ex);
+			}
+
 			_slab.Return(cell.ChunkBase);
 			cell.ChunkBase = Chunk.None;
-			cell.Head = 0;
-			cell.Tail = 0;
-			cell.CachedHead = 0;
 			Volatile.Write(ref cell.State, CellState.Free);
 			freed = true;
 		}
@@ -309,6 +324,15 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		Interlocked.Exchange(ref cell.State, CellState.Owned);
 
 		var chunk = cell.ChunkBase;
+		if (chunk == Chunk.None) {
+			// Spurious schedule: the producer harvested this cell's chunk while we were between our
+			// State release and our Tail recheck. There is nothing to drain and no chunk to drain from
+			// — release and move on. Without this the drain loop would index the slab at Chunk.None
+			// (-1), and SlotRef is deliberately unchecked.
+			ReleaseAndMaybeSchedule(index, ref cell, cell.Head, fromWorker: true);
+			return;
+		}
+
 		var head = cell.Head;
 		var n = 0;
 		while (n < _batchBound && head != Volatile.Read(ref cell.Tail)) {
@@ -344,12 +368,11 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	private void ReleaseAndMaybeSchedule(int index, ref KeyCell<TKey> cell, int head, bool fromWorker) {
 		if (fromWorker) {
 			Volatile.Write(ref cell.Head, head);
+			PublishProcessed();
 			if (_producerParked) {
 				_producerWakes++;
 				_spaceAvailable.Set();
 			}
-
-			PublishProcessed();
 		}
 
 		// FULL FENCE, deliberately not Volatile.Write: the Tail load below must not be hoisted above

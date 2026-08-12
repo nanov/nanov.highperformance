@@ -130,7 +130,15 @@ internal sealed class KeyCellMap<TKey>
 			if (ctl != Occupied) continue;
 			ref var cell = ref Unsafe.Add(ref cells, (nint)(uint)slot);
 			if (cell.ChunkBase != Chunk.None) continue;
-			if (Volatile.Read(ref cell.State) != CellState.Free) continue;
+
+			// CAS, not a plain read: a chunkless-and-Free cell can now be one Harvest() just reclaimed
+			// (Task 10), and a worker can still be mid-release on it — between its own State Exchange
+			// to Free and its Tail recheck. A plain read-then-tombstone here would let that delayed
+			// worker win its reschedule CAS against a slot the producer has already re-keyed for a
+			// different TKey. Claiming via CompareExchange closes that window the same way Harvest's
+			// own claim does.
+			if (Interlocked.CompareExchange(ref cell.State, CellState.Reclaiming, CellState.Free) != CellState.Free)
+				continue;
 			ctl = Tombstone;
 			cell = default;
 			cell.ChunkBase = Chunk.None;
