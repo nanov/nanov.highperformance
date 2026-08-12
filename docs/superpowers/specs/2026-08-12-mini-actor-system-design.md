@@ -557,6 +557,21 @@ worker ⇒ **affinity for free** (warm cache, warm cell line). Consequently **B 
 map at all** — the cell state machine already prevents concurrent processing; the router only
 answers "which worker gets this newly-dirty key."
 
+> **Known liveness hazard — local-first can starve the ring, and it is worse under B than D.**
+> If key A is refilled faster than it drains, the worker pops A from its local list forever and key
+> B, sitting in that worker's ring, **never runs** — unbounded latency, not merely unfairness.
+> Backpressure does not fix it: the producer blocks on A, A drains, the producer refills A.
+>
+> This is **not** a single-worker artifact. Under **B**, each worker owns its ring and nothing can
+> move B elsewhere, so the starvation survives any worker count. Under **D**, a thief can steal B,
+> so D is largely immune. That asymmetry is a real, testable difference between the two schedulers
+> and it is not something the original affinity argument accounted for.
+>
+> Phase 1 ships as-is (single worker, hazard recorded). The scheduler-seam task must bound
+> consecutive local draining — check the ring every K local activations, or whenever the local list
+> holds only the index just released — and the B-vs-D benchmark should include a
+> hot-key-plus-starved-key workload so the difference is measured rather than argued.
+
 **Load metric = queued key count** (`QueuedApprox`), not queued messages. Message-depth load is the
 "truer" metric, but it is stale the instant it is read and the router would pay cross-core reads per
 decision to obtain it. Key count is already exposed and free.
