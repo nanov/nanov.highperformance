@@ -83,13 +83,13 @@ there, execution order depended on *claim* order, which is not the same as take 
 One pre-allocated `T[]`, carved into fixed-size chunks (`chunkSize`, power of two). A chunk is
 identified by an `int` index; slot `i` of chunk `c` is `_slab[c * chunkSize + i]`.
 
-Free chunks live on a **Treiber stack** of chunk indices, ABA-safe via a packed
-`{ index:32, tag:32 }` in a `long` resolved with `Interlocked.CompareExchange`.
+Free chunks live on a **producer-private intrusive stack** of chunk indices — a plain `int` head
+plus a `int[] next` array. **No atomics, no Treiber stack, no ABA problem.**
 
-- Producer rents a chunk when a key first goes dirty; pops the **whole stack** in one CAS into a
-  private free list and allocates from it with zero atomics thereafter.
-- Chunks are **returned by the producer**, not the worker — see §4.4. Cost is one stack push per
-  key lifetime, not per message.
+That falls out of §4.4: chunks are rented *and* returned by the producer, so the free list has
+exactly one reader and one writer, both on the same thread. An earlier draft specified a Treiber
+stack because the worker returned chunks directly; once `ChunkBase` became producer-write-only that
+requirement disappeared. Do not reintroduce interlocked operations here.
 
 There is no second pool. "Renting a buffer" is claiming slots of the one slab; the free stack is
 bookkeeping, not an allocator.
@@ -160,14 +160,19 @@ A cell is ~32 bytes; a chunk is `chunkSize × sizeof(T)`. Decouple their lifetim
 - Cell **stays in the map**, so the producer re-finds the key with no re-insert cost.
 - Cell eviction is a cold LRU sweep, off the hot path.
 
-**Who returns the chunk — the producer, via a hint queue.** `ChunkBase` is producer-write-only
-(§4.2), so a worker must not null it. Instead the worker, on draining a key to empty, pushes the
-cell index onto a **drain-hint ring** (MPSC, one push per key lifetime — negligible). The producer
-drains that ring on its cold path (when its private free list runs dry, or during the LRU sweep),
-and for each hinted cell re-validates under a `CAS(State, Reclaiming, Free)` that it is still
-`Free` and still empty (`Tail == Head`), then runs `OnChunkReclaimed` over the chunk (§4.6) before
-nulling `ChunkBase` and pushing the chunk. A cell that went dirty again fails the CAS and is simply
-skipped — the hint is advisory, never authoritative.
+**Who returns the chunk — the producer, by a cold scan.** `ChunkBase` is producer-write-only
+(§4.2), so a worker must not null it. Instead the producer harvests on its **cold path** — when its
+private free list runs dry — by scanning the map for cells that are `Free` with a chunk still bound.
+For each candidate it CASes `Free → Reclaiming`, re-validates that the mailbox is still empty
+(`Tail == Head`), runs `OnChunkReclaimed` over the chunk (§4.6), nulls `ChunkBase`, and pushes the
+chunk back on the free list. A cell that went dirty again fails the CAS or the validation and is
+skipped.
+
+This is deliberately the same shape as `CoalescingKeyMap.EvictFree`: a cold, producer-side,
+state-gated sweep. **v1 has no drain-hint queue.** An MPSC hint ring (workers noting "this key looks
+empty" so the producer can harvest without scanning) is a pure optimization over the scan and is
+deferred until a benchmark shows the scan costs anything — it would be the *only* multi-producer
+structure in the system, which is a poor trade for an unmeasured win.
 
 > **The producer runs no cold paths after `TryComplete`.** Chunk harvest and LRU eviction must not
 > run once soft completion has been signalled. §5.6's quiescence argument depends on every producer
@@ -181,8 +186,8 @@ This keeps the §4.2 access discipline intact (`ChunkBase` producer-only), and i
 eviction-vs-drain race entirely: eviction only ever touches cells that already hold no storage.
 It is also what makes per-key state a later drop-in rather than a redesign.
 
-A dropped hint costs nothing but a delayed reclaim, so the hint ring may be lossy — if it is full,
-the worker drops the hint and the LRU sweep harvests that chunk later.
+Harvesting is never *required* for correctness — it only recycles storage. If the scan frees
+nothing, the producer is genuinely out of chunks and backpressures (§5.4).
 
 > **The reclaim revert must re-run the release check.** `Reclaiming` is a non-`Free` state, so a
 > worker whose release-recheck lands in that window loses its `Free → Scheduled` CAS and does *not*
@@ -342,9 +347,8 @@ if (Volatile.Read(ref cell.Tail) != head) {     // producer appended while we we
             ref cell.State, Scheduled, Free) == Free)
         scheduler.Schedule(cellIdx);
 }
-else
-    drainHints.TryPush(cellIdx);                // advisory: chunk is reclaimable (§4.4). Lossy by
-                                               // design — the worker never touches ChunkBase.
+// else: drained. The chunk is now reclaimable, but the worker does NOTHING — it must not touch
+// ChunkBase (§4.2). The producer discovers it on its next cold harvest scan (§4.4).
 ```
 
 #### Why it is correct
