@@ -1665,9 +1665,13 @@ Append to `ActorSystemTests.cs`:
 		system.Start();
 		system.TryComplete(new InvalidOperationException("boom"));
 
-		var ex = Assert.Throws<InvalidOperationException>(() =>
-			WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, 0));
-		Assert.That(ex!.Message, Is.EqualTo("boom"));
+		// Task.Wait always surfaces a fault as AggregateException — it never unwraps — so assert the
+		// wrapper and inspect InnerException. This matches the sibling faulted-completion tests in
+		// SpWorkerTests / AsyncSpWorkerTests / ConflationSpWorkerTests. Do NOT expect
+		// InvalidOperationException directly; that assertion can never match.
+		var agg = Assert.Throws<AggregateException>(() => system.Completion.Wait(2000));
+		Assert.That(agg!.InnerException, Is.InstanceOf<InvalidOperationException>());
+		Assert.That(agg.InnerException!.Message, Is.EqualTo("boom"));
 	}
 ```
 
