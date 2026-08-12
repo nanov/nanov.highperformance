@@ -1329,6 +1329,13 @@ The ownership protocol. **This is the highest-risk task in the plan** — re-rea
 **Interfaces:**
 - Produces: `public void Start()`, and internally the worker loop, `Activate`, `ReleaseAndMaybeSchedule`
 
+> **Why the chunk sizes here look oversized.** Backpressure does not exist until Task 9, so
+> `Dispatch` will happily wrap a full mailbox and overwrite unread slots. Until then, every test must
+> size `chunkSize` to hold the whole test's traffic for a single key. Get this wrong and the test
+> fails with *wrong values*, not a hang — the producer silently clobbers slots the worker has not read.
+> Task 9's tests then exercise the full-mailbox path deliberately, and Task 11's stress tests go back
+> to small chunks precisely because backpressure exists by then.
+
 - [ ] **Step 1: Write the failing tests**
 
 Append to `ActorSystemTests.cs` (inside the fixture):
@@ -1337,7 +1344,7 @@ Append to `ActorSystemTests.cs` (inside the fixture):
 	[Test]
 	public void Processes_All_Messages_Of_One_Key_In_Order() {
 		var state = new RecordingState();
-		using var system = New(state, chunkSize: 8);
+		using var system = New(state, chunkSize: 512); // must hold all 500 — no backpressure yet
 		system.Start();
 
 		const int count = 500;
@@ -1351,7 +1358,8 @@ Append to `ActorSystemTests.cs` (inside the fixture):
 	[Test]
 	public void Preserves_Order_Within_Every_Key_Across_Many_Keys() {
 		var state = new RecordingState();
-		using var system = New(state, keyCapacity: 128, chunkCount: 32, chunkSize: 8);
+		// chunkSize must hold all 200 messages of one key — no backpressure until Task 9.
+		using var system = New(state, keyCapacity: 128, chunkCount: 32, chunkSize: 256);
 		system.Start();
 
 		const int keys = 16;
@@ -1371,7 +1379,8 @@ Append to `ActorSystemTests.cs` (inside the fixture):
 	[Test]
 	public void Reschedules_A_Key_That_Exceeds_BatchBound() {
 		var state = new RecordingState();
-		using var system = New(state, chunkSize: 64, batchBound: 4);
+		// chunkSize holds all 100; batchBound 4 is what forces the repeated reschedule under test.
+		using var system = New(state, chunkSize: 128, batchBound: 4);
 		system.Start();
 
 		const int count = 100;
@@ -1422,7 +1431,9 @@ In `ActorSystem.cs`, add these fields after `private int _dispatched;`:
 	private readonly int[] _local; // worker-private reschedule stack — never touched by the producer
 	private int _localCount;
 	private Thread? _worker;
-	private volatile bool _stopped;
+	private volatile bool _stopped = false; // explicit init: nothing assigns it until Task 8, and an
+	                                        // unassigned field is CS0649 (a build error). It must stay
+	                                        // `volatile`, so it cannot be an auto-property.
 	private long _processedLocal;    // worker-private running count
 	private long _processedPublished; // published for the quiescence check (Task 7)
 ```
@@ -1574,7 +1585,8 @@ Append to `ActorSystemTests.cs`:
 	[Test]
 	public void TryComplete_Drains_Everything_Then_Completes() {
 		var state = new RecordingState();
-		using var system = New(state, chunkSize: 8);
+		// 2000 messages over 8 keys = 250 per key; chunkSize must hold that (no backpressure until Task 9).
+		using var system = New(state, chunkSize: 256);
 		system.Start();
 
 		const int count = 2_000;
