@@ -147,4 +147,97 @@ public class ActorSystemTests {
 			Assert.That(state.ByKey()[1], Is.EqualTo(new List<int> { 0, 1, 3, 4 }), "order broke around the throw");
 		});
 	}
+
+	[Test]
+	public void TryComplete_Drains_Everything_Then_Completes() {
+		var state = new RecordingState();
+		// 2000 messages over 8 keys = 250 per key; chunkSize must hold that (no backpressure until Task 9).
+		using var system = New(state, chunkSize: 256);
+		system.Start();
+
+		const int count = 2_000;
+		for (var i = 0; i < count; i++)
+			system.Dispatch(i % 8, i);
+
+		Assert.That(system.TryComplete(), Is.True);
+		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, count);
+		Assert.That(state.HandledCount, Is.EqualTo(count));
+	}
+
+	[Test]
+	public void TryComplete_On_An_Already_Drained_Parked_System_Completes() {
+		var state = new RecordingState();
+		using var system = New(state);
+		system.Start();
+
+		system.Dispatch(1, 1);
+		WorkerTestUtil.AwaitProgress(() => state.HandledCount, 1);
+		Thread.Sleep(100); // let the worker genuinely park
+
+		Assert.That(system.TryComplete(), Is.True);
+		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, 1);
+	}
+
+	[Test]
+	public void TryComplete_On_A_System_That_Never_Received_Anything_Completes() {
+		var state = new RecordingState();
+		using var system = New(state);
+		system.Start();
+		Thread.Sleep(100);
+
+		Assert.That(system.TryComplete(), Is.True);
+		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, 0);
+	}
+
+	[Test]
+	public void TryComplete_Is_Idempotent() {
+		var state = new RecordingState();
+		using var system = New(state);
+		system.Start();
+
+		Assert.Multiple(() => {
+			Assert.That(system.TryComplete(), Is.True);
+			Assert.That(system.TryComplete(), Is.False);
+		});
+		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, 0);
+	}
+
+	[Test]
+	public void Dispatch_After_TryComplete_Is_Rejected() {
+		var state = new RecordingState();
+		using var system = New(state);
+		system.Start();
+		system.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, 0);
+
+		Assert.That(system.Dispatch(1, 1), Is.False);
+	}
+
+	[Test]
+	public void OnCompleted_Fires_Once_Per_Worker() {
+		var state = new RecordingState();
+		using var system = New(state);
+		system.Start();
+		system.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, 0);
+
+		Assert.That(Volatile.Read(ref state.CompletedCalls), Is.EqualTo(1));
+	}
+
+	[Test]
+	public void TryComplete_With_An_Exception_Faults_Completion() {
+		var state = new RecordingState();
+		using var system = New(state);
+		system.Start();
+		system.TryComplete(new InvalidOperationException("boom"));
+
+		// Task.Wait(int) always surfaces a fault as AggregateException — it never unwraps, even from
+		// inside a polling loop like AwaitCompletionOrStall — so this matches the sibling
+		// TryComplete_With_Exception_Faults_Completion tests in the SPSC worker suite (SpWorkerTests,
+		// AsyncSpWorkerTests, ConflationSpWorkerTests), which all assert this way rather than expecting
+		// the inner exception type directly.
+		var agg = Assert.Throws<AggregateException>(() => system.Completion.Wait(2000));
+		Assert.That(agg!.InnerException, Is.InstanceOf<InvalidOperationException>());
+		Assert.That(agg.InnerException!.Message, Is.EqualTo("boom"));
+	}
 }

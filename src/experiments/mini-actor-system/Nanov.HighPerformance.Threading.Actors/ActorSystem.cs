@@ -39,6 +39,14 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	private long _processedPublished; // published for the quiescence check (Task 7)
 	private int _activations; // test hook: counts Activate calls, so batchBound has a mechanical guard
 
+	private readonly TaskCompletionSource _completion =
+		new(TaskCreationOptions.RunContinuationsAsynchronously);
+	private readonly ManualResetEventSlim _workAvailable = new(false);
+	private long _dispatchedFinal;
+	private volatile bool _completed;
+	private Exception? _completionError;
+	private int _completeGate;
+
 	/// <param name="handler">Struct handler; copied into each worker.</param>
 	/// <param name="keyCapacity">Max live keys.</param>
 	/// <param name="chunkCount">Max concurrently-dirty keys.</param>
@@ -72,6 +80,8 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	///   Returns false if the system is completed or disposed.
 	/// </summary>
 	public bool Dispatch(TKey key, T message) {
+		if (_completed || _stopped) return false;
+
 		ref var cell = ref _map.GetOrAddRef(key, out _, out var index);
 		if (cell.ChunkBase == Chunk.None && !TryBindChunk(ref cell)) return false;
 
@@ -106,6 +116,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		if (!_scheduled.TryEnqueue(index))
 			throw new InvalidOperationException(
 				"scheduler ring full — it is sized to the map, so this indicates a key index was scheduled twice.");
+		_workAvailable.Set();
 	}
 
 	/// <summary>Start the worker thread.</summary>
@@ -115,13 +126,28 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	}
 
 	private void RunLoop() {
-		while (!_stopped) {
-			if (TryAcquire(out var index)) {
-				Activate(index);
-				continue;
+		try {
+			while (!_stopped) {
+				if (TryAcquire(out var index)) {
+					Activate(index);
+					continue;
+				}
+
+				if (!WaitForWork()) break;
+			}
+		}
+		finally {
+			PublishProcessed();
+			Exception? error = _stopped && !_completed ? new OperationCanceledException() : _completionError;
+			try {
+				_handler.OnCompleted(error);
+			}
+			catch (Exception ex) {
+				SafeOnError(ex);
 			}
 
-			if (!WaitForWork()) break;
+			if (error is null) _completion.TrySetResult();
+			else _completion.TrySetException(error);
 		}
 	}
 
@@ -159,6 +185,10 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 			head++;
 			n++;
 			_processedLocal++;
+			if ((n & 31) == 0) {
+				Volatile.Write(ref cell.Head, head);
+				PublishProcessed();
+			}
 		}
 
 		ReleaseAndMaybeSchedule(index, ref cell, head, fromWorker: true);
@@ -203,12 +233,85 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		}
 	}
 
-	private bool WaitForWork() {
-		Thread.SpinWait(64); // replaced by real parking in Task 7
-		return !_stopped;
+	/// <summary>Resolves once the worker has drained and exited.</summary>
+	public Task Completion => _completion.Task;
+
+	/// <summary>
+	///   Signal that no more messages will be dispatched: drain everything queued, then exit. A non-null
+	///   <paramref name="exception" /> faults <see cref="Completion" />. Returns false if already
+	///   completing. Producer thread only — and it must be the producer's LAST act (see below).
+	/// </summary>
+	public bool TryComplete(Exception? exception = null) {
+		if (Interlocked.Exchange(ref _completeGate, 1) != 0) return false;
+		_completionError = exception;
+
+		// Publish the final count BEFORE the flag: the quiescence check reads the flag first, so this
+		// ordering is what makes "observed completed ⇒ observes the full dispatched count" hold.
+		Volatile.Write(ref _dispatchedFinal, _dispatched);
+		_completed = true;
+
+		// Shutdown wakes UNCONDITIONALLY — never flag-gated. Without this, a system that was already
+		// drained and parked when TryComplete arrives would never be woken by anything: no further
+		// message will ever be processed, so no worker will ever re-evaluate the predicate.
+		WakeAll();
+		return true;
 	}
 
-	public void Dispose() { }
+	private void WakeAll() => _workAvailable.Set();
+
+	/// <summary>
+	///   Park until work arrives or the system should exit. Returns false to exit the loop.
+	///   <para>
+	///     Arm-then-recheck: the flag is cleared, then work and quiescence are re-tested, and only then
+	///     do we block. Collapsing this into check-then-park is the classic lost wakeup, and it passes
+	///     every test whose worker never actually sleeps.
+	///   </para>
+	/// </summary>
+	private bool WaitForWork() {
+		for (var spin = 0; spin < 32; spin++) {
+			if (HasWork() || _stopped) return !_stopped;
+			Thread.SpinWait(64);
+		}
+
+		while (true) {
+			_workAvailable.Reset();
+			Interlocked.MemoryBarrier();
+			if (HasWork() || _stopped) return !_stopped;
+			if (IsQuiescent()) return false;
+			_workAvailable.Wait();
+			if (HasWork() || _stopped) return !_stopped;
+			if (IsQuiescent()) return false;
+		}
+	}
+
+	private bool HasWork() => _localCount > 0 || _scheduled.CountApprox > 0;
+
+	/// <summary>
+	///   Everything dispatched has been processed and completion was signalled.
+	///   <para>
+	///     <b>Read order is load-bearing.</b> <c>_completed</c> must be read BEFORE the counts, both with
+	///     acquire semantics. The soundness argument is "every producer increment is sequenced-before
+	///     <c>_completed = true</c>, so a worker observing the flag must observe the counts" — which only
+	///     holds if the count loads are ordered after the flag load. Reversed, ARM64 will serve a stale
+	///     count beside a fresh flag: false quiescence, and messages silently dropped on dispose.
+	///   </para>
+	///   This mirrors the family's existing soft-complete rule (re-read Tail after observing
+	///   _completed) with the processed count as the new Tail.
+	/// </summary>
+	private bool IsQuiescent() {
+		if (!_completed) return false;
+		var processed = Volatile.Read(ref _processedPublished);
+		return processed == Volatile.Read(ref _dispatchedFinal);
+	}
+
+	public void Dispose() {
+		_stopped = true;
+		WakeAll();
+		_worker?.Join(TimeSpan.FromSeconds(1));
+		// The events are deliberately NOT disposed: the producer is a caller-owned thread that may be
+		// parked inside Wait() right now, and disposing under it throws ObjectDisposedException on
+		// their thread. Letting the finalizer reclaim them is the correct trade here.
+	}
 
 	// ---- test hooks -------------------------------------------------------------------------------
 
