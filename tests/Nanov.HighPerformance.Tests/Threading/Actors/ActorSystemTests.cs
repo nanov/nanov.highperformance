@@ -459,4 +459,64 @@ public class ActorSystemTests {
 		Assert.That(producer.Join(TimeSpan.FromSeconds(5)), Is.True, "producer stayed parked after TryComplete");
 		Assert.That(Volatile.Read(ref finished), Is.EqualTo(1));
 	}
+
+	[Test]
+	public void Harvest_Recycles_Chunks_Of_Drained_Keys() {
+		var state = new RecordingState();
+		using var system = New(state, keyCapacity: 64, chunkCount: 4, chunkSize: 4);
+		system.Start();
+
+		// Far more distinct keys than chunks: only recycling makes this possible.
+		const int keys = 40;
+		for (var k = 0; k < keys; k++) {
+			Assert.That(system.Dispatch(k, k), Is.True, $"key {k}");
+			WorkerTestUtil.AwaitProgress(() => state.HandledCount, k + 1);
+		}
+
+		Assert.That(state.HandledCount, Is.EqualTo(keys));
+	}
+
+	[Test]
+	public void Harvest_Invokes_OnChunkReclaimed() {
+		var state = new RecordingState();
+		using var system = New(state, keyCapacity: 64, chunkCount: 4, chunkSize: 4);
+		system.Start();
+
+		for (var k = 0; k < 20; k++) {
+			system.Dispatch(k, k);
+			WorkerTestUtil.AwaitProgress(() => state.HandledCount, k + 1);
+		}
+
+		Assert.That(Volatile.Read(ref state.ChunkReclaimCalls), Is.GreaterThan(0));
+	}
+
+	[Test]
+	public void OnSlotReused_Fires_When_A_Slot_Is_Overwritten() {
+		var state = new RecordingState();
+		using var system = New(state, chunkSize: 4);
+		system.Start();
+
+		const int count = 40; // wraps the 4-slot mailbox many times
+		for (var i = 0; i < count; i++)
+			system.Dispatch(1, i);
+
+		WorkerTestUtil.AwaitProgress(() => state.HandledCount, count);
+		Assert.That(Volatile.Read(ref state.SlotReuseCalls), Is.EqualTo(count));
+	}
+
+	[Test]
+	public void Harvest_Leaves_A_Redirtied_Key_Scheduled() {
+		var state = new RecordingState();
+		using var system = New(state, keyCapacity: 64, chunkCount: 4, chunkSize: 4);
+		system.Start();
+
+		for (var round = 0; round < 200; round++) {
+			for (var k = 0; k < 6; k++)
+				system.Dispatch(k, round);
+		}
+
+		system.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, 200 * 6);
+		Assert.That(state.HandledCount, Is.EqualTo(200 * 6));
+	}
 }

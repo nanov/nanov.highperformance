@@ -146,7 +146,54 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		return true;
 	}
 
-	private bool Harvest() => false;
+	/// <summary>
+	///   Cold, producer-side sweep: reclaim the chunks of keys that have drained. Deliberately the same
+	///   shape as <c>CoalescingKeyMap.EvictFree</c> — a state-gated scan, not a queue. v1 has no
+	///   drain-hint ring; that is an optimization over this scan and would be the only multi-producer
+	///   structure in the system.
+	///   <para>
+	///     Must not run after <see cref="TryComplete" />: §5.6's quiescence argument requires every
+	///     producer schedule to be sequenced-before the completion flag, and this path can schedule.
+	///   </para>
+	/// </summary>
+	private bool Harvest() {
+		if (_completed) return false; // see the remark above — never harvest after completion
+
+		var freed = false;
+		var slots = _map.SlotCount;
+		for (var slot = 0; slot < slots; slot++) {
+			if (!_map.IsOccupied(slot)) continue;
+			ref var cell = ref _map.RefAt(slot);
+			if (cell.ChunkBase == Chunk.None) continue;
+			if (Volatile.Read(ref cell.State) != CellState.Free) continue;
+
+			// Claim the cell. A worker that is mid-release loses this CAS or wins it later; either way
+			// the key cannot be processed while we hold Reclaiming.
+			if (Interlocked.CompareExchange(ref cell.State, CellState.Reclaiming, CellState.Free) !=
+				CellState.Free)
+				continue;
+
+			var head = Volatile.Read(ref cell.Head);
+			if (Volatile.Read(ref cell.Tail) != head) {
+				// It went dirty between the check and the claim. Releasing this is NOT a plain revert:
+				// Reclaiming is a non-Free state, so a worker's release-recheck may have lost its CAS and
+				// skipped scheduling. Restoring Free without re-testing the mailbox strands the key.
+				ReleaseAndMaybeSchedule(slot, ref cell, head, fromWorker: false);
+				continue;
+			}
+
+			_handler.OnChunkReclaimed(_slab.ChunkSpan(cell.ChunkBase));
+			_slab.Return(cell.ChunkBase);
+			cell.ChunkBase = Chunk.None;
+			cell.Head = 0;
+			cell.Tail = 0;
+			cell.CachedHead = 0;
+			Volatile.Write(ref cell.State, CellState.Free);
+			freed = true;
+		}
+
+		return freed;
+	}
 
 	/// <summary>
 	///   Park until the worker frees space in this key's mailbox. Arm-then-recheck: reset the event
@@ -295,11 +342,14 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	///   is why it takes <paramref name="fromWorker" /> rather than being open-coded twice.
 	/// </summary>
 	private void ReleaseAndMaybeSchedule(int index, ref KeyCell<TKey> cell, int head, bool fromWorker) {
-		Volatile.Write(ref cell.Head, head);
-		PublishProcessed();
-		if (_producerParked) {
-			_producerWakes++;
-			_spaceAvailable.Set();
+		if (fromWorker) {
+			Volatile.Write(ref cell.Head, head);
+			if (_producerParked) {
+				_producerWakes++;
+				_spaceAvailable.Set();
+			}
+
+			PublishProcessed();
 		}
 
 		// FULL FENCE, deliberately not Volatile.Write: the Tail load below must not be hoisted above
