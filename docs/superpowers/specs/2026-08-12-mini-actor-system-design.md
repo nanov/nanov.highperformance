@@ -165,9 +165,17 @@ A cell is ~32 bytes; a chunk is `chunkSize × sizeof(T)`. Decouple their lifetim
 cell index onto a **drain-hint ring** (MPSC, one push per key lifetime — negligible). The producer
 drains that ring on its cold path (when its private free list runs dry, or during the LRU sweep),
 and for each hinted cell re-validates under a `CAS(State, Reclaiming, Free)` that it is still
-`Free` and still empty (`Tail == Head`) before nulling `ChunkBase` and pushing the chunk. A cell
-that went dirty again fails the CAS and is simply skipped — the hint is advisory, never
-authoritative.
+`Free` and still empty (`Tail == Head`), then runs `OnChunkReclaimed` over the chunk (§4.6) before
+nulling `ChunkBase` and pushing the chunk. A cell that went dirty again fails the CAS and is simply
+skipped — the hint is advisory, never authoritative.
+
+> **The producer runs no cold paths after `TryComplete`.** Chunk harvest and LRU eviction must not
+> run once soft completion has been signalled. §5.6's quiescence argument depends on every producer
+> `Schedule` being sequenced-before `completed = true` on the single producer thread, and a cold
+> path can `Schedule` via `ReleaseAndMaybeSchedule`. This is structurally true today — `TryComplete`
+> is the producer's last act — but it is a silent assumption, so assert it at the reclaim and
+> eviction entry points. The drain phase needs no harvesting anyway: no new messages arrive, so no
+> new chunks are wanted.
 
 This keeps the §4.2 access discipline intact (`ChunkBase` producer-only), and it removes the
 eviction-vs-drain race entirely: eviction only ever touches cells that already hold no storage.
@@ -220,6 +228,41 @@ What remains is irreducible: **two random accesses per message** (the cell, and 
 against `SpWorker`'s single sequential stream. That is the price of key affinity itself — any
 design that routes by key pays it — not of the map implementation.
 
+### 4.6 Slot reuse — no per-message cleaning, two producer-side hooks
+
+Slots are **never cleared on the drain path**. A drained reference stays in its slot until it is
+overwritten or harvested. This is the same trade-off `memory.md` records for `ConflationSpWorker`
+("a drained reference is released when the producer overwrites it, or when the cell is evicted"),
+accepted here for the same reason: the alternative is per-message work on the hottest loop.
+
+The consequence to handle is retention: a chunk sitting on the free stack can pin up to `chunkSize`
+dead messages. Both release points are **on the producer thread**, which is what makes a pooling
+hook possible at all — `ChunkBase` is producer-owned and reclaim is producer-driven (§4.4), so the
+producer can hand recovered objects somewhere useful instead of merely nulling them.
+
+| Hook | Site | Cadence | Covers |
+| --- | --- | --- | --- |
+| `OnSlotReused(ref T slot)` | §5.1, immediately before overwriting `slot[Tail & mask]` | per message | keys that never go idle |
+| `OnChunkReclaimed(Span<T> chunk)` | §4.4, during the producer's harvest walk | per key lifetime | the tail left in a chunk when its key *does* go idle |
+
+The overwrite hook is the load-bearing one. Reclaim alone is insufficient: a chunk is only harvested
+when its key goes fully idle, so a long-lived hot key would never return anything and a pool would
+starve under exactly the load it exists for.
+
+**The overwrite hook needs no cross-thread synchronization.** The producer is reading back its own
+earlier write — the worker only ever *reads* slots. Slot `Tail & mask` was last written at
+`Tail − chunkSize`, which is below `Head`, or the §5.1 fullness check would have blocked. The ring's
+existing `Head` gate already proves the worker is finished with it.
+
+**v1 ships the hooks, not a pool.** Both default to a no-op (or a plain null-out for reference `T`).
+That keeps the cold path shaped to host pooling without committing to a pool API before a benchmark
+says it pays.
+
+> This is deliberately **not** the `IsReferenceOrContainsReferences<T>` `= default` clear that
+> `Threading.Workers/CLAUDE.md` forbids. That rule targets `ValueSpWorker`'s per-item, per-slot
+> whole-struct clear, which defeated zero-copy and was replaced by handler-driven `Clear`. These are
+> producer-side hooks at overwrite and recycle time; there is no per-item clear on the drain loop.
+
 ## 5. Protocols
 
 ### 5.1 Dispatch (producer)
@@ -234,8 +277,11 @@ if (cell.Tail - cell.CachedHead >= chunkSize) {           // producer-private �
         WaitForSpace(cell);                               // refreshes CachedHead on exit
 }
 
-slab[cell.ChunkBase + (cell.Tail & mask)] = message
+ref var slot = ref slab[cell.ChunkBase + (cell.Tail & mask)]
+handler.OnSlotReused(ref slot)                            // pool-return hook (§4.6); default no-op
+slot = message
 Volatile.Write(ref cell.Tail, cell.Tail + 1)              // release: publishes the slot
+_dispatched++                                             // producer-private, no atomics (§5.6)
 
 Interlocked.MemoryBarrier()                               // StoreLoad — required by §5.3's Dekker
 if (Volatile.Read(ref cell.State) == Free)                // test-then-CAS (§4.5)
@@ -258,16 +304,33 @@ var n = 0;
 while (head != Volatile.Read(ref cell.Tail) && n < batchBound) {
     try { handler.Handle(cell.Key, slab[cell.ChunkBase + (head & mask)]); }
     catch (Exception ex) { handler.OnError(ex); }
-    slab[...] = default;                        // or handler-driven Clear, per the family's pattern
-    head++; n++;
-    if (ShouldFlush(n)) Volatile.Write(ref cell.Head, head);   // batched publish + producer wake
+    head++; n++;                                // slot NOT cleared — see §4.6
+    if (ShouldFlush(n)) {
+        Volatile.Write(ref cell.Head, head);    // batched publish + producer wake
+        PublishProcessed();                     // per-worker count, same cadence (§5.6)
+    }
 }
 ```
+
+**The slot is not cleared per message.** A drained reference stays in its slot until the producer
+overwrites it (§5.1) or the chunk is harvested (§4.4) — the same trade-off `memory.md` records for
+`ConflationSpWorker`, accepted for the same reason. See §4.6.
+
+**A throwing handler consumes the message.** `OnError` is called, `head` still advances, and the
+loop continues with the next message of the same key. The message is *not* retried, so a poison
+message cannot stall the key — and the per-key ordering guarantee is unaffected, since the failed
+message is consumed rather than reordered. Abandoning the rest of the batch instead would leave the
+remainder queued and reschedule the key, turning one bad message into a repeating head-of-line stall.
 
 **`batchBound` is required.** In-place drain is not self-limiting: under a firehose the producer
 refills as fast as the worker drains, `Tail` never equals `Head`, and the worker is pinned forever.
 (The rejected detach-a-snapshot design was self-limiting by construction; that property is lost and
 the knob is the price.) This is exactly why Akka has a `throughput` setting.
+
+**Default `batchBound = chunkSize`** — "drain what fits in one chunk". This makes the common case a
+full drain and degenerates to exactly the self-limiting behaviour of the discarded detach design.
+Akka's default of 5 is tuned for actors with expensive per-message work; handlers here are cheap and
+the batch amortizes a scheduler round-trip, so a small default would be actively wrong.
 
 ### 5.3 Release — the crux
 
@@ -330,6 +393,20 @@ when publishing `Head` or returning a chunk, and signals only if it is up.
 Source (2) is the sharp one: it blocks the producer on *one* key, stalling all others —
 head-of-line blocking across the whole system. See §11.
 
+**Two dispatch entry points, both shipped in v1:**
+
+| | Behaviour on backpressure |
+| --- | --- |
+| `Dispatch(key, msg)` | blocks until space — matches the family |
+| `TryDispatch(key, msg)` | returns `false` immediately, message not enqueued |
+
+`TryDispatch` costs a few lines (the machinery is shared) and earns its place by making head-of-line
+blocking **measurable**: run the same benchmark both ways and the delta is exactly the cost of the
+v1 per-key bound — the number that decides whether v2 chaining is worth building. Both return
+`false` if the system is completed or disposed, as the family does.
+
+A rejected `TryDispatch` does **not** increment `_dispatched` (§5.6).
+
 ### 5.5 Eviction
 
 Cold LRU sweep, producer-side. Only cells with `State == Free` **and** `ChunkBase < 0` (storage
@@ -337,13 +414,114 @@ already harvested) are evictable — so eviction never contends with an active d
 `CAS(State, Tombstone, Free)`, then tombstone the key. A lost CAS, or a validation failure after
 winning it, goes through the shared `ReleaseAndMaybeSchedule` path (§4.4) — never a plain revert.
 
+### 5.6 Completion and termination detection
+
+With N workers and stealing, "everything is drained" is a real termination-detection problem. A
+worker whose own queue is empty cannot exit merely because the producer completed: another worker
+may be mid-activation and about to reschedule a key. With stealing, "all queues empty" is not even a
+stable observation.
+
+#### The scheme: message counts, not in-flight key counts
+
+```
+producer:  int _dispatched                 // producer-private, plain increment, no atomics
+worker i:  long _processed[i]              // padded, worker-private; published at Head-flush cadence
+
+TryComplete():                             // producer thread, its last act
+    Volatile.Write(ref _dispatchedFinal, _dispatched)
+    Volatile.Write(ref _completed, true)
+    scheduler.WakeAll()                    // UNCONDITIONAL broadcast — see below
+
+quiescent():                               // evaluated on the idle path only
+    if (!Volatile.Read(ref _completed)) return false      // ← read completed FIRST
+    var sum = 0L
+    for (var i = 0; i < N; i++) sum += Volatile.Read(ref _processed[i])
+    return sum == Volatile.Read(ref _dispatchedFinal)
+```
+
+**Exact by construction.** Every message is handled exactly once — the cell state machine guarantees
+that independently of anything here — so the sum converges to `_dispatchedFinal` regardless of
+release races, `batchBound` reschedules, `ReleaseAndMaybeSchedule` reverts, tombstones, or steals.
+No episode accounting exists to get wrong, and future protocol changes cannot break it.
+
+**Conservative in the safe direction.** A worker that has processed messages but not yet published
+makes the sum too *low*, never too high. An under-count delays quiescence; it cannot fabricate it.
+
+**Cheap where it matters.** The hot-path cost is a worker-private store, published at the cadence of
+the batched `Head` flush that already exists. (Same cadence — a *different* cache line, since
+`_processed[i]` is per worker and `Head` is per cell.) The O(N) sum runs only on the idle path after
+completion, and §8 already plans these counters.
+
+#### Load order is load-bearing
+
+The exit predicate must read `_completed` **first**, then the counters, all with acquire semantics.
+The soundness argument is "every producer increment is sequenced-before `_completed = true`, so a
+worker observing `_completed == true` must observe the corresponding counts" — and that implication
+only holds if the count loads are ordered *after* the `_completed` load. Reversed, ARM64 will serve
+a stale zero next to a fresh `_completed`, producing **false quiescence and silent message loss**.
+
+This is precisely the existing soft-complete rule in `Threading.Workers/CLAUDE.md` — *"re-read
+`_tail` **after** observing `_completed`"* — with the counter sum as the new `_tail`. Comment it the
+same way and test it the same way.
+
+#### Wake protocol — two edges, both required
+
+1. **`TryComplete` on an already-drained system.** Everything drained long ago, every worker parked.
+   No further count will ever be published, so nobody will ever observe quiescence. `TryComplete`
+   must therefore **broadcast to all N unconditionally**, per the family rule that shutdown Sets
+   everything and is never flag-gated. §6.2's "wake exactly one, not the herd" applies to `Schedule`
+   only — never to shutdown.
+2. **The last publisher after completion.** The worker whose publish completes the sum must then
+   broadcast. Ordering on that thread: publish → observe the sum is complete → read `_completed`
+   → wake all.
+
+**Parking is arm-then-recheck, with the quiescence predicate inside the recheck**: raise the parked
+flag → `Interlocked.MemoryBarrier()` → re-check work availability *and* quiescence → park. Collapsing
+this to check-then-park is the classic lost wakeup, and it will pass every test that never actually
+parks — which is why the parking tests must run under `AwaitCompletionOrStall`.
+
+#### Why not an in-flight key counter
+
+The obvious scheme — one global counter of keys in `Scheduled ∪ Owned`, `+1` on `Schedule`, `−1` on
+a final release — was designed, reviewed and **rejected with two confirmed bugs**. Recorded here so
+nobody "simplifies" back to it:
+
+- **It leaks on every `batchBound` reschedule.** Producer `+1`; worker drains to the bound, wins the
+  release-recheck CAS and calls `Schedule` → `+1` again; next activation drains fully → one `−1`.
+  Net `+1` per bounded activation, forever. `Completion` hangs deterministically under any firehose.
+- **It leaks on the release race even if only the producer increments.** In §5.3's second row the
+  producer wins the CAS and increments, and the worker's recheck CAS then *fails* — so the worker
+  takes neither branch and never decrements. The episode ended via a failed CAS, which no
+  final-release rule covers.
+
+The naive repair (decrement at every `Owned → Free`) is balanced but strictly worse: it puts the
+decrement *before* the recheck, so a worker that read a stale `Tail`, saw "empty" and decremented
+can produce a transient zero while `_completed` is true — `Completion` fires with a message still
+queued, which is then dropped on dispose. That is the same failure class as `memory.md` bug #2.
+
+A correct token discipline does exist (`+1` only on producer-won transitions; worker-won recheck
+transfers the token; worker-*lost* recheck decrements; confirmed-empty release decrements after the
+confirming load). It is exact, and it was verified against all three §5.3 outcomes. It is rejected
+anyway on two grounds: it is four counter sites keyed to CAS outcomes, each a latent reintroduction
+of the bugs above; and it puts a **contended cross-core RMW on every activation from every worker**
+— under high key churn with small batches, activations approach messages, making it a shared hot
+line of exactly the kind the L2 signaling work existed to remove.
+
+#### Hard stop
+
+`Dispose` drops queued messages. A worker **finishes the message it is currently in** and abandons
+the rest of the batch — tearing down under a running handler is something the family never does.
+All N workers are joined against **one shared 1 s budget**, not 1 s each; N workers must not make
+disposal take N seconds. `Completion` resolves as `OperationCanceledException`, as the family does.
+
 ## 6. Scheduler seam
 
 ```csharp
 interface IKeyScheduler {
   void Schedule(int cellIdx);                       // producer first-dirty, or worker self-reschedule
   bool TryAcquire(int workerId, out int cellIdx);   // non-blocking; may steal
-  bool WaitForWork(int workerId);                   // park; false ⇒ shutting down
+  bool WaitForWork(int workerId);                   // park (arm-then-recheck, §5.6); false ⇒ exit
+  void WakeAll();                                   // unconditional broadcast — shutdown only
   void Start(int workerCount);
   void SignalStop();
 }
@@ -375,6 +553,15 @@ worker ⇒ **affinity for free** (warm cache, warm cell line). Consequently **B 
 map at all** — the cell state machine already prevents concurrent processing; the router only
 answers "which worker gets this newly-dirty key."
 
+**Load metric = queued key count** (`QueuedApprox`), not queued messages. Message-depth load is the
+"truer" metric, but it is stale the instant it is read and the router would pay cross-core reads per
+decision to obtain it. Key count is already exposed and free.
+
+**Ship round-robin as a second, metric-free router.** If `argmin(QueuedApprox)` and round-robin
+benchmark the same, the router's cleverness is not earning its keep — which is a genuine result and
+directly informs whether B is worth keeping at all. A null baseline you can actually run beats an
+argument about which metric is better.
+
 ### 6.2 D — Work stealing (pull-side)
 
 ```
@@ -389,8 +576,14 @@ producer ──▶ [ global submission queue ]  (SPMC, key indices)
   thieves CAS the top. Self-reschedules push to the local bottom ⇒ same affinity property as B.
 - **Overflow** — fixed-size deque; if full, push to the global queue instead. This is what .NET's
   `ThreadPoolWorkQueue` does; it avoids implementing Chase-Lev's growable array in v1.
+- **Steal granularity: one key.** The steal-half variant exists because fine-grained task deques
+  make a single steal too small to amortize the CAS. That does not apply here — one key already *is*
+  a batch of up to `batchBound` messages, so a single steal moves substantial work. Steal-half would
+  also concentrate several hot keys onto one thief, which is precisely the imbalance stealing exists
+  to fix. (Key-merge and richer policies are a later branch, deliberately unspecified.)
 - **Idle** — bounded spin → random-victim steal scan → park. Track sleeping-worker count so
-  `Schedule` wakes exactly one, not the herd.
+  `Schedule` wakes exactly one, not the herd. **`WakeAll` is the exception** — shutdown broadcasts
+  unconditionally (§5.6).
 
 > Use **Lê / Pop / Cohen / Zappa Nardelli (2013)** for the deque memory orderings, **not** the 2005
 > paper. Apple Silicon will find the difference.
@@ -410,8 +603,10 @@ cost (idle workers self-serve instead of waiting for a router judging by a stale
 ```csharp
 readonly struct OrderHandler : IActorHandler<long, Order> {
   public void Handle(long key, Order msg) { /* exclusive per key, ordered */ }
-  public void OnError(Exception error) { }
-  public void OnCompleted(Exception? error) { }
+  public void OnError(Exception error) { }             // Handle threw; worker continues (§5.2)
+  public void OnCompleted(Exception? error) { }        // fires ONCE PER WORKER — see below
+  public void OnSlotReused(ref Order slot) { }         // §4.6 — default no-op
+  public void OnChunkReclaimed(Span<Order> chunk) { }  // §4.6 — default no-op
 }
 
 using var system = new ActorSystem<long, Order, OrderHandler, WorkStealingScheduler>(
@@ -419,20 +614,33 @@ using var system = new ActorSystem<long, Order, OrderHandler, WorkStealingSchedu
   workers: 8,
   keyCapacity: 1 << 12,     // live keys
   chunkSize: 64,            // messages per key, v1 bound
-  batchBound: 64);          // max messages per activation
+  batchBound: 64);          // max per activation; defaults to chunkSize
 
 system.Start();
-system.Dispatch(orderId, order);   // single producer; blocks on backpressure
+system.Dispatch(orderId, order);          // blocks on backpressure
+system.TryDispatch(orderId, order);       // returns false instead of blocking (§5.4)
 system.TryComplete();
 await system.Completion;
 ```
 
+`where TKey : notnull, IEquatable<TKey>` — keyed by its own `GetHashCode` / `Equals`, no
+handler-supplied hash, exactly as `ConflationSpWorker` and `CoalescingSpWorker`. `T` is unconstrained.
+
 Deliberately mirrors the existing family: struct handler (devirtualized), `Start` / `TryComplete` /
 `Dispose` / `Completion`, hard-stop-drops vs soft-complete-drains.
 
-**Handler copies.** Each worker gets its own copy of the handler struct, so per-worker handler state
-is thread-local by construction. Shared state goes behind a reference the struct captures — same
-rule as today, but now it genuinely matters.
+**Handler copies, and `OnCompleted` fires N times.** Each worker gets its own copy of the handler
+struct, so per-worker handler state is thread-local by construction — and each copy therefore needs
+its own teardown, so **every** worker's copy receives `OnCompleted` exactly once. A single
+designated call would leave N−1 copies un-torn-down. The one system-level signal is `Completion`,
+which resolves once, after all N workers have exited. Shared state goes behind a reference the
+struct captures — same rule as today, but now it genuinely matters.
+
+**Worker pool is fixed at N and workers park indefinitely when idle.** No idle-timeout exit, no
+dynamic sizing in v1: that is a control loop of its own (hysteresis, spawn latency, thrash under
+bursty load) and it is orthogonal to the B-vs-D question this experiment exists to answer.
+Instrument park/unpark rate instead (§8) — heavy parking is the evidence for making it dynamic, and
+then it will have been measured rather than guessed.
 
 ## 8. Observability
 
@@ -464,11 +672,17 @@ watchdogs so a lost wakeup fails fast instead of hanging).
 | 9 | Eviction: cell reclaimed only when `Free` + unbound; key re-dispatch after eviction works | §5.5 |
 | 9b | **Reclaim race**: producer harvesting a chunk concurrently with a worker's release-recheck; assert never stranded (this is the `ReleaseAndMaybeSchedule` path) | §4.4 |
 | 10 | Hard stop drops / soft complete drains | family contract |
-| 11 | Handler throws ⇒ `OnError`, processing continues | family contract |
+| 11 | Handler throws ⇒ `OnError`, next message of the same key still runs, order intact | §5.2 |
 | 12 | Zero per-message allocation after warmup | family contract |
+| 13 | **Quiescence under churn**: `Σ processed == dispatched` after every drain; predicate never true while any ring is non-empty | §5.6 |
+| 14 | **`TryComplete` on an already-drained, fully-parked system completes** | §5.6 wake edge 1 |
+| 15 | **`TryComplete` racing a final in-flight message** — the F2 interleaving: no `Completion` before that message is handled | §5.6 |
+| 16 | `OnCompleted` fires exactly once per worker (N total); `Completion` resolves once, after all exit | §7 |
+| 17 | `TryDispatch` returns false under backpressure and does not count toward `dispatched` | §5.4 |
 
-Tests 3, 4 and 8 are the ones that will find real bugs; budget accordingly. All three are stress
-tests and must run under the stall watchdog, on both TFMs, in Debug and Release.
+Tests 3, 4, 8, 13 and 15 are the ones that will find real bugs; budget accordingly. All are stress
+tests and must run under the stall watchdog, on both TFMs, in Debug and Release. Tests 14 and 15
+must genuinely **park** — a lost-wakeup bug passes every test whose workers never sleep.
 
 ## 10. Project shape
 
@@ -505,10 +719,13 @@ it will not. Measure cardinality independently of skew for that reason.
 
 | Limitation | v1 stance | Upgrade |
 | --- | --- | --- |
-| **Per-key ring is bounded ⇒ a full key blocks the single producer entirely** (head-of-line across all keys) | accept, measure | bigger chunks → v2 chaining → non-blocking `TryDispatch` |
-| `batchBound` is a tuning knob | accept | none; inherent to in-place drain |
+| **Per-key ring is bounded ⇒ a full key blocks the single producer entirely** (head-of-line across all keys) | accept, measure — `TryDispatch` (§5.4) makes the cost visible | bigger chunks → v2 chaining |
+| `batchBound` is a tuning knob | accept; defaults to `chunkSize` | none; inherent to in-place drain |
 | Rigid memory (`liveKeys × chunkSize`) | accept | v2 chaining makes chunks fungible |
+| Capacity model (`keyCapacity` vs chunk count vs `chunkSize`) not pinned down | deliberately left to evolve once measured | — |
+| Terminology: "actor" is used loosely here and means the *worker* in the shipped `Threading.Workers` README | deliberately parked; v1 has no per-key state, so nothing turns on it yet | resolve when per-key state lands |
 | Single producer | accept | out of scope |
+| Fixed worker count, no idle-timeout exit | accept; instrument park rate | dynamic sizing once measured |
 
 ### v2 — chained chunks
 
