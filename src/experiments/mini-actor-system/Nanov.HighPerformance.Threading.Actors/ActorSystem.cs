@@ -37,6 +37,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 
 	private long _processedLocal;    // worker-private running count
 	private long _processedPublished; // published for the quiescence check (Task 7)
+	private int _activations; // test hook: counts Activate calls, so batchBound has a mechanical guard
 
 	/// <param name="handler">Struct handler; copied into each worker.</param>
 	/// <param name="keyCapacity">Max live keys.</param>
@@ -139,6 +140,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	}
 
 	private void Activate(int index) {
+		_activations++;
 		ref var cell = ref _map.RefAt(index);
 		Interlocked.Exchange(ref cell.State, CellState.Owned);
 
@@ -215,4 +217,6 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	internal int ScheduledCountApprox => _scheduled.CountApprox;
 
 	internal int DispatchedCount => _dispatched;
+
+	internal int Activations => Volatile.Read(ref _activations);
 }

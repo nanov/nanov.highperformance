@@ -83,7 +83,7 @@ public class ActorSystemTests {
 	[Test]
 	public void Processes_All_Messages_Of_One_Key_In_Order() {
 		var state = new RecordingState();
-		using var system = New(state, chunkSize: 512); // must hold all 500 — no backpressure yet
+		using var system = New(state, chunkSize: 512, batchBound: 8); // must hold all 500 — no backpressure yet
 		system.Start();
 
 		const int count = 500;
@@ -98,7 +98,7 @@ public class ActorSystemTests {
 	public void Preserves_Order_Within_Every_Key_Across_Many_Keys() {
 		var state = new RecordingState();
 		// chunkSize must hold all 200 messages of one key — no backpressure until Task 9.
-		using var system = New(state, keyCapacity: 128, chunkCount: 32, chunkSize: 256);
+		using var system = New(state, keyCapacity: 128, chunkCount: 32, chunkSize: 256, batchBound: 8);
 		system.Start();
 
 		const int keys = 16;
@@ -128,6 +128,8 @@ public class ActorSystemTests {
 
 		WorkerTestUtil.AwaitProgress(() => state.HandledCount, count);
 		Assert.That(state.ByKey()[1], Is.EqualTo(Enumerable.Range(0, count).ToList()));
+		Assert.That(system.Activations, Is.GreaterThan(1),
+			"batchBound was not honoured — 100 messages drained in a single activation");
 	}
 
 	[Test]
