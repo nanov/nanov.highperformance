@@ -2125,8 +2125,7 @@ Replace `Dispatch` and `TryBindChunk`, and add `TryDispatch`, with the shared co
 			cell.CachedHead = Volatile.Read(ref cell.Head);
 			while (cell.Tail - cell.CachedHead >= _chunkSize) {
 				if (!blocking) return false;
-				if (!WaitForProgress()) return false;
-				cell.CachedHead = Volatile.Read(ref cell.Head);
+				if (!WaitForMailboxSpace(ref cell)) return false; // refreshes CachedHead itself
 			}
 		}
 
@@ -2147,9 +2146,9 @@ Replace `Dispatch` and `TryBindChunk`, and add `TryDispatch`, with the shared co
 	private bool BindChunk(ref KeyCell<TKey> cell, bool blocking) {
 		int chunk;
 		while (!_slab.TryRent(out chunk)) {
-			if (Harvest()) continue;              // cold: reclaim drained keys' chunks (Task 10)
+			if (Harvest()) continue;           // cold: reclaim drained keys' chunks (Task 10)
 			if (!blocking) return false;
-			if (!WaitForProgress()) return false; // park until a worker drains something
+			if (!WaitForChunk()) return false; // park until a worker drains something to harvest
 		}
 
 		cell.ChunkBase = chunk;
@@ -2160,24 +2159,50 @@ Replace `Dispatch` and `TryBindChunk`, and add `TryDispatch`, with the shared co
 	}
 
 	/// <summary>
-	///   Park until the worker makes progress — either freeing a mailbox slot, or draining a key whose
-	///   chunk the producer can then harvest. One helper serves both backpressure sources (§5.4) because
-	///   both are relieved by the same event: the worker advancing.
+	///   Park until the worker frees space in this key's mailbox.
+	///   <para>
+	///     <b>Arm-then-recheck, and the order matters.</b> Reset the event BEFORE raising the parked
+	///     flag — reversed, a worker <c>Set</c> landing between the two is destroyed by our own
+	///     <c>Reset</c>. Then fence and re-test the predicate INSIDE the armed window: a worker that
+	///     advanced <c>Head</c> just before we armed saw the flag down and did not <c>Set</c>, so this
+	///     recheck is the only thing that catches it. Without it the wake is genuinely lost and only
+	///     the timeout recovers — a 20 ms stall on every full-mailbox park. See
+	///     <c>SpRingCore.WaitForSpaceSlow</c> for the reference shape.
+	///   </para>
 	///   <para>
 	///     Returns false if the system stopped or completed while parked, so a dispatch racing shutdown
 	///     is <b>rejected, never stranded</b> — that stranding is exactly bug #2 in <c>memory.md</c>.
 	///   </para>
-	///   <para>
-	///     The bounded wait is deliberate for v1: a missed wake self-heals within 20 ms rather than
-	///     hanging. Phase 2 replaces it with the family's parked-flag protocol once there are N workers
-	///     to signal.
-	///   </para>
+	///   The bounded wait is belt-and-braces for v1, not the mechanism: a missed wake self-heals within
+	///   20 ms rather than hanging. Phase 2 replaces it with the family's parked-flag protocol.
 	/// </summary>
-	private bool WaitForProgress() {
+	private bool WaitForMailboxSpace(ref KeyCell<TKey> cell) {
+		_spaceAvailable.Reset();
 		_producerParked = true;
 		try {
-			_spaceAvailable.Reset();
-			Interlocked.MemoryBarrier(); // flag visible before we re-test, so the worker cannot miss us
+			Interlocked.MemoryBarrier(); // flag visible before the recheck below
+			if (_stopped || _completed) return false;
+			cell.CachedHead = Volatile.Read(ref cell.Head);
+			if (cell.Tail - cell.CachedHead < _chunkSize) return true; // freed while we were arming
+			_spaceAvailable.Wait(TimeSpan.FromMilliseconds(20));
+			cell.CachedHead = Volatile.Read(ref cell.Head);
+			return !_stopped && !_completed;
+		}
+		finally {
+			_producerParked = false;
+		}
+	}
+
+	/// <summary>
+	///   Park until the worker drains a key, which is what makes a chunk harvestable. There is no
+	///   producer-visible predicate to re-test here — only a harvest adds a chunk, and only this thread
+	///   harvests — so this arms and waits without a recheck.
+	/// </summary>
+	private bool WaitForChunk() {
+		_spaceAvailable.Reset();
+		_producerParked = true;
+		try {
+			Interlocked.MemoryBarrier();
 			if (_stopped || _completed) return false;
 			_spaceAvailable.Wait(TimeSpan.FromMilliseconds(20));
 			return !_stopped && !_completed;
@@ -2187,6 +2212,10 @@ Replace `Dispatch` and `TryBindChunk`, and add `TryDispatch`, with the shared co
 		}
 	}
 ```
+
+> **Why two methods and not one with a predicate parameter.** `BindChunk` parks with a cell whose
+> chunk is not yet bound, so its cursors are both 0. A mailbox predicate would read `0 - 0 < chunkSize`
+> as "space available", return true immediately, and turn `BindChunk` into an infinite busy spin.
 
 Add a stub `Harvest` (fully implemented in Task 10):
 
