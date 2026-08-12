@@ -413,6 +413,8 @@ public class ActorSystemTests {
 		Assert.That(producer.Join(TimeSpan.FromSeconds(10)), Is.True, "producer never unblocked");
 		WorkerTestUtil.AwaitProgress(() => state.HandledCount, count);
 		Assert.That(state.ByKey()[1], Is.EqualTo(Enumerable.Range(0, count).ToList()));
+		Assert.That(system.ProducerWakes, Is.GreaterThan(0),
+			"the worker never woke the parked producer — backpressure is running on the 20ms poll alone");
 	}
 
 	[Test]
@@ -429,9 +431,32 @@ public class ActorSystemTests {
 		producer.Start();
 
 		Thread.Sleep(100);
+		Assert.That(Volatile.Read(ref finished), Is.EqualTo(0), "producer was never actually blocked");
 		system.Dispose();
 
 		Assert.That(producer.Join(TimeSpan.FromSeconds(5)), Is.True, "producer stayed parked after Dispose");
+		Assert.That(Volatile.Read(ref finished), Is.EqualTo(1));
+	}
+
+	[Test]
+	public void TryComplete_Unblocks_A_Producer_Parked_On_A_Full_Mailbox() {
+		var state = new RecordingState();
+		using var system = New(state, chunkSize: 4);
+		var finished = 0;
+
+		var producer = new Thread(() => {
+			for (var i = 0; i < 1_000; i++)
+				if (!system.Dispatch(1, i)) break;
+			Volatile.Write(ref finished, 1);
+		}) { IsBackground = true };
+		producer.Start();
+
+		Thread.Sleep(100);
+		Assert.That(Volatile.Read(ref finished), Is.EqualTo(0), "producer was never actually blocked");
+
+		system.TryComplete();
+
+		Assert.That(producer.Join(TimeSpan.FromSeconds(5)), Is.True, "producer stayed parked after TryComplete");
 		Assert.That(Volatile.Read(ref finished), Is.EqualTo(1));
 	}
 }

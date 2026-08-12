@@ -44,6 +44,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	private readonly ManualResetEventSlim _workAvailable = new(false);
 	private readonly ManualResetEventSlim _spaceAvailable = new(false);
 	private volatile bool _producerParked;
+	private int _producerWakes; // test hook: counts Sets actually delivered to a parked producer
 	private long _dispatchedFinal;
 	private volatile bool _completed;
 	private Exception? _completionError;
@@ -109,8 +110,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 			cell.CachedHead = Volatile.Read(ref cell.Head);
 			while (cell.Tail - cell.CachedHead >= _chunkSize) {
 				if (!blocking) return false;
-				if (!WaitForProgress()) return false;
-				cell.CachedHead = Volatile.Read(ref cell.Head);
+				if (!WaitForMailboxSpace(ref cell)) return false;
 			}
 		}
 
@@ -136,7 +136,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		while (!_slab.TryRent(out chunk)) {
 			if (Harvest()) continue;              // cold: reclaim drained keys' chunks (Task 10)
 			if (!blocking) return false;
-			if (!WaitForProgress()) return false; // park until a worker drains something
+			if (!WaitForChunk()) return false; // park until a worker drains something
 		}
 
 		cell.ChunkBase = chunk;
@@ -149,24 +149,39 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	private bool Harvest() => false;
 
 	/// <summary>
-	///   Park until the worker makes progress — either freeing a mailbox slot, or draining a key whose
-	///   chunk the producer can then harvest. One helper serves both backpressure sources (§5.4) because
-	///   both are relieved by the same event: the worker advancing.
-	///   <para>
-	///     Returns false if the system stopped or completed while parked, so a dispatch racing shutdown
-	///     is <b>rejected, never stranded</b> — that stranding is exactly bug #2 in <c>memory.md</c>.
-	///   </para>
-	///   <para>
-	///     The bounded wait is deliberate for v1: a missed wake self-heals within 20 ms rather than
-	///     hanging. Phase 2 replaces it with the family's parked-flag protocol once there are N workers
-	///     to signal.
-	///   </para>
+	///   Park until the worker frees space in this key's mailbox. Arm-then-recheck: reset the event
+	///   BEFORE raising the parked flag, fence, then re-test the predicate inside the armed window — a
+	///   worker that advanced Head just before we armed will not Set, so the recheck is the only thing
+	///   that catches it. Returns false if the system stopped or completed while parked, so a dispatch
+	///   racing shutdown is rejected rather than committed into a ring whose consumer has exited.
 	/// </summary>
-	private bool WaitForProgress() {
+	private bool WaitForMailboxSpace(ref KeyCell<TKey> cell) {
+		_spaceAvailable.Reset();
 		_producerParked = true;
 		try {
-			_spaceAvailable.Reset();
-			Interlocked.MemoryBarrier(); // flag visible before we re-test, so the worker cannot miss us
+			Interlocked.MemoryBarrier(); // flag visible before the recheck below
+			if (_stopped || _completed) return false;
+			cell.CachedHead = Volatile.Read(ref cell.Head);
+			if (cell.Tail - cell.CachedHead < _chunkSize) return true; // freed while we were arming
+			_spaceAvailable.Wait(TimeSpan.FromMilliseconds(20));
+			cell.CachedHead = Volatile.Read(ref cell.Head);
+			return !_stopped && !_completed;
+		}
+		finally {
+			_producerParked = false;
+		}
+	}
+
+	/// <summary>
+	///   Park until the worker drains a key, which is what makes a chunk harvestable. There is no
+	///   producer-visible predicate to re-test here — only a harvest adds a chunk, and only this thread
+	///   harvests — so this arms and waits without a recheck.
+	/// </summary>
+	private bool WaitForChunk() {
+		_spaceAvailable.Reset();
+		_producerParked = true;
+		try {
+			Interlocked.MemoryBarrier();
 			if (_stopped || _completed) return false;
 			_spaceAvailable.Wait(TimeSpan.FromMilliseconds(20));
 			return !_stopped && !_completed;
@@ -264,7 +279,10 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 			if ((n & 31) == 0) {
 				Volatile.Write(ref cell.Head, head);
 				PublishProcessed();
-				if (_producerParked) _spaceAvailable.Set();
+				if (_producerParked) {
+					_producerWakes++;
+					_spaceAvailable.Set();
+				}
 			}
 		}
 
@@ -279,7 +297,10 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	private void ReleaseAndMaybeSchedule(int index, ref KeyCell<TKey> cell, int head, bool fromWorker) {
 		Volatile.Write(ref cell.Head, head);
 		PublishProcessed();
-		if (_producerParked) _spaceAvailable.Set();
+		if (_producerParked) {
+			_producerWakes++;
+			_spaceAvailable.Set();
+		}
 
 		// FULL FENCE, deliberately not Volatile.Write: the Tail load below must not be hoisted above
 		// this store. Producer and worker each store to their own variable then load the other's, with a
@@ -420,4 +441,6 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	internal int DispatchedCount => _dispatched;
 
 	internal int Activations => Volatile.Read(ref _activations);
+
+	internal int ProducerWakes => Volatile.Read(ref _producerWakes);
 }
