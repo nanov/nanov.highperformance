@@ -240,4 +240,94 @@ public class ActorSystemTests {
 		Assert.That(agg!.InnerException, Is.InstanceOf<InvalidOperationException>());
 		Assert.That(agg.InnerException!.Message, Is.EqualTo("boom"));
 	}
+
+	[Test]
+	public void Dispose_Drops_Queued_Messages() {
+		var state = new RecordingState();
+		var started = new ManualResetEventSlim(false);
+		var gate = new ManualResetEventSlim(false);
+		state.Throw = (_, value) => {
+			if (value == 0) {
+				// Signal entry BEFORE blocking: HandledCount only increments once Handle() returns from
+				// this callback, i.e. AFTER gate.Wait unblocks — waiting on that instead of "started"
+				// races Dispose() against the un-gated messages 1..49, which are fast enough to all drain
+				// before Dispose() ever sets _stopped. "started" pins the synchronization point to the
+				// instant the worker is actually parked inside message 0.
+				started.Set();
+				gate.Wait(TimeSpan.FromSeconds(5));
+			}
+
+			return false;
+		};
+
+		var system = New(state, chunkSize: 64);
+		system.Start();
+		for (var i = 0; i < 50; i++)
+			system.Dispatch(1, i);
+
+		Assert.That(started.Wait(TimeSpan.FromSeconds(5)), Is.True, "worker never reached message 0");
+		system.Dispose();
+		gate.Set();
+
+		Assert.That(state.HandledCount, Is.LessThan(50), "hard stop should have dropped queued messages");
+	}
+
+	[Test]
+	public void Dispose_Faults_Completion_As_Cancelled() {
+		var state = new RecordingState();
+		var system = New(state);
+		system.Start();
+		system.Dispatch(1, 1);
+		WorkerTestUtil.AwaitProgress(() => state.HandledCount, 1);
+
+		system.Dispose();
+
+		// NOT Assert.ThrowsAsync<OperationCanceledException> — that constraint is an EXACT-type match
+		// (Throws.TypeOf<T>()), and awaiting a cancelled Task surfaces System.Threading.Tasks.
+		// TaskCanceledException, a subclass. Assert.CatchAsync<T> is the InstanceOf<T> form and is what
+		// actually exercises "Completion is cancelled, not faulted" the way the brief intends.
+		Assert.CatchAsync<OperationCanceledException>(async () => await system.Completion);
+	}
+
+	[Test]
+	public void Dispose_Is_Idempotent() {
+		var state = new RecordingState();
+		var system = New(state);
+		system.Start();
+		system.Dispose();
+		Assert.DoesNotThrow(() => system.Dispose());
+	}
+
+	[Test]
+	public void Dispatch_After_Dispose_Is_Rejected() {
+		var state = new RecordingState();
+		var system = New(state);
+		system.Start();
+		system.Dispose();
+
+		Assert.That(system.Dispatch(1, 1), Is.False);
+	}
+
+	// Regression guards for a carried-over defect: a system that was constructed but Start() was never
+	// called has no worker thread, so RunLoop's finally — the only other place Completion resolves —
+	// never runs. Without the _worker-is-null branch in TryComplete/Dispose, await system.Completion
+	// would hang forever here.
+
+	[Test]
+	public void TryComplete_On_A_System_That_Was_Never_Started_Resolves_Completion() {
+		var state = new RecordingState();
+		using var system = New(state);
+
+		Assert.That(system.TryComplete(), Is.True);
+		Assert.DoesNotThrowAsync(async () => await system.Completion);
+	}
+
+	[Test]
+	public void Dispose_On_A_System_That_Was_Never_Started_Resolves_Completion_As_Cancelled() {
+		var state = new RecordingState();
+		using var system = New(state);
+
+		system.Dispose();
+		Assert.CatchAsync<OperationCanceledException>(async () => await system.Completion);
+	}
 }

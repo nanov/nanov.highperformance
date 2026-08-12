@@ -46,6 +46,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	private volatile bool _completed;
 	private Exception? _completionError;
 	private int _completeGate;
+	private int _disposeGate;
 
 	/// <param name="handler">Struct handler; copied into each worker.</param>
 	/// <param name="keyCapacity">Max live keys.</param>
@@ -138,7 +139,8 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		}
 		finally {
 			PublishProcessed();
-			Exception? error = _stopped && !_completed ? new OperationCanceledException() : _completionError;
+			var hardStopped = _stopped && !_completed;
+			Exception? error = hardStopped ? new OperationCanceledException() : _completionError;
 			try {
 				_handler.OnCompleted(error);
 			}
@@ -146,7 +148,10 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 				SafeOnError(ex);
 			}
 
-			if (error is null) _completion.TrySetResult();
+			// Hard stop cancels — mirrors the worker family (SpRingCore.SetCompletion). A genuine
+			// soft-complete-with-exception is the only case that actually faults Completion.
+			if (hardStopped) _completion.TrySetCanceled();
+			else if (error is null) _completion.TrySetResult();
 			else _completion.TrySetException(error);
 		}
 	}
@@ -254,6 +259,15 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		// drained and parked when TryComplete arrives would never be woken by anything: no further
 		// message will ever be processed, so no worker will ever re-evaluate the predicate.
 		WakeAll();
+
+		// A system that was constructed but never started has no worker thread, so RunLoop's finally
+		// — the only other place Completion resolves — will never run. Resolve it here instead;
+		// TrySet* is idempotent so this cannot race a worker that starts resolving concurrently.
+		if (_worker is null) {
+			if (exception is null) _completion.TrySetResult();
+			else _completion.TrySetException(exception);
+		}
+
 		return true;
 	}
 
@@ -304,10 +318,19 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		return processed == Volatile.Read(ref _dispatchedFinal);
 	}
 
+	/// <summary>
+	///   Hard stop: drop queued messages and exit. The message currently inside the handler still
+	///   finishes — tearing down under a running handler is something the family never does.
+	///   Workers are joined against one shared budget, not one per worker. A system that was
+	///   constructed but never started has no worker thread to resolve <see cref="Completion" />, so
+	///   this resolves it directly as cancelled in that case.
+	/// </summary>
 	public void Dispose() {
+		if (Interlocked.Exchange(ref _disposeGate, 1) != 0) return;
 		_stopped = true;
 		WakeAll();
-		_worker?.Join(TimeSpan.FromSeconds(1));
+		if (_worker is null) _completion.TrySetCanceled();
+		else _worker.Join(TimeSpan.FromSeconds(1));
 		// The events are deliberately NOT disposed: the producer is a caller-owned thread that may be
 		// parked inside Wait() right now, and disposing under it throws ObjectDisposedException on
 		// their thread. Letting the finalizer reclaim them is the correct trade here.
