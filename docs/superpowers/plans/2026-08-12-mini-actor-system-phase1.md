@@ -145,6 +145,7 @@ Create `tests/Nanov.HighPerformance.Tests/Threading/Actors/ChunkSlabTests.cs`:
 namespace Nanov.HighPerformance.Tests.Threading.Actors;
 
 using Nanov.HighPerformance.Threading.Actors.Internal;
+using NUnit.Framework;
 
 [TestFixture]
 public class ChunkSlabTests {
@@ -199,6 +200,7 @@ Replace the body of `tests/…/Threading/Actors/ChunkSlabTests.cs` with:
 namespace Nanov.HighPerformance.Tests.Threading.Actors;
 
 using Nanov.HighPerformance.Threading.Actors.Internal;
+using NUnit.Framework;
 
 [TestFixture]
 public class ChunkSlabTests {
@@ -503,6 +505,7 @@ Create `tests/…/Threading/Actors/KeyCellMapTests.cs`:
 namespace Nanov.HighPerformance.Tests.Threading.Actors;
 
 using Nanov.HighPerformance.Threading.Actors.Internal;
+using NUnit.Framework;
 
 [TestFixture]
 public class KeyCellMapTests {
@@ -789,6 +792,7 @@ Create `tests/…/Threading/Actors/KeyRingTests.cs`:
 namespace Nanov.HighPerformance.Tests.Threading.Actors;
 
 using Nanov.HighPerformance.Threading.Actors.Internal;
+using NUnit.Framework;
 
 [TestFixture]
 public class KeyRingTests {
@@ -1090,6 +1094,7 @@ namespace Nanov.HighPerformance.Tests.Threading.Actors;
 
 using Nanov.HighPerformance.Threading.Actors;
 using Nanov.HighPerformance.Threading.Actors.Internal;
+using NUnit.Framework;
 
 [TestFixture]
 public class ActorSystemTests {
@@ -1376,13 +1381,15 @@ Append to `ActorSystemTests.cs` (inside the fixture):
 	}
 ```
 
-Add this using inside the namespace at the top of the file (`System.Linq` is already available via
-`ImplicitUsings` — adding it explicitly would trip the unnecessary-using style rule, which is a build
-error here):
+Add this using inside the namespace at the top of the file, keeping the list sorted as the existing
+test files do (`Nanov.*` before `NUnit.Framework`):
 
 ```csharp
 using Nanov.HighPerformance.Tests.Threading.Workers;
 ```
+
+`System.Linq` is already covered by `ImplicitUsings`, so it is not needed — though adding it is
+harmless, as `SpWorkerTests` does exactly that and still builds warning-free.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -2366,9 +2373,9 @@ Create `tests/…/Threading/Actors/ActorSystemStressTests.cs`:
 ```csharp
 namespace Nanov.HighPerformance.Tests.Threading.Actors;
 
-using System.Linq;
 using Nanov.HighPerformance.Tests.Threading.Workers;
 using Nanov.HighPerformance.Threading.Actors;
+using NUnit.Framework;
 
 /// <summary>
 ///   Race guards. Each targets a named interleaving from the design spec; a regression here is a real
