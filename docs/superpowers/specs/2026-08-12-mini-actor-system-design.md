@@ -479,6 +479,13 @@ same way and test it the same way.
    broadcast. Ordering on that thread: publish → observe the sum is complete → read `_completed`
    → wake all.
 
+   > **Phase 1 does not implement this edge, and correctly so.** With a single worker, the only
+   > thread that could observe quiescence is the one already evaluating the predicate on its own
+   > idle path, so there is nobody to wake. It becomes load-bearing the moment a second worker
+   > exists: worker A publishes the count that completes the sum while workers B…N sit parked, and
+   > without the broadcast they park forever. **The scheduler-seam task must add it** — it is the
+   > single most likely way Phase 2 hangs.
+
 **Parking is arm-then-recheck, with the quiescence predicate inside the recheck**: raise the parked
 flag → `Interlocked.MemoryBarrier()` → re-check work availability *and* quiescence → park. Collapsing
 this to check-then-park is the classic lost wakeup, and it will pass every test that never actually
