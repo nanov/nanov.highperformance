@@ -25,12 +25,20 @@ using NUnit.Framework;
 ///     The actual protection: every test that dispatches enough volume to risk blocking runs its
 ///     <c>Dispatch</c> calls on a dedicated producer <see cref="Thread" /> and joins it with an explicit
 ///     bounded <see cref="Thread.Join(TimeSpan)" /> on the TEST thread — a genuine bounded wait, unlike
-///     <c>CancelAfter</c>. A progress counter (<c>Volatile.Write</c>/<c>Volatile.Read</c>), not an
-///     in-thread <c>Assert</c>, carries the result back: an assertion failing on a non-test thread throws
-///     off-thread and can crash the process instead of producing a red test. After the join,
-///     <c>TryComplete</c> + <see cref="WorkerTestUtil.AwaitCompletionOrStall" /> — the stall watchdog —
-///     covers the drain phase the same way it always did. <c>CancelAfter</c> is left in place anyway: it
-///     is harmless, and it does bound whichever parts of a test run on the test thread itself.
+///     <c>CancelAfter</c>. Nothing runs on that background thread unguarded: a progress counter
+///     (<c>Volatile.Write</c>/<c>Volatile.Read</c>) carries how far it got, and a <c>try</c>/<c>catch</c>
+///     captures any exception into a local for the test thread to re-throw AFTER the join — never an
+///     in-thread <c>Assert</c>, and never an uncaught exception left to hit the process-wide
+///     unhandled-exception path. Both matter: an assertion failing off-thread can crash the process
+///     instead of producing a red test, and so can an exception that nothing on that thread catches —
+///     which one of these tests (<c>Release_Race_Never_Strands_Or_Double_Schedules</c>) can legitimately
+///     throw on purpose, since <c>ScheduleFromProducer</c>'s ring-overflow exception IS the
+///     double-schedule symptom that test exists to catch. Post-join order is always: bounded join, then
+///     re-surface any captured exception, then assert progress — checking progress first would report a
+///     misleading "rejected mid-run" when the real cause was an exception. After that, <c>TryComplete</c>
+///     + <see cref="WorkerTestUtil.AwaitCompletionOrStall" /> — the stall watchdog — covers the drain
+///     phase the same way it always did. <c>CancelAfter</c> is left in place anyway: it is harmless, and
+///     it does bound whichever parts of a test run on the test thread itself.
 ///   </para>
 /// </summary>
 [TestFixture]
@@ -55,18 +63,29 @@ public class ActorSystemStressTests {
 		// Dispatch runs on its own thread so the test thread can bound the wait with a real Join — see the
 		// class doc comment for why CancelAfter alone cannot catch a wedged Dispatch. No Assert inside the
 		// producer thread: a failure there throws off-thread and can crash the process instead of failing
-		// the test, so a plain progress counter carries the result back instead.
+		// the test, so a plain progress counter carries the result back instead. An exception IS still
+		// possible here on purpose — ScheduleFromProducer throws on scheduler-ring overflow, which is this
+		// very test's own double-schedule symptom — so it is caught and re-thrown on the test thread below
+		// rather than left to hit the process-wide unhandled-exception path.
 		var dispatched = 0;
+		Exception? producerError = null;
 		var producer = new Thread(() => {
-			for (var i = 0; i < count; i++) {
-				if (!system.Dispatch(1, i)) return;
-				Volatile.Write(ref dispatched, i + 1);
+			try {
+				for (var i = 0; i < count; i++) {
+					if (!system.Dispatch(1, i)) return;
+					Volatile.Write(ref dispatched, i + 1);
+				}
+			}
+			catch (Exception ex) {
+				producerError = ex; // surfaced on the test thread below; Join gives the happens-before edge
 			}
 		}) { IsBackground = true };
 		producer.Start();
 
 		Assert.That(producer.Join(TimeSpan.FromSeconds(90)), Is.True,
 			$"producer wedged after {Volatile.Read(ref dispatched)}/{count} dispatches — likely a stranded key");
+		if (producerError is not null)
+			Assert.Fail($"producer threw: {producerError}");
 		Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(count), "a Dispatch was rejected mid-run");
 
 		system.TryComplete();
@@ -95,16 +114,24 @@ public class ActorSystemStressTests {
 			const int count = 64;
 			// Bounded producer thread, not the test thread — see the class doc comment.
 			var dispatched = 0;
+			Exception? producerError = null;
 			var producer = new Thread(() => {
-				for (var i = 0; i < count; i++) {
-					if (!system.Dispatch(i % 4, i)) return;
-					Volatile.Write(ref dispatched, i + 1);
+				try {
+					for (var i = 0; i < count; i++) {
+						if (!system.Dispatch(i % 4, i)) return;
+						Volatile.Write(ref dispatched, i + 1);
+					}
+				}
+				catch (Exception ex) {
+					producerError = ex;
 				}
 			}) { IsBackground = true };
 			producer.Start();
 
 			Assert.That(producer.Join(TimeSpan.FromSeconds(5)), Is.True,
 				$"round {round}: producer wedged after {Volatile.Read(ref dispatched)}/{count} dispatches");
+			if (producerError is not null)
+				Assert.Fail($"round {round}: producer threw: {producerError}");
 			Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(count), $"round {round}: a Dispatch was rejected");
 
 			system.TryComplete();
@@ -126,19 +153,27 @@ public class ActorSystemStressTests {
 
 		// Bounded producer thread, not the test thread — see the class doc comment.
 		var dispatched = 0;
+		Exception? producerError = null;
 		var producer = new Thread(() => {
-			var n = 0;
-			for (var i = 0; i < perKey; i++) {
-				for (var k = 0; k < keys; k++) {
-					if (!system.Dispatch(k, i)) return;
-					Volatile.Write(ref dispatched, ++n);
+			try {
+				var n = 0;
+				for (var i = 0; i < perKey; i++) {
+					for (var k = 0; k < keys; k++) {
+						if (!system.Dispatch(k, i)) return;
+						Volatile.Write(ref dispatched, ++n);
+					}
 				}
+			}
+			catch (Exception ex) {
+				producerError = ex;
 			}
 		}) { IsBackground = true };
 		producer.Start();
 
 		Assert.That(producer.Join(TimeSpan.FromSeconds(90)), Is.True,
 			$"producer wedged after {Volatile.Read(ref dispatched)}/{total} dispatches — likely a stranded key");
+		if (producerError is not null)
+			Assert.Fail($"producer threw: {producerError}");
 		Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(total), "a Dispatch was rejected mid-run");
 
 		system.TryComplete();
@@ -162,19 +197,27 @@ public class ActorSystemStressTests {
 
 		// Bounded producer thread, not the test thread — see the class doc comment.
 		var dispatched = 0;
+		Exception? producerError = null;
 		var producer = new Thread(() => {
-			var n = 0;
-			for (var i = 0; i < perKey; i++) {
-				for (var k = 0; k < keys; k++) {
-					if (!system.Dispatch(k, i)) return;
-					Volatile.Write(ref dispatched, ++n);
+			try {
+				var n = 0;
+				for (var i = 0; i < perKey; i++) {
+					for (var k = 0; k < keys; k++) {
+						if (!system.Dispatch(k, i)) return;
+						Volatile.Write(ref dispatched, ++n);
+					}
 				}
+			}
+			catch (Exception ex) {
+				producerError = ex;
 			}
 		}) { IsBackground = true };
 		producer.Start();
 
 		Assert.That(producer.Join(TimeSpan.FromSeconds(90)), Is.True,
 			$"producer wedged after {Volatile.Read(ref dispatched)}/{total} dispatches — likely a stranded key");
+		if (producerError is not null)
+			Assert.Fail($"producer threw: {producerError}");
 		Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(total), "a Dispatch was rejected mid-run");
 
 		system.TryComplete();
@@ -266,12 +309,20 @@ public class ActorSystemStressTests {
 			// message's release — THIS is the one call in the test that can genuinely block forever if the
 			// reclaim-revert path strands key 0, so it runs on a bounded thread rather than the test thread.
 			var forcedHarvest = 0;
+			Exception? racerError = null;
 			var racer = new Thread(() => {
-				if (system.Dispatch(1, 0)) Volatile.Write(ref forcedHarvest, 1);
+				try {
+					if (system.Dispatch(1, 0)) Volatile.Write(ref forcedHarvest, 1);
+				}
+				catch (Exception ex) {
+					racerError = ex;
+				}
 			}) { IsBackground = true };
 			racer.Start();
 			Assert.That(racer.Join(TimeSpan.FromSeconds(5)), Is.True,
 				$"round {round}: Dispatch(1, 0) wedged — key 0's final message was likely stranded");
+			if (racerError is not null)
+				Assert.Fail($"round {round}: Dispatch(1, 0) threw: {racerError}");
 			Assert.That(Volatile.Read(ref forcedHarvest), Is.EqualTo(1), $"round {round}: Dispatch(1, 0) was rejected");
 
 			system.TryComplete();
