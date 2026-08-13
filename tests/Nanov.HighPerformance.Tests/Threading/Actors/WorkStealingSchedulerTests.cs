@@ -106,6 +106,20 @@ public class WorkStealingSchedulerTests {
 	///     to absorb OS thread-creation latency (routinely slower than this test's whole race window)
 	///     so <c>Schedule</c> does not trivially always win by running before the worker even starts.
 	///   </para>
+	///   <para>
+	///     <b>The head start after <c>started</c> is a nanosecond-scale <c>Thread.SpinWait</c>, never a
+	///     sleep.</b> An earlier version used 40 <c>SpinWait.SpinOnce()</c> calls, believing that was a
+	///     "handful of spin cycles" — it measures ~30&#160;ms on this machine, because
+	///     <c>SpinOnce</c> escalates to <c>Thread.Sleep(1)</c> after its 20th call. That reintroduced the
+	///     ORIGINAL sleep under a different name: <c>Schedule</c> landed ~30&#160;ms after the worker was
+	///     already blocked in <c>Wait</c> in essentially every trial, so the test only ever proved <c>Set</c>
+	///     wakes an already-blocked waiter, exactly the thing the rewrite was meant to stop doing.
+	///     <c>Thread.SpinWait</c> below never sleeps and sweeps a genuine nanosecond-scale range across
+	///     trials (scaled to <c>iterations</c>, not a fixed modulus — a fixed <c>iter % 2048</c> against
+	///     only 200 trials only ever covers the bottom tenth of that range, biasing every trial toward a
+	///     near-zero head start and measurably raising the false-failure rate), so some trials really do
+	///     land inside the arm window instead of always racing well clear of it.
+	///   </para>
 	/// </summary>
 	[Test]
 	[CancelAfter(60_000)]
@@ -116,7 +130,7 @@ public class WorkStealingSchedulerTests {
 			scheduler.Start(2, _ => { });
 
 			var acquired = -1;
-			var started = new ManualResetEventSlim(false);
+			using var started = new ManualResetEventSlim(false);
 			var worker = new Thread(() => {
 				started.Set(); // absorb thread-creation latency only — see the doc comment above
 				scheduler.ArmWait(0);
@@ -126,10 +140,10 @@ public class WorkStealingSchedulerTests {
 			worker.Start();
 			Assert.That(started.Wait(TimeSpan.FromSeconds(5)), Is.True,
 				$"iteration {iter}: worker thread never started");
-			// A handful of spin cycles, not a sleep: gives the worker a realistic head start to reach
-			// ArmWait before Schedule races past it, without the 50ms handshake's full-fence guarantee.
-			var spinner = new SpinWait();
-			for (var s = 0; s < 40; s++) spinner.SpinOnce();
+			// Nanosecond-scale, never sleeps (unlike SpinWait.SpinOnce past its ~20-call escalation
+			// threshold) — scaled to `iterations` so the full 0..2047-cycle sweep is covered regardless of
+			// how many trials this run does. See the doc comment above.
+			Thread.SpinWait(iter * 2048 / iterations);
 
 			var key = 1000 + iter;
 			scheduler.Schedule(key); // deliberately racing the worker's arm cycle — no further handshake
@@ -155,7 +169,7 @@ public class WorkStealingSchedulerTests {
 		scheduler.Start(3, _ => { });
 
 		var released = 0;
-		var armed = new CountdownEvent(3);
+		using var armed = new CountdownEvent(3);
 		var threads = new Thread[3];
 		for (var i = 0; i < threads.Length; i++) {
 			var id = i;

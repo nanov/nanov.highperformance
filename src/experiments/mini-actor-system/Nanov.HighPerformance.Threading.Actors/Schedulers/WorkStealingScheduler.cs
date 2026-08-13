@@ -52,6 +52,7 @@ public struct WorkStealingScheduler : IKeyScheduler {
 		public long GlobalDequeues;
 		public long DequeOverflows;
 		public long Parks;
+		public long GlobalEnqueueRetries;
 		public int WakeScanCursor; // rotating start for WakeOne's scan -- see WakeOne's doc
 	}
 
@@ -73,6 +74,13 @@ public struct WorkStealingScheduler : IKeyScheduler {
 	public readonly long GlobalDequeues => Volatile.Read(ref _state.GlobalDequeues);
 
 	public readonly long DequeOverflows => Volatile.Read(ref _state.DequeOverflows);
+
+	/// <summary>
+	///   Failed <c>TryEnqueue</c> attempts that had to retry against the global queue's claim-window
+	///   race (see <see cref="TryEnqueueGlobalWithRetry" />). Non-zero under normal load; what tells
+	///   the benchmark whether that retry tail is ever actually paid.
+	/// </summary>
+	public readonly long GlobalEnqueueRetries => Volatile.Read(ref _state.GlobalEnqueueRetries);
 
 	/// <summary>
 	///   Count of times a worker entered <see cref="Wait" />, incremented on ENTRY before the block
@@ -109,10 +117,11 @@ public struct WorkStealingScheduler : IKeyScheduler {
 	}
 
 	public readonly void Schedule(int cellIdx) {
-		if (!TryEnqueueGlobalWithRetry(_state.Global!, cellIdx))
+		if (!TryEnqueueGlobalWithRetry(_state, cellIdx))
 			throw new InvalidOperationException(
-				"global key queue full — it is sized to the map, so this most likely means Capacity is set " +
-				"below the key map's slot count, not that a key index was scheduled twice.");
+				"global key queue enqueue failed after 64 retries over roughly 65ms — either Capacity is set " +
+				"below the key map's slot count, or a dequeuer has been stalled (e.g. preempted) that long " +
+				"holding a claim on the slot this position wrapped onto. Not necessarily a duplicate schedule.");
 		WakeOne(_state);
 	}
 
@@ -121,10 +130,11 @@ public struct WorkStealingScheduler : IKeyScheduler {
 			// Deque full: spill to the global queue rather than growing. Some other worker will pick it
 			// up, which costs this key its affinity but keeps the deque bounded and cache-resident.
 			Interlocked.Increment(ref _state.DequeOverflows);
-			if (!TryEnqueueGlobalWithRetry(_state.Global!, cellIdx))
+			if (!TryEnqueueGlobalWithRetry(_state, cellIdx))
 				throw new InvalidOperationException(
-					"deque overflowed into a full global queue — both are sized to the map, so Capacity is " +
-					"almost certainly below the key map's slot count.");
+					"deque overflowed into a global queue that then failed to enqueue after 64 retries over " +
+					"roughly 65ms — either Capacity is set below the key map's slot count, or a dequeuer has " +
+					"been stalled that long holding a claim on the slot this position wrapped onto.");
 		}
 
 		// A self-reschedule leaves stealable work behind, so a sleeping peer should be given the chance
@@ -133,15 +143,31 @@ public struct WorkStealingScheduler : IKeyScheduler {
 	}
 
 	/// <summary>
-	///   <see cref="GlobalKeyQueue.TryEnqueue" />'s <see langword="false" /> means "not right now" — a
-	///   concurrent dequeuer's claim window, a few instructions wide — never durable fullness (see its
-	///   own doc). A caller that latches a single <see langword="false" /> into a hard failure blames
-	///   sizing for what is usually a transient race; one immediate retry rides out that window.
+	///   <see cref="GlobalKeyQueue.TryEnqueue" />'s <see langword="false" /> means "not right now", never
+	///   durable fullness (see its own doc) — but the window here is NOT "a few instructions". With
+	///   <c>CountApprox</c> reading near-empty at the moment of failure (confirmed by instrumentation
+	///   during review), the slot this position wrapped onto is a FULL LAP stale: the participant that
+	///   still holds it claimed position <c>pos − capacity</c> and has been stalled across roughly
+	///   <c>capacity</c> subsequent queue operations — OS-preemption scale (tens to hundreds of
+	///   microseconds), not a handful of retired instructions. That is the actual justification for
+	///   <see cref="SpinWait" />'s escalation (busy-spin, then a yield, then <c>Thread.Sleep(1)</c>)
+	///   rather than a fixed busy-spin budget: a busy-spin-only retry would not survive a stalled
+	///   participant that has genuinely been preempted for a scheduling quantum.
+	///   <para>
+	///     <b>Wall-clock cost: up to roughly 65&#160;ms.</b> 64 attempts, measured on this machine at
+	///     ~64.75&#160;ms end to end — 44 of the 64 <c>SpinOnce</c> calls land past
+	///     <c>SpinWait</c>'s internal sleep threshold and are <c>Thread.Sleep(1)</c>, not a spin. This
+	///     runs on the producer or a worker thread once per activation, not per message, but anyone
+	///     budgeting dispatch tail latency for this scheduler needs that number.
+	///     <see cref="GlobalEnqueueRetries" /> counts how often this path is actually paid.
+	///   </para>
 	/// </summary>
-	private static bool TryEnqueueGlobalWithRetry(GlobalKeyQueue global, int cellIdx) {
+	private static bool TryEnqueueGlobalWithRetry(State s, int cellIdx) {
+		var global = s.Global!;
 		var spinner = new SpinWait();
 		for (var attempt = 0; attempt < 64; attempt++) {
 			if (global.TryEnqueue(cellIdx)) return true;
+			Interlocked.Increment(ref s.GlobalEnqueueRetries);
 			spinner.SpinOnce();
 		}
 
@@ -155,26 +181,47 @@ public struct WorkStealingScheduler : IKeyScheduler {
 	///   not-yet-visible queue and blocks. Mid-run that stalls one worker; on the last dispatch before
 	///   <c>TryComplete</c> the key is never picked up, quiescence never arrives, and the system hangs.
 	///   <para>
+	///     <b>arm64 vs. x86-64.</b> On arm64, <c>Volatile.Write</c>/<c>Volatile.Read</c> lower to
+	///     <c>stlr</c>/<c>ldar</c>, and ARMv8's release/acquire is RCsc — an <c>ldar</c> cannot be
+	///     reordered ahead of an earlier <c>stlr</c>. Since the publish side of both enqueue paths
+	///     (<see cref="GlobalKeyQueue.TryEnqueue" />, <see cref="WorkStealingDeque.TryPushBottom" />) ends
+	///     in a <c>Volatile.Write</c>, and the first flag read below is a <c>Volatile.Read</c>, this fence
+	///     is REDUNDANT on arm64 — removing it there cannot produce a lost wakeup, and a mutation test that
+	///     does so on Apple Silicon coming back clean does not mean the fence is dead code. It is
+	///     load-bearing on x86-64, where those lower to plain <c>mov</c>s and the store buffer permits the
+	///     exact StoreLoad reordering this fence exists to forbid. Keep it regardless of which
+	///     architecture you are testing on.
+	///   </para>
+	///   <para>
 	///     <b>Rotating scan start, not always index 0.</b> A burst of K schedules in quick succession
 	///     would otherwise re-read <c>Parked[0]</c> every time — the first <c>Set</c> has not cleared it
 	///     yet — so every wake in the burst lands on worker 0 while 1..N-1 stay parked: a real cold-start
 	///     parallelism loss in the scheduler whose whole point is to be benchmarked against B. Same
-	///     motivation as <see cref="TrySteal" />'s randomised victim scan.
+	///     motivation as <see cref="TrySteal" />'s randomised victim scan — a per-worker RNG there, a
+	///     shared cursor here (there is exactly one <see cref="WakeOne" /> caller path, so there is
+	///     nothing to shard the cursor across).
+	///   </para>
+	///   <para>
+	///     <b>Plain read/write on <c>WakeScanCursor</c>, not <see cref="Interlocked" />.</b> It is a pure
+	///     fairness heuristic, not correctness-critical — an <see langword="int" /> cannot tear, and a
+	///     lost update just means two concurrent <c>Schedule</c> calls start their scan from the same
+	///     index, which is the pre-fix (always-0) behaviour for that one pair, never worse. Written back
+	///     only on the branch that actually finds and wakes someone, so a busy system genuinely pays
+	///     nothing extra here — matching <see cref="ScheduleLocal" />'s own "a busy system never pays for
+	///     this" comment on the call site.
 	///   </para>
 	/// </summary>
 	private static void WakeOne(State s) {
 		Interlocked.MemoryBarrier();
 		var parked = s.Parked!;
 		var count = parked.Length;
-		// Unsigned wraparound, same reasoning as RoutedScheduler.Route's NextRoundRobin: the counter
-		// eventually wraps int.MinValue, and C#'s % takes the DIVIDEND's sign, so casting to uint before
-		// the modulo keeps the wrap harmless for any worker count.
-		var start = (int)((uint)Interlocked.Increment(ref s.WakeScanCursor) % (uint)count);
+		var start = s.WakeScanCursor % count; // plain read — see the doc above
 		for (var i = 0; i < count; i++) {
 			var idx = start + i;
 			if (idx >= count) idx -= count;
 			if (!Volatile.Read(ref parked[idx])) continue;
 			s.WorkAvailable![idx].Set();
+			s.WakeScanCursor = idx + 1; // plain write, only here — see the doc above
 			return;
 		}
 	}
