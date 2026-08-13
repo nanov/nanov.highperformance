@@ -324,29 +324,42 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 			// A background-thread escape would kill the host process with Completion unresolved.
 			// Fault Completion instead so the failure is observable.
 			_completionError ??= ex;
-			SafeOnError(w!, ex);
+			// Only reachable with a worker identity; if the cast itself failed there is no handler copy
+			// to report through, and _completionError above is what surfaces the failure.
+			if (w is not null) SafeOnError(w, ex);
 		}
 		finally {
-			PublishProcessed(w!);
+			// w can be null here if the cast (or the very first w.Id dereference, for a null state)
+			// threw before a worker identity was ever established — see the comment at the cast site.
+			// Everything that needs w is guarded on it; NOTHING above is dereferenced unconditionally,
+			// unlike the round-1 fix, which put an unguarded PublishProcessed(w!) first in this block —
+			// an NRE there escaped the thread before the decrement below ever ran, leaving Completion
+			// unresolved forever. The decrement itself is NOT guarded: a worker that never got an
+			// identity still counts toward _liveWorkers and must still release it, or the count never
+			// reaches zero and Completion hangs regardless of what happened above.
+			if (w is not null) {
+				PublishProcessed(w);
 
-			// _completed means a drain was REQUESTED, not that it finished. A Dispose racing an
-			// in-flight TryComplete drops messages, so the exit is only clean if we actually reached
-			// quiescence. Read _completed BEFORE the counters — same acquire ordering rule as
-			// IsQuiescent, and && short-circuits in the right order. This is this worker's OWN view,
-			// used only for the OnCompleted callback below — see the recompute inside the decrement
-			// branch for why the SYSTEM verdict cannot reuse it.
-			var drainedCleanly = _completed && QuiescentSum() >= Volatile.Read(ref _dispatchedFinal);
-			var hardStopped = _stopped && !drainedCleanly;
-			Exception? error = hardStopped ? new OperationCanceledException() : _completionError;
-			try {
-				w!.Handler.OnCompleted(error); // once per worker — the documented contract
-			}
-			catch (Exception ex) {
-				SafeOnError(w!, ex);
+				// _completed means a drain was REQUESTED, not that it finished. A Dispose racing an
+				// in-flight TryComplete drops messages, so the exit is only clean if we actually reached
+				// quiescence. Read _completed BEFORE the counters — same acquire ordering rule as
+				// IsQuiescent, and && short-circuits in the right order. This is this worker's OWN view,
+				// used only for the OnCompleted callback below — see the recompute inside the decrement
+				// branch for why the SYSTEM verdict cannot reuse it.
+				var drainedCleanly = _completed && QuiescentSum() >= Volatile.Read(ref _dispatchedFinal);
+				var hardStopped = _stopped && !drainedCleanly;
+				Exception? error = hardStopped ? new OperationCanceledException() : _completionError;
+				try {
+					w.Handler.OnCompleted(error); // once per worker — the documented contract
+				}
+				catch (Exception ex) {
+					SafeOnError(w, ex);
+				}
 			}
 
 			// Only the LAST worker out resolves Completion; otherwise the first to exit would report
-			// the system finished while its peers are still draining.
+			// the system finished while its peers are still draining. ALWAYS runs, even for a worker
+			// that never got an identity — see the comment above.
 			if (Interlocked.Decrement(ref _liveWorkers) == 0) {
 				// Recompute HERE, not above: this read is ordered after our own Interlocked.Decrement,
 				// which is ordered after every peer's decrement, which is ordered after each peer's
