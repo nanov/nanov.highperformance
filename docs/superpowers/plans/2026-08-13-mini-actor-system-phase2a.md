@@ -834,6 +834,8 @@ public struct RoutedScheduler : IKeyScheduler {
 		public int[]? LocalCount;
 		public int[]? LocalRun;             // consecutive local acquisitions, for the starvation bound
 		public ManualResetEventSlim[]? WorkAvailable;
+		public readonly ManualResetEventSlim InboxNotEmpty = new(false);
+		public volatile bool RouterParked;
 		public Thread? Router;
 		public volatile bool Stopping;
 		public int NextRoundRobin;
@@ -870,11 +872,35 @@ public struct RoutedScheduler : IKeyScheduler {
 		s.Router.Start();
 	}
 
+	/// <summary>
+	///   Drain the producer's inbox and route each key index to a worker.
+	///   <para>
+	///     <b>The router parks rather than spinning.</b> A spin-forever router burns a whole core while
+	///     idle — it would steal a core from the workers and distort every measurement in the B-vs-D
+	///     benchmark, which is the entire point of building this. So it uses the same arm-then-recheck
+	///     protocol as the worker and producer parks: reset the event BEFORE raising the parked flag,
+	///     fence, re-test the inbox inside the armed window, and only then block. The producer's
+	///     <see cref="Schedule" /> sets the event when it sees the flag up.
+	///   </para>
+	/// </summary>
 	private static void RouteLoop(State s, RoutingPolicy policy) {
 		while (!s.Stopping) {
 			if (!s.Inbox!.TryDequeue(out var cellIdx)) {
-				Thread.SpinWait(64);
-				continue;
+				s.InboxNotEmpty.Reset();
+				s.RouterParked = true;
+				try {
+					Interlocked.MemoryBarrier(); // flag visible before the recheck below
+					if (s.Stopping) return;
+					// Recheck INSIDE the armed window: a producer that enqueued just before we armed saw
+					// the flag down and did not Set, so this recheck is the only thing that catches it.
+					if (!s.Inbox.TryDequeue(out cellIdx)) {
+						s.InboxNotEmpty.Wait();
+						continue;
+					}
+				}
+				finally {
+					s.RouterParked = false;
+				}
 			}
 
 			var target = policy == RoutingPolicy.RoundRobin
@@ -907,6 +933,17 @@ public struct RoutedScheduler : IKeyScheduler {
 		if (!_state.Inbox!.TryEnqueue(cellIdx))
 			throw new InvalidOperationException(
 				"router inbox full — it is sized to the map, so this means a key index was scheduled twice.");
+		// StoreLoad fence between publishing the item and reading the router's parked flag. Without it
+		// this read can be hoisted above the enqueue: we would see RouterParked == false and skip the
+		// Set, while the router's own recheck sees a not-yet-visible ring and parks. Mid-run that
+		// stalls routing until the next dispatch; on the LAST dispatch before TryComplete the key is
+		// never routed at all, quiescence is never reached, and the system hangs. Schedule runs once
+		// per activation, not per message, so the fence is cheap here.
+		//
+		// This is the same StoreLoad gap recorded as known debt on the worker's wake site — do not
+		// reproduce it here.
+		Interlocked.MemoryBarrier();
+		if (_state.RouterParked) _state.InboxNotEmpty.Set();
 	}
 
 	public void ScheduleLocal(int workerId, int cellIdx) =>
@@ -938,12 +975,17 @@ public struct RoutedScheduler : IKeyScheduler {
 		_state.LocalCount![workerId] > 0 || _state.WorkerRings![workerId].CountApprox > 0;
 
 	public void WakeAll() {
+		// The router too — unconditionally. WakeAll is the shutdown/quiescence path, and a router still
+		// holding an unrouted key would leave quiescence permanently unreachable. Shutdown wakes
+		// everything and is never flag-gated.
+		_state.InboxNotEmpty.Set();
 		foreach (var evt in _state.WorkAvailable!)
 			evt.Set();
 	}
 
 	public void SignalStop() {
 		_state.Stopping = true;
+		_state.InboxNotEmpty.Set(); // unconditional: release a parked router so it can observe Stopping
 		WakeAll();
 	}
 
