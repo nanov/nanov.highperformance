@@ -187,4 +187,62 @@ public class MultiWorkerTests {
 				"the last publisher never broadcast — the seven parked peers had nothing else to wake them");
 		});
 	}
+
+	/// <summary>
+	///   Forces BOTH producer cold paths — chunk harvest and cell eviction — against eight concurrently
+	///   releasing workers.
+	///   <para>
+	///     <c>keyCapacity: 8</c> gives 16 map slots against 400 distinct keys, so once 16 are occupied
+	///     every new key must reach <c>GetOrAddRefCold</c> and evict. <c>chunkCount: 4</c> against those
+	///     same 400 keys means <c>TryRent</c> fails constantly and <c>Harvest()</c> runs on nearly every
+	///     bind. Both paths' correctness argument is entirely about racing a worker between its
+	///     <c>Exchange(State, Free)</c> and its reschedule CAS, and until this test that race had only
+	///     ever run against one worker on one core.
+	///   </para>
+	/// </summary>
+	[Test]
+	[CancelAfter(120_000)]
+	public void Eviction_And_Harvest_Under_Eight_Workers_Preserve_Order_And_Lose_Nothing() {
+		const int keys = 400;
+		const int perKey = 3;
+		const int total = keys * perKey;
+		var state = new RecordingState();
+		using var system = new ActorSystem<int, int, RecordingHandler, RoutedScheduler>(
+			new RecordingHandler(state), keyCapacity: 8, chunkCount: 4, chunkSize: 4,
+			batchBound: 1, workers: 8, scheduler: new RoutedScheduler { Capacity = 64 });
+		system.Start();
+
+		var dispatched = 0;
+		Exception? producerError = null;
+		var producer = new Thread(() => {
+			try {
+				for (var k = 0; k < keys; k++)
+					for (var i = 0; i < perKey; i++) {
+						if (!system.Dispatch(k, i)) return;
+						Volatile.Write(ref dispatched, Volatile.Read(ref dispatched) + 1);
+					}
+			}
+			catch (Exception ex) {
+				producerError = ex;
+			}
+		}) { IsBackground = true };
+		producer.Start();
+
+		Assert.That(producer.Join(TimeSpan.FromSeconds(90)), Is.True,
+			$"producer wedged after {Volatile.Read(ref dispatched)}/{total} dispatches");
+		if (producerError is not null) Assert.Fail($"producer threw: {producerError}");
+		Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(total));
+
+		system.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, total);
+
+		Assert.That(state.HandledCount, Is.EqualTo(total));
+		Assert.That(system.RejectedClaims, Is.EqualTo(0),
+			"a worker lost the Scheduled -> Owned CAS: two tokens existed for one key index");
+
+		var byKey = state.ByKey();
+		Assert.That(byKey, Has.Count.EqualTo(keys));
+		foreach (var (key, values) in byKey)
+			Assert.That(values, Is.EqualTo(Enumerable.Range(0, perKey).ToList()), $"key {key} out of order");
+	}
 }
