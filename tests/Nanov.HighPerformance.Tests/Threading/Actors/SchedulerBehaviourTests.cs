@@ -88,8 +88,9 @@ public class SchedulerBehaviourTests<TScheduler, TFactory>
 		// Eviction_And_Harvest_Under_Eight_Workers_Lose_Nothing is NOT free of) — a nonzero count here can
 		// only mean a genuine duplicate token for one key index. That is exactly the failure mode a
 		// scheduler that lets a key move between workers (D's stealing, D's ScheduleLocal spill into the
-		// shared global queue) would expose first, and this invariant was previously asserted only under
-		// RoutedScheduler across the whole suite.
+		// shared global queue) would expose first, and until this assertion the invariant had never been
+		// checked under any such scheduler — only under SingleWorkerScheduler and RoutedScheduler, neither
+		// of which can move a key once it is scheduled.
 		Assert.That(system.RejectedClaims, Is.EqualTo(0),
 			"a worker lost the Scheduled -> Owned CAS: two tokens existed for one key index");
 	}
