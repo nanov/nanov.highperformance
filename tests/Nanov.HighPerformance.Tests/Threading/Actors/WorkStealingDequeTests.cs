@@ -14,6 +14,7 @@ public class WorkStealingDequeTests {
 		var deque = new WorkStealingDeque(16);
 		for (var i = 0; i < 5; i++)
 			Assert.That(deque.TryPushBottom(i), Is.True);
+		Assert.That(deque.CountApprox, Is.EqualTo(5));
 
 		var popped = new List<int>();
 		while (deque.TryPopBottom(out var value))
@@ -65,6 +66,14 @@ public class WorkStealingDequeTests {
 	///   Run enough rounds that the interleaving is actually sampled — this is the case the CAS in
 	///   <c>TryPopBottom</c> exists for, and a deque that gets it wrong hands the SAME key to two
 	///   workers, which breaks the one-owner invariant the whole system rests on.
+	///   <para>
+	///     A fresh <see cref="Thread" /> per round does not sample this race: thread creation and
+	///     first-schedule (~10-100 µs) dwarfs <c>TryPopBottom</c>/<c>TrySteal</c> (~10 ns) by three to
+	///     four orders of magnitude, so the owner is done before the thief's delegate runs its first
+	///     instruction. A single long-lived thief thread rendezvousing with the owner through a
+	///     two-party <see cref="Barrier" /> every round gets both sides releasing within nanoseconds of
+	///     each other, so the CAS in <c>TryPopBottom</c> is actually exercised.
+	///   </para>
 	/// </summary>
 	[Test]
 	public void Owner_And_Thief_Never_Both_Take_The_Last_Item() {
@@ -72,31 +81,38 @@ public class WorkStealingDequeTests {
 		var deque = new WorkStealingDeque(4);
 		var doubleTaken = 0;
 		var lost = 0;
+		var thiefWins = 0;
+		var thiefGot = false;
+
+		using var barrier = new Barrier(2);
+
+		var thief = new Thread(() => {
+			for (var round = 0; round < rounds; round++) {
+				barrier.SignalAndWait();
+				thiefGot = deque.TrySteal(out _);
+				barrier.SignalAndWait();
+			}
+		}) { IsBackground = true };
+		thief.Start();
 
 		for (var round = 0; round < rounds; round++) {
 			deque.TryPushBottom(round);
-			var start = new ManualResetEventSlim(false);
-			var ownerGot = false;
-			var thiefGot = false;
-
-			var thief = new Thread(() => {
-				start.Wait();
-				thiefGot = deque.TrySteal(out _);
-			}) { IsBackground = true };
-			thief.Start();
-
-			start.Set();
-			ownerGot = deque.TryPopBottom(out _);
-			Assert.That(thief.Join(TimeSpan.FromSeconds(5)), Is.True, "thief wedged");
+			barrier.SignalAndWait(); // release owner and thief together, right before the race
+			var ownerGot = deque.TryPopBottom(out _);
+			barrier.SignalAndWait(); // rendezvous again: thiefGot is now safe to read
 
 			if (ownerGot && thiefGot) doubleTaken++;
 			if (!ownerGot && !thiefGot) lost++;
+			if (!ownerGot && thiefGot) thiefWins++;
 			while (deque.TryPopBottom(out _)) { }
 		}
+
+		Assert.That(thief.Join(TimeSpan.FromSeconds(10)), Is.True, "thief wedged");
 
 		Assert.Multiple(() => {
 			Assert.That(doubleTaken, Is.EqualTo(0), "the same key was handed to two workers");
 			Assert.That(lost, Is.EqualTo(0), "an item vanished — neither end got it");
+			Assert.That(thiefWins, Is.GreaterThan(0), "the race was never sampled");
 		});
 	}
 

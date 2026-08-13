@@ -41,6 +41,7 @@ internal sealed class WorkStealingDeque {
 	private PaddedLong _bottom;
 
 	internal WorkStealingDeque(int capacity) {
+		ArgumentOutOfRangeException.ThrowIfGreaterThan(capacity, 1 << 30);
 		var n = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(capacity, 2));
 		_buffer = new int[n];
 		_mask = n - 1;
