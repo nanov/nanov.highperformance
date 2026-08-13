@@ -445,11 +445,20 @@ winning it, goes through the shared `ReleaseAndMaybeSchedule` path (§4.4) — n
 > one worker, never a second owner. It stays benign because there is still exactly one token in
 > flight per legitimate schedule event.
 >
-> Separately, `Activate`'s unconditional `Interlocked.Exchange(State, Owned)` still does not verify
-> it won the key before taking ownership. That is fine with one worker (there is no second claimant
-> to lose to) but **must become a validating claim before a second worker exists** — with two
-> workers racing to acquire the same popped index, both could otherwise drain one mailbox from the
-> same `Head`, destroying per-key order. That remains a Phase 2 entry criterion.
+> **Closed in Phase 2a.** `Activate`'s claim is now a validating CAS, not a blind exchange:
+> `Interlocked.CompareExchange(ref cell.State, CellState.Owned, CellState.Scheduled)`. Losing it means
+> "not ours" — the worker counts the rejection (`RejectedClaims`) and returns without touching the
+> cell, per §4.2's discipline. A reviewer enumerated all eight writers of `cell.State` in the shipped
+> code and established that while a schedule token is outstanding, every *other* writer that could
+> touch the cell requires a comparand of `Free` (the producer's dispatch CAS, the worker's own release
+> CAS, `Harvest`'s and `EvictFree`'s `Free → Reclaiming` claims) and therefore fails against
+> `Scheduled` — so `Scheduled` is both the correct and the complete comparand, and no legitimate token
+> can be dropped by this CAS. This also *removed* a latent strand that the old unconditional
+> `Interlocked.Exchange(State, Owned)` carried: at one worker it was harmless (no second claimant to
+> race), but the blind exchange could stomp `Owned` directly over a producer-held `Reclaiming` had a
+> second worker ever raced it — the CAS makes that structurally impossible instead of merely
+> improbable. With two workers now real, this was the load-bearing half of the Phase 2 entry
+> criterion, and it is closed.
 
 ### 5.6 Completion and termination detection
 
@@ -531,6 +540,26 @@ same way and test it the same way.
    > exists: worker A publishes the count that completes the sum while workers B…N sit parked, and
    > without the broadcast they park forever. **The scheduler-seam task must add it** — it is the
    > single most likely way Phase 2 hangs.
+   >
+   > **Implemented in Phase 2a.** `PublishProcessed` — the same per-32-message publish path that writes
+   > `_processedPublished[w.Id]` — evaluates `IsQuiescent()` immediately after the write and, if true,
+   > gates the actual `WakeAll()` behind a one-shot `Interlocked.Exchange(ref _quiescenceBroadcast, 1)
+   > == 0`. The check lives *here*, on the per-batch publish path, precisely because this is the site
+   > where a worker's own publish can be the one that pushes the running sum over `_dispatchedFinal` —
+   > nowhere else in the loop observes that transition. `IsQuiescent()` is reused as-is: flag read
+   > first, counts second, the order this section already corrected above.
+   >
+   > It has a real guard, not just a green build: `Quiescence_Broadcast_Releases_Peers_Parked_Before_
+   > The_Last_Publish` (`tests/…/Threading/Actors/MultiWorkerTests.cs`) holds one worker inside its
+   > handler via a rendezvous so its seven peers park with nothing to do, fires `TryComplete` while
+   > that worker is still busy — `TryComplete`'s own unconditional `WakeAll` reaches the parked peers
+   > but is rejected as not-yet-quiescent (the busy worker's message is still in flight) and they
+   > re-park — and only the busy worker's *own* final publish, the first to observe `IsQuiescent() ==
+   > true`, can release them. Disabling the broadcast block makes this test stall instead of fail —
+   > verified. (`Quiescence_Broadcast_Fires_At_Most_Once` and the N=8 lifecycle smoke test
+   > `Eight_Workers_All_Complete_After_Drain` exercise the idempotence and the common case respectively,
+   > but neither forces the broadcast to be the *only* thing that can release a parked peer — see the
+   > doc comment on the smoke test for why not.)
 
 **Parking is arm-then-recheck, with the quiescence predicate inside the recheck**: raise the parked
 flag → `Interlocked.MemoryBarrier()` → re-check work availability *and* quiescence → park. Collapsing
@@ -624,6 +653,31 @@ answers "which worker gets this newly-dirty key."
 > consecutive local draining — check the ring every K local activations, or whenever the local list
 > holds only the index just released — and the B-vs-D benchmark should include a
 > hot-key-plus-starved-key workload so the difference is measured rather than argued.
+>
+> **Phase 2a implements the bound but has not proven it is needed.** `RoutedScheduler.LocalDrainBound`
+> (default 16, documented on the property itself as "a guess pending measurement, not a result") caps
+> consecutive acquisitions from a worker's local stack before its ring gets priority (`TryAcquire`).
+> But the sustained-load stress test (`Eight_Workers_Sustained_Load_Preserves_Order_And_Loses_Nothing`)
+> does **not** reproduce starvation: setting the bound to `int.MaxValue` — effectively unbounded local
+> draining — made no measurable difference to that test's timing (168/130 ms vs 182/188 ms). Say this
+> plainly: the bound exists in code, but its necessity is **not demonstrated** by anything in the
+> current suite. That test round-robins dispatch across keys, which never lets one key monopolize a
+> worker's local stack for long — it simply is not shaped to trigger the hazard.
+>
+> A test that would actually reproduce starvation needs three things the current suite lacks:
+> - a single hot key dispatched **densely and consecutively** (not round-robin interleaved with other
+>   keys), with a small `batchBound` so every activation self-reschedules onto the same worker's local
+>   stack many times in a row instead of draining once and stopping;
+> - a victim key routed onto **that same worker's ring**, which requires `RoutingPolicy.RoundRobin` for
+>   deterministic placement — `LeastLoaded` routing actively spreads work away from a worker that is
+>   visibly busy, which defeats the setup before it starts;
+> - hot-key volume far exceeding the bound, and an assertion on *when* the victim's message is handled
+>   relative to the hot stream: unbounded, the victim should never be serviced until the hot stream
+>   ends; bounded, it should be serviced within roughly `LocalDrainBound × batchBound` hot messages.
+>
+> The B-vs-D benchmark (§10) must include this workload — not a generic hot-key-plus-starved-key
+> mention, but specifically dense-consecutive-hot-key + round-robin-placed victim + a bound-relative
+> latency assertion — or the question this section raises stays unanswered indefinitely.
 
 **Load metric = queued key count** (`QueuedApprox`), not queued messages. Message-depth load is the
 "truer" metric, but it is stale the instant it is read and the router would pay cross-core reads per
@@ -789,6 +843,14 @@ it will not. Measure cardinality independently of skew for that reason.
 
 ## 11. Known limitations and upgrade path
 
+**Phase 2a delivered the machinery, not the result.** The experiment's central question — push-side
+(B) vs. pull-side (D) — is still unanswered: scheduler D and the head-to-head B-vs-D benchmark are
+both outstanding (§6.2, §10 are unimplemented; Phase 2b and Phase 3 in the roadmap below). What exists
+today is an N-worker key-affine processor running behind a pluggable scheduler seam with one scheduler
+(B) proven correct under churn — not a comparison, and not evidence that dynamic balancing beats
+static sharding. Treat every throughput number produced against Phase 2a as a sanity check on B alone,
+not as an answer to §1's question.
+
 | Limitation | v1 stance | Upgrade |
 | --- | --- | --- |
 | **Per-key ring is bounded ⇒ a full key blocks the single producer entirely** (head-of-line across all keys) | accept, measure — `TryDispatch` (§5.4) makes the cost visible | bigger chunks → v2 chaining |
@@ -798,6 +860,65 @@ it will not. Measure cardinality independently of skew for that reason.
 | Terminology: "actor" is used loosely here and means the *worker* in the shipped `Threading.Workers` README | deliberately parked; v1 has no per-key state, so nothing turns on it yet | resolve when per-key state lands |
 | Single producer | accept | out of scope |
 | Fixed worker count, no idle-timeout exit | accept; instrument park rate | dynamic sizing once measured |
+| **Scheduler D does not exist yet** — only B is implemented | accept for Phase 2a | build D (Phase 2b) |
+| **The B-vs-D benchmark has not run** — the experiment's question (§1) is open | accept for Phase 2a | Phase 3 |
+
+### Known defects
+
+Two live problems in the Phase 2a code, recorded here with enough mechanism that whoever fixes them
+does not have to rediscover it.
+
+#### (a) Lost wakeup on the chunk-exhaustion backpressure path — currently causes an intermittently red test suite
+
+`WaitForChunk` (§5.4 source: `ActorSystem.BindChunk`'s slab-exhaustion path) arms the producer's parked
+flag and blocks **without re-running `Harvest()` inside the armed window**. Its own comment argues no
+recheck is needed because "only a harvest adds a chunk, and only this thread harvests" — true, but it
+answers the wrong question. The predicate that actually matters is "has some cell reached `Free` since
+my last scan", and that predicate *is* producer-visible and can change while `WaitForChunk` is arming.
+
+Compounding it, `ReleaseAndMaybeSchedule` reads `_producerParked` **before** it publishes
+`Interlocked.Exchange(ref cell.State, CellState.Free)`. So the interleaving is: the producer's last
+`Harvest()` scan finds nothing free and returns to `BindChunk`; the worker finishes a key and reads
+`_producerParked` as `false` (the producer has not armed yet) and skips the `Set`; the worker then
+publishes `Free`; the producer arms, fences, finds no recheck to run, and sleeps a full 20 ms poll with
+a harvestable chunk already sitting there.
+
+Liveness is safe — the bounded 20 ms poll guarantees the producer eventually wakes and re-scans — so
+this is a **throughput and tail-latency defect, not a correctness one**. It reproduces as
+`Harvest_Racing_Release_Never_Strands` (`tests/…/Threading/Actors/ActorSystemStressTests.cs`) failing
+roughly one run in three under load, wedging around 100,000–120,000 of 128,000 dispatches against a
+90 s budget. That test's failure message ("likely a stranded key") is misleading — nothing is
+stranded; the producer is simply asleep for up to 20 ms at a time with harvestable work available,
+which is enough to blow the budget under contention.
+
+**The fix**: re-run `Harvest()` inside `WaitForChunk`'s armed window (mirroring `WaitForMailboxSpace`'s
+recheck shape), and move the worker's `_producerParked` read in `ReleaseAndMaybeSchedule` to
+**immediately after** the `Interlocked.Exchange(ref cell.State, CellState.Free)` and **before** the
+tail-check/reschedule branch — reading it after the reschedule CAS instead would let `State` already be
+back to `Scheduled` by the time the flag is checked, making the wake a no-op. Bonus: because
+`Interlocked.Exchange` is a full fence, moving the `_producerParked` read after it also retroactively
+StoreLoad-orders the earlier `Volatile.Write(cell.Head, …)` in the same method — which likely closes the
+separately-recorded `WaitForMailboxSpace` debt (§5.4's known-debt blockquote) as a side effect, since
+that debt is exactly the missing StoreLoad ordering between a worker's `Head` publish and its
+`_producerParked` read.
+
+#### (b) The router's fault path converts a process kill into a silent hang
+
+`RoutedScheduler.RouteLoop` (§6.1) now catches an exception from its own body, sets its `Stopping`
+flag and signals every wait primitive it owns — a real improvement over the exception escaping and
+killing the process. But `Stopping` is scheduler-private state; `IKeyScheduler` has no fault channel
+back to `ActorSystem`, so `ActorSystem._stopped` is never set and stays `false`. Workers wake once from
+the router's signal, find `IsQuiescent()` false (the key the router was routing when it faulted is
+never delivered, so its messages are never processed and the dispatched/processed sum never converges),
+and re-park on an unbounded `Wait` — nothing will ever signal that event again, since the router thread
+has already returned. `Completion` never resolves.
+
+Net improvement in blast radius over the pre-fix behaviour (one dead router used to take the whole
+process down; now it only wedges this one `ActorSystem`), but the stated goal — "nobody left parked" —
+is not achieved. The root gap is structural: `IKeyScheduler` needs a fault channel to
+`ActorSystem`'s `_completionError` / `_completion`, the same escape hatch `RunLoop`'s own `try`/`catch`
+already has for a worker-thread fault, so a scheduler-owned background thread's fault can actually
+resolve `Completion` (faulted, not hung) instead of dead-ending on a flag nothing reads.
 
 ### v2 — chained chunks
 
