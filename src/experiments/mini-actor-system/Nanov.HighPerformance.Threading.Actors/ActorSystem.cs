@@ -52,6 +52,7 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	private int _completeGate;
 	private int _disposeGate;
 	private int _quiescenceBroadcast;
+	private int _quiescenceWakes; // test hook only — counts actual WakeAll calls, not the gate flag
 
 	/// <param name="handler">
 	///   The handler prototype. The producer keeps its own copy of it, and every worker gets a further
@@ -481,26 +482,36 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	///     publisher is also the sole predicate evaluator — which is why Phase 1 omitted it.
 	///   </para>
 	///   <para>
-	///     Order: publish → observe the sum → read <c>_completed</c> → wake. This is the OPPOSITE of
-	///     <see cref="IsQuiescent" />, which reads <c>_completed</c> FIRST — the two ask different
-	///     questions. <c>IsQuiescent</c> needs "if I see completed, I must see the counts" (so the flag
-	///     must be read first, or a stale count could hide behind a fresh flag). This check needs "if I
-	///     just completed the sum, is completion signalled?" — reading the flag before the sum here would
-	///     let a stale flag suppress the broadcast on the very publish that made it true.
+	///     Reuses <see cref="IsQuiescent" /> as-is — flag FIRST, counts second. <c>_dispatchedFinal</c> is
+	///     0 until <see cref="TryComplete" /> publishes it, so a sum-first check (<c>sum &gt;= 0</c>) is
+	///     unconditionally true for the entire pre-completion life of the system; a worker that then reads
+	///     a freshly-set <c>_completed</c> would burn the one-shot gate on a PARTIAL sum, and the real
+	///     broadcast — at genuine quiescence — could never fire again, hanging every parked peer forever.
+	///     Reading the flag first is what makes "observed completed ⇒ observed the real final count" hold
+	///     (<see cref="TryComplete" /> publishes <c>_dispatchedFinal</c> before <c>_completed</c>), so the
+	///     gate can only ever be burned at true quiescence. This is also why the flag-first order is safe
+	///     even though it looks backwards next to <see cref="TryComplete" />'s unconditional
+	///     <c>SignalStop()</c>: a SUPPRESSED broadcast here is rescued three ways — <c>TryComplete</c>'s
+	///     own unconditional wake, this worker's own next publish within 32 messages, and the exit-path
+	///     publish in <c>RunLoop</c>'s <c>finally</c> — while a PREMATURE one is not rescuable at all,
+	///     because the gate is one-shot.
 	///   </para>
 	///   <para>
 	///     <see cref="Interlocked.Exchange(ref int, int)" /> on <see cref="_quiescenceBroadcast" /> gates
 	///     the actual <see cref="IKeyScheduler.WakeAll" /> call to at most once for the system's lifetime
 	///     — this runs every 32 messages on the drain loop's warm path, so a repeated broadcast would be a
 	///     wake storm. A worker that parks after the broadcast still re-checks quiescence inside its own
-	///     arm-then-recheck (<see cref="WaitForWork" />), so it cannot miss the exit.
+	///     arm-then-recheck (<see cref="WaitForWork" />), so it cannot miss the exit. Flag-first also
+	///     collapses the common (not-yet-quiescent) case to a single cheap bool read, instead of an
+	///     O(workers) sum plus a <c>long</c> read on every publish.
 	///   </para>
 	/// </summary>
 	private void PublishProcessed(WorkerState<THandler> w) {
 		Volatile.Write(ref _processedPublished[w.Id].Value, w.ProcessedLocal);
-		if (QuiescentSum() >= Volatile.Read(ref _dispatchedFinal) && _completed &&
-			Interlocked.Exchange(ref _quiescenceBroadcast, 1) == 0)
+		if (IsQuiescent() && Interlocked.Exchange(ref _quiescenceBroadcast, 1) == 0) {
+			Interlocked.Increment(ref _quiescenceWakes);
 			_scheduler.WakeAll();
+		}
 	}
 
 	private void SafeOnError(Exception error) {
@@ -666,5 +677,10 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		}
 	}
 
-	internal int QuiescenceBroadcasts => Volatile.Read(ref _quiescenceBroadcast);
+	/// <summary>
+	///   Number of times <see cref="IKeyScheduler.WakeAll" /> was actually called for quiescence — NOT the
+	///   gate flag, which is always 0 or 1 by construction and so cannot distinguish "gated correctly"
+	///   from "never checked, never broadcast."
+	/// </summary>
+	internal int QuiescenceWakes => Volatile.Read(ref _quiescenceWakes);
 }

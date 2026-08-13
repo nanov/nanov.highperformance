@@ -1,8 +1,8 @@
 namespace Nanov.HighPerformance.Tests.Threading.Actors;
 
-using Nanov.HighPerformance.Tests.Threading.Workers;
 using Nanov.HighPerformance.Threading.Actors;
 using Nanov.HighPerformance.Threading.Actors.Schedulers;
+using Nanov.HighPerformance.Tests.Threading.Workers;
 using NUnit.Framework;
 
 [TestFixture]
@@ -23,7 +23,7 @@ public class MultiWorkerTests {
 
 		Assert.Multiple(() => {
 			Assert.That(state.HandledCount, Is.EqualTo(500));
-			Assert.That(system.QuiescenceBroadcasts, Is.LessThanOrEqualTo(1),
+			Assert.That(system.QuiescenceWakes, Is.LessThanOrEqualTo(1),
 				"the quiescence broadcast must be idempotent — it is on the per-32-message publish path");
 		});
 	}
