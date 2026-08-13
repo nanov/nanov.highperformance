@@ -51,6 +51,7 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	private Exception? _completionError;
 	private int _completeGate;
 	private int _disposeGate;
+	private int _quiescenceBroadcast;
 
 	/// <param name="handler">
 	///   The handler prototype. The producer keeps its own copy of it, and every worker gets a further
@@ -469,8 +470,38 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		else _scheduler.Schedule(index);
 	}
 
-	private void PublishProcessed(WorkerState<THandler> w) =>
+	/// <summary>
+	///   Publish this worker's processed count, and — if that publish just satisfied quiescence —
+	///   broadcast so parked peers can exit.
+	///   <para>
+	///     <b>This second wake edge is required at N &gt; 1</b> (§5.6). Without it, the worker whose
+	///     publish completes the sum simply carries on to its own idle check and exits, while every
+	///     other worker stays parked forever with nothing left to wake them: no further message will ever
+	///     be processed, so no further publish will ever occur. At N = 1 it is unreachable — the sole
+	///     publisher is also the sole predicate evaluator — which is why Phase 1 omitted it.
+	///   </para>
+	///   <para>
+	///     Order: publish → observe the sum → read <c>_completed</c> → wake. This is the OPPOSITE of
+	///     <see cref="IsQuiescent" />, which reads <c>_completed</c> FIRST — the two ask different
+	///     questions. <c>IsQuiescent</c> needs "if I see completed, I must see the counts" (so the flag
+	///     must be read first, or a stale count could hide behind a fresh flag). This check needs "if I
+	///     just completed the sum, is completion signalled?" — reading the flag before the sum here would
+	///     let a stale flag suppress the broadcast on the very publish that made it true.
+	///   </para>
+	///   <para>
+	///     <see cref="Interlocked.Exchange(ref int, int)" /> on <see cref="_quiescenceBroadcast" /> gates
+	///     the actual <see cref="IKeyScheduler.WakeAll" /> call to at most once for the system's lifetime
+	///     — this runs every 32 messages on the drain loop's warm path, so a repeated broadcast would be a
+	///     wake storm. A worker that parks after the broadcast still re-checks quiescence inside its own
+	///     arm-then-recheck (<see cref="WaitForWork" />), so it cannot miss the exit.
+	///   </para>
+	/// </summary>
+	private void PublishProcessed(WorkerState<THandler> w) {
 		Volatile.Write(ref _processedPublished[w.Id].Value, w.ProcessedLocal);
+		if (QuiescentSum() >= Volatile.Read(ref _dispatchedFinal) && _completed &&
+			Interlocked.Exchange(ref _quiescenceBroadcast, 1) == 0)
+			_scheduler.WakeAll();
+	}
 
 	private void SafeOnError(Exception error) {
 		try {
@@ -634,4 +665,6 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 			return sum;
 		}
 	}
+
+	internal int QuiescenceBroadcasts => Volatile.Read(ref _quiescenceBroadcast);
 }
