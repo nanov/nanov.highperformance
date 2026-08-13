@@ -187,10 +187,8 @@ public class WorkStealingSchedulerTests {
 			// Dispose only on the success path. Not because the worker could still reach
 			// `started.Set()` after this returns — `Set()` is the lambda's FIRST statement, and the
 			// assert above already confirmed `started.Wait()` returned, so it has provably already run
-			// by this point. The guard is simply harmless to keep: CountdownEvent-style primitives throw
-			// ObjectDisposedException unconditionally from a Set/Signal on a disposed instance, which
-			// would crash the test host from a background thread instead of leaving a readable
-			// assertion failure, so skipping dispose on the timeout path costs nothing.
+			// by this point. The guard is simply harmless to keep, and skipping dispose on the timeout
+			// path — the one path where the worker's state is genuinely unknown — costs nothing.
 			started.Dispose();
 			return Volatile.Read(ref acquired) == key;
 		}

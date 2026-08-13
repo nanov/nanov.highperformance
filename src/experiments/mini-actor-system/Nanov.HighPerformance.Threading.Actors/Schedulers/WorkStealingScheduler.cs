@@ -133,8 +133,12 @@ public struct WorkStealingScheduler : IKeyScheduler {
 	///   <para>
 	///     The candidate remedy — having <c>DispatchCore</c> restore the cell to <c>Free</c> before the
 	///     exception escapes — is only PARTIAL even if made: it stops the cell from being stuck forever,
-	///     but quiescence for THIS dispatch still needs a later dispatch to the same key to re-arm and
-	///     drain it. Recorded here as a known gap; not implemented — <b>do not change the logic.</b>
+	///     but quiescence for THIS dispatch still needs something to re-arm the cell — either a later
+	///     dispatch to the same key, or a <c>Harvest()</c> triggered by chunk pressure from ANY key,
+	///     which claims <c>Free -&gt; Reclaiming</c>, finds <c>Tail != head</c> and reschedules. Harvest is
+	///     producer-only, pre-<c>TryComplete</c>, and runs only under chunk exhaustion, so it narrows the
+	///     gap without closing it. Recorded here as a known gap; not implemented —
+	///     <b>do not change the logic.</b>
 	///   </para>
 	/// </summary>
 	public readonly void Schedule(int cellIdx) {

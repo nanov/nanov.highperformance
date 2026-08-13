@@ -1064,7 +1064,7 @@ Phase 2b task report overstated it on the strength of those 5 methods.** The res
 scheduler-specific: `ActorSystemTests` (33 tests) and `ActorSystemStressTests` (8 tests) run only under
 `SingleWorkerScheduler`; `FaultPropagationTests` (3 tests) runs only under `RoutedScheduler`; and
 `MultiWorkerTests` (6 tests) runs 5 under `RoutedScheduler` and 1 under `SingleWorkerScheduler`. None of
-these three fixtures runs any test under `WorkStealingScheduler`. Concretely, **the following have never
+those four fixtures runs any test under `WorkStealingScheduler`. Concretely, **the following have never
 run under D**: backpressure (`WaitForMailboxSpace` / `WaitForChunk`, in `ActorSystemTests` /
 `ActorSystemStressTests`), `TryDispatch`, hard-stop semantics, zero-allocation, and fault propagation.
 Nothing structurally prevents extending any of these to `WorkStealingScheduler` — it is unclaimed
@@ -1147,8 +1147,10 @@ into "D is slower":
    overwhelming majority of calls are the empty poll, not a successful pop — does two `Volatile.Write`s
    plus an `Interlocked.MemoryBarrier()`, dirtying the cache line every peer reads in `HasWork`'s scan.
    `TryAcquire` calls it unconditionally, and `WaitForWork` returns with no backoff whenever `HasWork` is
-   true, so a worker that just lost a steal can re-enter this path in a tight loop — up to 3.75 failed
-   acquires per message by §9's measured numbers. The standard early-out other implementations use
+   true, so a worker that just lost a steal can re-enter this path in a tight loop. Deriving the rate
+   carefully, because it is easy to overstate: §9 measures up to 3.75 `StealsAttempted` *increments* per
+   message, and a fully failed scan costs `workers - 1` = 7 of them, so that is up to roughly **0.54
+   failed acquires per message** — not 3.75. The standard early-out other implementations use
    (`if (_bottom.Value - Volatile.Read(ref _top.Value) <= 0) return false;`, as .NET's
    `ThreadPoolWorkQueue` carries) would remove the write-and-fence on the empty path entirely.
    **Recommended as the first act of Phase 3, before the benchmark runs**, so that D is measured in the
