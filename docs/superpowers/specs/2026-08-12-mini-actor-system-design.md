@@ -428,6 +428,14 @@ v1 per-key bound — the number that decides whether v2 chaining is worth buildi
 > tail-latency cliff on the backpressure path. Fix (a short spin before parking, matching
 > `SpRingCore.WaitForSpaceSlow`, or a fence before the worker's `_producerParked` read) is deferred
 > pending measurement.
+>
+> **Narrowed since this was written.** "The worker's wake sites" is now too broad: the **release** site
+> (`ReleaseAndMaybeSchedule`) reads `_producerParked` immediately after
+> `Interlocked.Exchange(ref cell.State, Free)`, which is a full fence, so that site is StoreLoad-ordered
+> and no longer carries this debt. What remains is **`Activate`'s mid-batch flush** alone — the
+> per-32-message `Volatile.Write(ref cell.Head, …)` followed by a plain `_producerParked` read. Still
+> real, still bounded by the 20 ms poll, still deferred. See §11 known defect (a) for the fix that
+> narrowed it.
 
 A rejected `TryDispatch` does **not** increment `_dispatched` (§5.6).
 
@@ -506,7 +514,9 @@ makes the sum too *low*, never too high. An under-count delays quiescence; it ca
 **Cheap where it matters.** The hot-path cost is a worker-private store, published at the cadence of
 the batched `Head` flush that already exists. (Same cadence — a *different* cache line, since
 `_processed[i]` is per worker and `Head` is per cell.) The O(N) sum runs only on the idle path after
-completion, and §8 already plans these counters.
+completion. (An earlier draft added "and §8 already plans these counters" — §8 planned per-worker
+`activations` / `messages` counters that were never built, so the `_processed[i]` array shipped as
+`ActorSystem`'s own state, not as scheduler observability. Nothing in §8 backs this path.)
 
 #### Load order is load-bearing
 
@@ -612,16 +622,32 @@ disposal take N seconds. `Completion` resolves as `OperationCanceledException`, 
 
 ## 6. Scheduler seam
 
+The nine members as shipped (`Schedulers/IKeyScheduler.cs` is the authority; this listing is a
+convenience and must be re-read against the file before it is relied on):
+
 ```csharp
 interface IKeyScheduler {
-  void Schedule(int cellIdx);                       // producer first-dirty, or worker self-reschedule
-  bool TryAcquire(int workerId, out int cellIdx);   // non-blocking; may steal
-  bool WaitForWork(int workerId);                   // park (arm-then-recheck, §5.6); false ⇒ exit
-  void WakeAll();                                   // unconditional broadcast — shutdown only
-  void Start(int workerCount);
+  void Start(int workerCount, Action<Exception> onFault);  // onFault: for a scheduler owning a thread
+  void Schedule(int cellIdx);                              // producer first-dirty ONLY
+  void ScheduleLocal(int workerId, int cellIdx);           // worker self-reschedule — a separate member
+  bool TryAcquire(int workerId, out int cellIdx);          // non-blocking; may steal
+  bool HasWork(int workerId);                              // racy by design; read before parking
+  void ArmWait(int workerId);                              // Reset(), then raise the parked flag
+  void Wait(int workerId);                                 // block until woken
+  void WakeAll();                                          // unconditional broadcast — shutdown only
   void SignalStop();
 }
 ```
+
+> **This differs from an earlier draft of this spec in four ways, all deliberate.** That draft gave
+> `Schedule` double duty ("producer first-dirty, *or* worker self-reschedule") and exposed a single
+> `bool WaitForWork(int workerId)` seam member. As shipped: self-reschedule is its own member,
+> `ScheduleLocal`, because it must reach the *calling worker's* own local structure (B's private stack,
+> D's own deque) and a shared `Schedule` cannot express that; and `WaitForWork` is **not a seam member
+> at all** — it is `ActorSystem`'s own method, built from `HasWork` / `ArmWait` / `Wait`. Splitting it
+> that way is what lets `ActorSystem` own the arm-then-recheck sequence and put the *quiescence*
+> predicate inside the recheck (§5.6), which a scheduler cannot see. `Start` also gained the `onFault`
+> channel so a scheduler-owned background thread's death can fault `Completion` rather than wedge it.
 
 Devirtualized the same way handlers are: `where TScheduler : struct, IKeyScheduler`, the struct
 wrapping a reference to shared state (the `Rec` / `RecordingState` pattern from `SpWorkerTests`).
@@ -629,6 +655,11 @@ wrapping a reference to shared state (the `Rec` / `RecordingState` pattern from 
 **Queues can never overflow.** A key index is in at most one place at a time (§3.1), so total
 indices in flight is bounded by key-map capacity. Size the scheduler queues to that and there is no
 backpressure logic in the scheduler at all.
+
+> **That last sentence is now too flat.** D's global queue does carry a bounded retry loop on the
+> enqueue side — see §6.2. It is not backpressure in the sizing sense the paragraph means (the queue
+> still cannot durably fill), but it is a wait, and it has a ~65 ms worst-case tail. Read §6.2's retry
+> subsection before quoting "no backpressure logic in the scheduler at all".
 
 ### 6.1 B — Routed (push-side)
 
@@ -659,9 +690,13 @@ answers "which worker gets this newly-dirty key."
 > so D is largely immune. That asymmetry is a real, testable difference between the two schedulers
 > and it is not something the original affinity argument accounted for.
 >
-> *(Both halves of that paragraph now need scoping — the B half is still argued rather than measured,
-> and D's immunity holds only at **N ≥ 2**. See the four caveats under the Phase 2b block below before
-> quoting it.)*
+> *(Every clause of that paragraph now needs scoping. The B half is still argued rather than measured;
+> D's immunity holds only at **N ≥ 2**; and — most importantly — **"a thief can steal B" is the one
+> part the measurement contradicts.** In the D arm the victim was rescued through the **global queue**,
+> not by a steal: `GlobalDequeues` was constant at 2 (the two keys' initial schedules) in all 20
+> executions, and 0–1 steals succeeded per run out of 18–33 attempts. Stealing is not the rescue
+> mechanism that was measured. See the four caveats under the Phase 2b block below before quoting any
+> of this.)*
 >
 > Phase 1 ships as-is (single worker, hazard recorded). The scheduler-seam task must bound
 > consecutive local draining — check the ring every K local activations, or whenever the local list
@@ -685,6 +720,14 @@ answers "which worker gets this newly-dirty key."
 > | bounded | B | 16 | 1 | **17** — exactly `LocalDrainBound + 1` |
 > | unbounded | B | `int.MaxValue` | 1 | **3000** — exactly `HotMessages`, the entire stream |
 > | work stealing | D | none | 4 | **0** |
+>
+> **The D arm contains no rescuing steal, and the table must not be read as one.** `GlobalDequeues` was
+> constant at **2** — the two keys' initial schedules — in every one of the 20 executions, so the victim
+> was picked up from the *global queue* by an idle worker. Steals did occur (0–1 succeeded per run, out
+> of 18–33 attempted), but none of them was the rescue. This is consistent with §6.2's depth-1 deque
+> finding: D's steals only ever come from the one-push-wide window between a worker's push and its own
+> next pop, which is not where a starved key sits. What the D arm demonstrates is *a shared structure an
+> idle peer can drain*, not *stealing*.
 >
 > **Zero variance on every value across 20 executions** (10 runs × 2 TFMs), and the assertion threshold
 > of 200 sits strictly inside the 17-to-3000 gap rather than inside either distribution. Both B positions
@@ -723,14 +766,20 @@ answers "which worker gets this newly-dirty key."
 >    setup before it starts), but nothing in these runs measured it doing anything. Do not write that
 >    round-robin was required "as measured".
 > 4. **Severity scales with producer/consumer imbalance; the hazard is not unconditional.** At near-parity
->    — an earlier `Thread.SpinWait(200)` calibration, since abandoned — the unbounded arm starved the
->    victim in only about 60% of executions (4 of 10 landed below the threshold), with positions scattered
->    from 34 to 3000. Total starvation is a *sustained-backpressure* regime, reached here only at
->    `SpinWait(5000)`. Do not quote positions from the abandoned calibration; the shipped numbers are the
->    ones in the table.
+>    — an earlier `Thread.SpinWait(200)` calibration, since abandoned — the unbounded arm reproduced total
+>    starvation in only about 60% of executions. In that calibration's formal batch (10 executions,
+>    against **that batch's own threshold of `HotMessages / 2` = 1500**, *not* the 200 the shipped tests
+>    use) 4 executions landed below it, at positions 762, 775, 1360 and 1430; the passing 6 were 1992 and
+>    3000×5. A separate exploratory batch at the same spin value went as low as **34**. Total starvation
+>    is a *sustained-backpressure* regime, reached here only at `SpinWait(5000)`. Do not quote any
+>    position from the abandoned calibration, and do not read its failures against the shipped
+>    threshold — the two batches and the two thresholds are not interchangeable.
 >
-> The B-vs-D benchmark (§10) should still carry this workload at N > 1 on **both** schedulers. That is
-> what would turn caveats 1 and 2 from arguments into measurements.
+> The B-vs-D benchmark (§10) **must** carry this workload at N > 1 on **both** schedulers — not a
+> generic hot-key-plus-starved-key mention, but specifically dense-consecutive-hot-key +
+> round-robin-placed victim + a bound-relative latency assertion, now also at N > 1 and also under D.
+> That is the only thing that turns caveats 1 and 2 from arguments into measurements, and without it
+> the question this section raises stays half-answered indefinitely. It is written into §10's plan.
 
 **Load metric = queued key count** (`QueuedApprox`), not queued messages. Message-depth load is the
 "truer" metric, but it is stale the instant it is read and the router would pay cross-core reads per
@@ -773,20 +822,33 @@ order depends on claim order.
 
 #### As built (Phase 2b) — four deviations from the above
 
-The paragraphs above are the design as originally specified. `WorkStealingScheduler`,
-`GlobalKeyQueue` and `WorkStealingDeque` deviate from it in four places, each for a reason worth
-keeping:
+The paragraphs above are the design as originally specified and are **kept, not corrected in place**,
+so the reasoning that produced them stays readable. Three flat assertions in them are false as built and
+a skimmer hits them first: the diagram, the "Global queue" bullet and the closing "contained mini-C"
+paragraph all say **SPMC**, and the queue is **MPMC** — see deviation 1. `WorkStealingScheduler`,
+`GlobalKeyQueue` and `WorkStealingDeque` deviate from the text above in four places, each for a reason
+worth keeping:
 
 1. **The global queue is MPMC, not SPMC.** Overflow (bullet 3 above) means a worker whose deque is
    full spills into the same queue, so there are `workers + 1` possible enqueuers, not one. The
    enqueue side therefore CASes as well. It costs one CAS on a path that runs once per **activation**,
    not per message, and it removes a sizing invariant that would otherwise be silent to violate.
-2. **`HasWork` consults peer deques**, which the design above did not mention. Reporting only on the
-   worker's own deque and the global queue would let workers park while stealable work sits in a
-   peer's deque — **D would silently degenerate into B without a router.** No correctness test would
-   catch that, because quiescence still resolves; it is a liveness-*shaped* defect with a
-   throughput-only symptom. Mutation-verified: making `HasWork` ignore peers is caught
-   **deterministically, 15/15 on both TFMs**, by `An_Idle_Worker_Steals_From_A_Busy_Peer`.
+2. **`HasWork` consults peer deques.** The design above does not mention `HasWork` at all — the seam
+   member did not exist in that draft (see §6's note). Reporting only on the worker's own deque and
+   the global queue would let workers park while stealable work sits in a peer's deque — **D would
+   silently degenerate into B without a router.** No correctness test would catch that, because
+   quiescence still resolves; it is a liveness-*shaped* defect with a throughput-only symptom.
+   Mutation-verified: making `HasWork` ignore peers is caught **deterministically, 15/15 on both
+   TFMs**, by `An_Idle_Worker_Steals_From_A_Busy_Peer`. Do not "simplify" the peer scan away.
+
+   > **Its cost is unmeasured and belongs on the benchmark's suspect list.** The scan reads every
+   > peer's `CountApprox`, which loads that peer's `_bottom` — **the owner's hottest write line** —
+   > and `ActorSystem.WaitForWork` calls `HasWork` up to 32 times in its spin phase plus twice per
+   > park-loop iteration. At 8 workers that is a few hundred cross-core reads of 7 hot lines per park
+   > attempt. Nothing has measured it. It is the price of deviation 2 and it lands squarely on §13
+   > step 6: if D loses to B on low skew, **the park-path peer scan is a suspect alongside stealing
+   > overhead**, and the benchmark should be able to tell them apart rather than blaming the steal
+   > path by default.
 3. **D owns no threads, so it has no stop flag and never invokes `onFault`.** The seam's fault
    callback exists for a scheduler that runs its own thread and could die on it silently — B's router.
    `SignalStop` here only has to release parked workers so each can observe the system's own exit
@@ -795,6 +857,15 @@ keeping:
    Cohen / Zappa Nardelli (2013), as §12 requires. `Volatile` release/acquire does not order a store
    before a subsequent load of a different location on Apple Silicon; the deque needs exactly that
    ordering in `TryPopBottom` and `TrySteal`.
+
+> **A publication precondition that is easy to lose.** `GlobalKeyQueue`'s constructor writes non-zero
+> per-slot sequence stamps (`_cells[i].Sequence = i`) with **no publication fence**. That is safe today
+> only because of how it is used: the queue is constructed in `Start` and the worker threads are started
+> afterwards, and `Thread.Start` supplies the happens-before edge. **The instance must therefore never be
+> handed to already-running workers through a non-volatile field.** `WorkStealingScheduler.Start` guards
+> against *reuse* of a scheduler instance; it does not guard against *late publication*. Anyone who later
+> makes the global queue lazily created, resizable, or swappable at runtime ships an unfenced publication
+> unless they add the fence at the same time.
 
 #### The deque never holds more than one item — and what that invalidates
 
@@ -821,8 +892,11 @@ invalidates several things the design above implies:
 
 `GlobalKeyQueue.TryEnqueue` returning `false` means "not right now", never durable fullness: a
 participant preempted mid-claim makes a free slot look occupied. Both enqueue sites therefore retry —
-**64 attempts (1 initial + 63 retries), of which 44 escalate to `Thread.Sleep(1)`, giving a ~65 ms
-worst-case wall clock** on a path in the scheduler we are about to latency-benchmark. That escalation
+**64 attempts (1 initial + 63 retries), of which ~44 escalate to `Thread.Sleep(1)`, giving a ~65 ms
+worst-case wall clock** on a path in the scheduler we are about to latency-benchmark. (The escalation
+count is approximate on purpose: 44 was derived for a 64-`SpinOnce` loop, and the shipped loop makes 63
+calls — the removed one being the most-escalated — so 43 is the defensible figure. It was never
+re-measured, so treat it as ~44 and the wall clock as ~65 ms, not as exact.) That escalation
 is the right shape for the real mechanism: a `false` observed with `CountApprox == 0` proves the
 blocking stamp is a **full lap stale** — the participant holding it claimed position `pos − capacity`
 and has been stalled across roughly `capacity` subsequent operations. That is OS-preemption scale
@@ -834,11 +908,22 @@ failure**, reproduced 7 times in 40 runs on unmutated code — and it had passed
 explicitly classified it as "not a live defect". A one-shot retry was also measured insufficient
 (5/50 clean). `GlobalEnqueueRetries` (§8) is what says whether the tail is ever actually paid.
 
+**Only one of the two enqueue sites can reach that tail.** The code retries at both, but the spill site
+in `ScheduleLocal` is unreachable through this `ActorSystem`/scheduler pairing (see the depth-1 finding
+above). So the ~65 ms worst case belongs entirely to the **producer's `Schedule`** — which sharpens the
+latency point rather than softening it: the tail sits on the dispatch path, not on a worker's.
+
 ### 6.3 Expected outcome
 
 B should win on low skew (fewer atomics, one predictable hop). D should win on skew and variable
 cost (idle workers self-serve instead of waiting for a router judging by a stale `QueuedApprox`).
 **Steal rate is the number that says which regime you are in** — hence the counters in §8.
+
+> **Steal rate alone turned out not to be that number.** At the one configuration measured so far,
+> `GlobalDequeues` exceeded `StealsSucceeded` in **all 10 samples** (§9), and in the starvation workload
+> the rescue was a global-queue pickup with essentially no steals at all (§6.1). Read the steal rate
+> *against* `GlobalDequeues`, not on its own — a low steal rate may mean "no imbalance to fix" or it may
+> mean "the global queue is doing the redistribution", and those are different regimes.
 
 ## 7. Public API
 
@@ -883,6 +968,11 @@ dynamic sizing in v1: that is a control loop of its own (hysteresis, spawn laten
 bursty load) and it is orthogonal to the B-vs-D question this experiment exists to answer.
 Instrument park/unpark rate instead (§8) — heavy parking is the evidence for making it dynamic, and
 then it will have been measured rather than guessed.
+
+> **That instrumentation does not yet exist in usable form.** D's `Parks` counts park *intent*, not
+> sleeps (§8), and **there is no unpark counter at all**, so "park/unpark rate" is currently
+> unmeasurable and `Parks` over-counts by an unknown margin. B exposes no park counter either. Anyone
+> reaching for this evidence has to add the counters first.
 
 ## 8. Observability
 
@@ -976,7 +1066,10 @@ can run (64 chunks for 64 keys, 512 map slots), so a non-zero count there would 
 | `DequeOverflows` | 0 |
 | `GlobalEnqueueRetries` | 0 |
 
-**`GlobalDequeues` exceeded `StealsSucceeded` in 9 of the 10 samples.** At this configuration most
+**`GlobalDequeues` exceeded `StealsSucceeded` in all 10 of the 10 samples.** (The task report and this
+spec's first draft both said "9 of 10"; recomputing from the per-run table, the closest sample is
+11,056 steals against 12,025 global dequeues — still global. Because the table above prints ranges
+rather than paired rows, a reader cannot check this, so it is stated explicitly.) At this configuration most
 non-local acquisitions come from the global queue, not from stealing. The mechanism is
 cold-start-always-global plus a round-robin producer plus idle-worker abundance: with `batchBound: 1`
 and four keys round-robined, cells flip back to `Free` constantly, and every re-dirty is a cold start
@@ -1012,7 +1105,34 @@ Baselines: **N statically hash-sharded `SpWorker`s** (the design this must beat)
 `Channel<T>` + `ConcurrentDictionary` idiomatic equivalent.
 
 Axes: worker count; key cardinality; **key skew** (uniform → Zipf → single hot key); per-message
-handler cost (constant → high variance). Report throughput, p99 latency, and steal rate.
+handler cost (constant → high variance). Report throughput, p99 latency, and steal rate — and report
+`GlobalDequeues` alongside the steal rate, per §6.3, or a redistribution result gets attributed to
+stealing that the global queue actually did.
+
+**The head-to-head is B vs. D at the same worker count**, both against the two baselines above. That
+is §13's step 6 and it is the only thing that answers §1. Nothing measured before it compares the two
+schedulers on an isolated variable.
+
+#### Required workload: dense-hot-key + placed victim (the §6.1 starvation asymmetry)
+
+This one is **not optional**, and it is the workload §6.1's open caveats depend on. Not a generic
+"hot-key-plus-starved-key" mention — specifically:
+
+- a single hot key dispatched **densely and consecutively** (not round-robin interleaved), with a small
+  `batchBound` so every activation self-reschedules onto the same worker's local structure many times
+  in a row, and a per-message handler cost high enough that the producer stays ahead of the consumer —
+  §6.1 needed `Thread.SpinWait(5000)` to hold that precondition by construction rather than by luck;
+- a victim key placed on **that same worker's** ring/deque, which under B requires
+  `RoutingPolicy.RoundRobin` (`LeastLoaded` spreads work away from a visibly busy worker and defeats
+  the setup before it starts);
+- hot-key volume far exceeding `LocalDrainBound`, and an assertion on **when** the victim's message is
+  handled relative to the hot stream — a bound-relative latency assertion, not a wall-clock one;
+- **run at N > 1 and under both schedulers.** §6.1 measured B at 1 worker and D at 4, which varies two
+  factors at once; only the N > 1 cross-product separates "the scheduler" from "having idle peers", and
+  it is the only way to test whether D at `workers: 1` starves exactly as B does.
+
+Report the victim's position, not a duration: §6.1's positions are closed forms (`bound + 1`,
+`HotMessages`) and a regression shows up as a changed position long before it shows up in a timing mean.
 
 The honest expectation: this substrate is **more expensive per message than a single `SpWorker`**,
 and per §4.5 the cost is **two random accesses per message** (cell + chunk) against `SpWorker`'s one
@@ -1101,12 +1221,35 @@ concrete design so this limitation is not a vague gesture.
 > is so hard to observe end-to-end — and also why the ordering inside `ArmWait` must not be relaxed on
 > the grounds that "nothing failed".
 
-### Known defects
+### Known defects — STALE, both were addressed before this plan's base commit
 
-Two live problems in the Phase 2a code, recorded here with enough mechanism that whoever fixes them
-does not have to rediscover it.
+> **Read this before acting on either entry below.** Both were written against Phase 2a and both have
+> since had their prescribed fixes shipped — (a) in `c2f9506`, (b) in `658ae62` — *before* the Phase 2b
+> plan's base commit. **Phase 2b did not re-verify either**, so neither is declared closed here; what is
+> recorded is that **the stated mechanism no longer matches the code.** Each entry now carries a note
+> naming the shipped fix sites. Re-verify against the code before treating either as a live defect, and
+> in particular do not file a genuine new failure under (a) — its "intermittently red test suite" claim
+> is no longer true (see below).
 
-#### (a) Lost wakeup on the chunk-exhaustion backpressure path — currently causes an intermittently red test suite
+#### (a) Lost wakeup on the chunk-exhaustion backpressure path — FIXED in `c2f9506`; the text below describes the pre-fix code
+
+> **Status.** Both prescribed fixes are shipped. `WaitForChunk` re-runs `Harvest()` inside its armed
+> window (`ActorSystem.cs:296-303`), and `ReleaseAndMaybeSchedule` reads `_producerParked` **after**
+> `Interlocked.Exchange(ref cell.State, CellState.Free)` and before the tail-check branch
+> (`ActorSystem.cs:512-526`), with an in-code comment naming this defect. **The heading's original claim
+> that this "currently causes an intermittently red test suite", and the body's "roughly one run in three
+> under load", are both false as of this commit** — `Harvest_Racing_Release_Never_Strands` ran green in
+> roughly fifteen full-suite runs across Phase 2b. The mechanism below is kept only because it explains
+> *why* the two fix sites are where they are.
+>
+> **Consequence for §5.4: that section's known-debt blockquote is now over-broad.** It says the worker's
+> wake sites publish `Head` and then read `_producerParked` without StoreLoad ordering. The **release**
+> site no longer does — `Interlocked.Exchange` is a full fence and the `_producerParked` read now sits
+> after it, which retroactively orders the earlier `Volatile.Write(ref cell.Head, …)` against that read.
+> What still carries the debt is only **`Activate`'s mid-batch flush** (`ActorSystem.cs:480-487`), where
+> the per-32-message `Volatile.Write(cell.Head, …)` is followed by a plain `_producerParked` read with no
+> fence between them. That one is real, still bounded by the 20 ms poll, and deliberately unfixed
+> (out of scope for Phase 2b). Keep it recorded; drop the claim that it covers the release path too.
 
 `WaitForChunk` (§5.4 source: `ActorSystem.BindChunk`'s slab-exhaustion path) arms the producer's parked
 flag and blocks **without re-running `Harvest()` inside the armed window**. Its own comment argues no
@@ -1140,7 +1283,17 @@ separately-recorded `WaitForMailboxSpace` debt (§5.4's known-debt blockquote) a
 that debt is exactly the missing StoreLoad ordering between a worker's `Head` publish and its
 `_producerParked` read.
 
-#### (b) The router's fault path converts a process kill into a silent hang
+#### (b) The router's fault path converts a process kill into a silent hang — FIXED in `658ae62`; the text below describes the pre-fix code
+
+> **Status.** The root gap this entry names — *"`IKeyScheduler` has no fault channel back to
+> `ActorSystem`"* — no longer holds. `Start(int workerCount, Action<Exception> onFault)` ships
+> (`IKeyScheduler.cs:31`), `RoutedScheduler.RouteLoop` invokes `OnFault` first in its `catch`, before its
+> own stop-and-signal cleanup, so the exception is recorded before anyone can observe `Stopping`
+> (`RoutedScheduler.cs:179`), and `ActorSystem.Fault` records `_completionError`, sets `_stopped`,
+> calls `SignalStop()` and sets `_spaceAvailable` (`ActorSystem.cs:336-341`). So the specific mechanism
+> below — workers re-parking forever on a flag nothing reads — is broken at its first step: `_stopped`
+> *is* now set. **Not declared closed:** Phase 2b did not re-verify the end-to-end behaviour, and
+> `FaultPropagationTests` was not re-read as part of this write-up. Re-verify before relying on it.
 
 `RoutedScheduler.RouteLoop` (§6.1) now catches an exception from its own body, sets its `Stopping`
 flag and signals every wait primitive it owns — a real improvement over the exception escaping and

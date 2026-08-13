@@ -58,11 +58,22 @@ run. Phase 2b makes D exist and proves it correct, nothing more. Design detail l
   `Thread.Sleep(1)`: **~65 ms worst case**, which anyone budgeting dispatch tail latency needs to know.
   The escalation is right because a `false` with `CountApprox == 0` proves the blocking stamp is a full
   lap stale — OS-preemption scale, not a few instructions.
+- **The most transferable trap: a test that cannot detect the thing it is named for.** Hit **five times**
+  in this project. A deque race test whose thief always lost by 3–4 orders of magnitude, so forcing the
+  arbitrating CAS to `true` still passed. A parked-worker test whose `Thread.Sleep(50)` guaranteed the
+  schedule landed outside the arm window, making the exact defect it guarded invisible. A parked-system
+  completion test whose broadcast block could be deleted entirely. Each was caught **only** by mutating
+  the exact line the test names and requiring red — never by reading the test. **So: for any test whose
+  name asserts a race, a fence or an arbitration, mutate that specific line and confirm the test fails
+  before believing it.** A green suite is not evidence a guard works; it is evidence nothing broke
+  loudly.
 - **Process trap worth keeping.** Every fix round in this phase was a failure of *evidence*, never of
-  the scheduler: a mutation result that measured a different bug, a "spin" that was a 30 ms
-  `Thread.Sleep`, a threshold placed inside the distribution it was meant to separate, and a position
-  range quoted from an abandoned calibration. Attribute every number to the configuration that produced
-  it, and say "argued from the code, not measured" when that is what it is.
+  the scheduler — the production code was approved in round 0 and survived all three rounds unchanged.
+  The failures: a mutation result that measured a different bug, a "spin" that was a 30 ms
+  `Thread.Sleep`, a threshold placed inside the distribution it was meant to separate, a bound stated an
+  order of magnitude too tightly, and a position range quoted from an abandoned calibration. Attribute
+  every number to the configuration that produced it, and say "argued from the code, not measured" when
+  that is what it is.
 
 ## 2026-07-10 — Two spotted concurrency bugs fixed (Conflation NRE + Dispatch/TryComplete race)
 
