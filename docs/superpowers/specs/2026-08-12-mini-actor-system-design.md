@@ -1,6 +1,7 @@
 # Mini actor system — design
 
-**Status:** approved design, not yet implemented
+**Status:** Phase 1 (single worker) and Phase 2a (N workers, scheduler seam, scheduler B) implemented;
+scheduler D and the B-vs-D benchmark outstanding (§11). Unmerged.
 **Date:** 2026-08-12
 **Branch:** `experiment/mini-actor-system`
 
@@ -17,7 +18,12 @@ The experiment's question is a comparative one:
 > Given identical storage machinery, does **push-side scheduling** (a router assigning keys to
 > workers) or **pull-side scheduling** (workers taking and stealing keys) balance load better?
 
-Both schedulers are built. They differ by one type argument.
+The seam both schedulers plug into exists and is proven: `ActorSystem<TKey, T, THandler, TScheduler>`
+takes the scheduling policy as a `where TScheduler : struct, IKeyScheduler` type argument (§6, §7), so
+B and D are designed to differ by exactly that one type argument and nothing else in the call site.
+**Only B is built.** D (§6.2) and the head-to-head benchmark (§10) that would answer the question above
+are still outstanding — see §11 — so **the comparative question this section opens with is not yet
+answerable.** What Phase 2a establishes is that the seam itself does not force a choice between the two.
 
 ### Why not static hash sharding
 
