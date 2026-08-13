@@ -669,6 +669,15 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		}
 	}
 
+	internal int WorkersThatActivated {
+		get {
+			var n = 0;
+			foreach (var w in _workers)
+				if (Volatile.Read(ref w.Activations) > 0) n++;
+			return n;
+		}
+	}
+
 	internal int ProducerWakes {
 		get {
 			var sum = 0;
