@@ -66,53 +66,109 @@ public class WorkStealingSchedulerTests {
 	}
 
 	/// <summary>
-	///   The wake edge. A parked worker must be released by a schedule from another thread. This is
-	///   the Dekker handshake between the enqueue and the parked-flag read; get the fence wrong and
-	///   this test hangs rather than fails, which is why it is bounded by a join.
+	///   The wake edge. A parked worker must be released by a schedule from another thread — the Dekker
+	///   handshake between <c>Schedule</c>'s enqueue-then-flag-read (<c>WakeOne</c>'s fence) and
+	///   <c>ArmWait</c>'s Reset-before-flag ordering.
+	///   <para>
+	///     <b>Why 200 independent trials, not a single Set/Wait handshake.</b> An earlier version of this
+	///     test had the worker signal a separate <see cref="ManualResetEventSlim" /> AFTER its own
+	///     <c>ArmWait</c> returned, then padded with a 50&#160;ms sleep before calling <c>Schedule</c>.
+	///     That handshake is itself a full memory fence — the CLR guarantees whatever the worker wrote
+	///     before signalling it is visible once the main thread's wait on it returns, with or without
+	///     <c>WakeOne</c>'s own fence — and it necessarily runs strictly after <c>ArmWait</c>'s two
+	///     statements have both already executed. So neither the fence nor the statement order could ever
+	///     be exercised, sleep or no sleep: the SIGNAL, not the sleep, was what closed the race.
+	///   </para>
+	///   <para>
+	///     <b>Why a fresh scheduler and a single arm per trial, not one worker looping its own arm/wait
+	///     cycle 200 times.</b> A first rewrite tried exactly that — one worker thread looping
+	///     <c>ArmWait</c>/<c>Wait</c>/drain — and it turned out to be racy against a CORRECT scheduler,
+	///     independent of any mutation: between draining a batch (which clears <c>Parked</c> as a side
+	///     effect of <c>TryAcquire</c>) and the loop's next <c>ArmWait</c>, there is a window with no
+	///     recheck at all, by design — the raw scheduler API contracts that gap to the CALLER
+	///     (<c>ActorSystem.WaitForWork</c> closes it with its own armed recheck; this test deliberately
+	///     does not, to avoid masking the wake path under test — see below). A <c>Schedule</c> landing in
+	///     that window with nothing left to rescue it is a real hang that has nothing to do with
+	///     <c>WakeOne</c> or <c>ArmWait</c>. Giving each trial its OWN scheduler and exactly one arm cycle
+	///     removes that unrelated race entirely, at the cost of 200 short-lived scheduler instances rather
+	///     than one long-lived one.
+	///   </para>
+	///   <para>
+	///     <b>Why no recheck between <c>ArmWait</c> and <c>Wait</c> in the worker.</b> A recheck (e.g.
+	///     <c>TryAcquire</c>) would find the key via <see cref="GlobalKeyQueue" />'s own properly-fenced
+	///     state directly, independent of whether <c>WakeOne</c>'s wake path works at all — masking
+	///     exactly the property under test.
+	///   </para>
+	///   <para>
+	///     <b>Why <c>started</c> does not reintroduce the fence problem.</b> It fires as the FIRST
+	///     statement in the worker's lambda, BEFORE <c>ArmWait</c> — so, unlike the removed handshake, it
+	///     establishes no ordering against <c>ArmWait</c>'s write or against <c>Wait</c>. It exists only
+	///     to absorb OS thread-creation latency (routinely slower than this test's whole race window)
+	///     so <c>Schedule</c> does not trivially always win by running before the worker even starts.
+	///   </para>
 	/// </summary>
 	[Test]
+	[CancelAfter(60_000)]
 	public void A_Parked_Worker_Is_Woken_By_A_Schedule() {
-		var scheduler = new WorkStealingScheduler { Capacity = 64, DequeCapacity = 64 };
-		scheduler.Start(2, _ => { });
+		const int iterations = 200;
+		for (var iter = 0; iter < iterations; iter++) {
+			var scheduler = new WorkStealingScheduler { Capacity = 64, DequeCapacity = 64 };
+			scheduler.Start(2, _ => { });
 
-		var acquired = -1;
-		var parked = new ManualResetEventSlim(false);
-		var worker = new Thread(() => {
-			scheduler.ArmWait(0);
-			Interlocked.MemoryBarrier();
-			parked.Set();
-			scheduler.Wait(0);
-			if (scheduler.TryAcquire(0, out var value)) Volatile.Write(ref acquired, value);
-		}) { IsBackground = true };
-		worker.Start();
+			var acquired = -1;
+			var started = new ManualResetEventSlim(false);
+			var worker = new Thread(() => {
+				started.Set(); // absorb thread-creation latency only — see the doc comment above
+				scheduler.ArmWait(0);
+				scheduler.Wait(0);
+				if (scheduler.TryAcquire(0, out var value)) Volatile.Write(ref acquired, value);
+			}) { IsBackground = true };
+			worker.Start();
+			Assert.That(started.Wait(TimeSpan.FromSeconds(5)), Is.True,
+				$"iteration {iter}: worker thread never started");
+			// A handful of spin cycles, not a sleep: gives the worker a realistic head start to reach
+			// ArmWait before Schedule races past it, without the 50ms handshake's full-fence guarantee.
+			var spinner = new SpinWait();
+			for (var s = 0; s < 40; s++) spinner.SpinOnce();
 
-		Assert.That(parked.Wait(TimeSpan.FromSeconds(5)), Is.True);
-		Thread.Sleep(50); // let it actually reach Wait
-		scheduler.Schedule(42);
+			var key = 1000 + iter;
+			scheduler.Schedule(key); // deliberately racing the worker's arm cycle — no further handshake
 
-		Assert.That(worker.Join(TimeSpan.FromSeconds(10)), Is.True,
-			"the parked worker was never woken — lost wakeup on the schedule path");
-		Assert.That(Volatile.Read(ref acquired), Is.EqualTo(42));
+			Assert.That(worker.Join(TimeSpan.FromSeconds(10)), Is.True,
+				$"iteration {iter}: the parked worker was never woken — lost wakeup on the schedule path");
+			Assert.That(Volatile.Read(ref acquired), Is.EqualTo(key), $"iteration {iter}: wrong/missing key");
+		}
 	}
 
+	/// <summary>
+	///   A fixed sleep before <c>SignalStop</c> is a race against ordinary OS scheduling latency, not a
+	///   guarantee: if a thread's startup is delayed past the sleep, <c>WakeAll</c>'s <c>Set</c> lands
+	///   BEFORE that thread's own <c>ArmWait</c>, whose <c>Reset</c> then erases it — a failure against a
+	///   correct scheduler, on a loaded box, not a real defect. A <see cref="CountdownEvent" /> signalled
+	///   by each thread AFTER its own <c>ArmWait</c> returns (the same pattern
+	///   <see cref="A_Parked_Worker_Is_Woken_By_A_Schedule" /> uses) removes that race: <c>SignalStop</c>
+	///   cannot run until every <c>ArmWait</c> — and therefore every <c>Reset</c> — has already happened.
+	/// </summary>
 	[Test]
 	public void Signal_Stop_Releases_Every_Parked_Worker() {
 		var scheduler = new WorkStealingScheduler { Capacity = 64, DequeCapacity = 64 };
 		scheduler.Start(3, _ => { });
 
 		var released = 0;
+		var armed = new CountdownEvent(3);
 		var threads = new Thread[3];
 		for (var i = 0; i < threads.Length; i++) {
 			var id = i;
 			threads[id] = new Thread(() => {
 				scheduler.ArmWait(id);
+				armed.Signal();
 				scheduler.Wait(id);
 				Interlocked.Increment(ref released);
 			}) { IsBackground = true };
 			threads[id].Start();
 		}
 
-		Thread.Sleep(100);
+		Assert.That(armed.Wait(TimeSpan.FromSeconds(5)), Is.True, "not every worker armed in time");
 		scheduler.SignalStop();
 		foreach (var thread in threads)
 			Assert.That(thread.Join(TimeSpan.FromSeconds(10)), Is.True, "a worker was left parked");

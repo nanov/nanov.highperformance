@@ -52,6 +52,7 @@ public struct WorkStealingScheduler : IKeyScheduler {
 		public long GlobalDequeues;
 		public long DequeOverflows;
 		public long Parks;
+		public int WakeScanCursor; // rotating start for WakeOne's scan -- see WakeOne's doc
 	}
 
 	/// <summary>Global queue capacity; must be at least the key map's slot count so it can never fill.</summary>
@@ -73,6 +74,12 @@ public struct WorkStealingScheduler : IKeyScheduler {
 
 	public readonly long DequeOverflows => Volatile.Read(ref _state.DequeOverflows);
 
+	/// <summary>
+	///   Count of times a worker entered <see cref="Wait" />, incremented on ENTRY before the block
+	///   runs — so this measures park INTENT, not actual sleep time. A worker whose event was already
+	///   <c>Set</c> when it called <see cref="Wait" /> (e.g. a wake that landed between the armed
+	///   recheck and this call) still increments this and returns immediately.
+	/// </summary>
 	public readonly long Parks => Volatile.Read(ref _state.Parks);
 
 	/// <summary>
@@ -102,7 +109,7 @@ public struct WorkStealingScheduler : IKeyScheduler {
 	}
 
 	public readonly void Schedule(int cellIdx) {
-		if (!_state.Global!.TryEnqueue(cellIdx))
+		if (!TryEnqueueGlobalWithRetry(_state.Global!, cellIdx))
 			throw new InvalidOperationException(
 				"global key queue full — it is sized to the map, so this most likely means Capacity is set " +
 				"below the key map's slot count, not that a key index was scheduled twice.");
@@ -114,7 +121,7 @@ public struct WorkStealingScheduler : IKeyScheduler {
 			// Deque full: spill to the global queue rather than growing. Some other worker will pick it
 			// up, which costs this key its affinity but keeps the deque bounded and cache-resident.
 			Interlocked.Increment(ref _state.DequeOverflows);
-			if (!_state.Global!.TryEnqueue(cellIdx))
+			if (!TryEnqueueGlobalWithRetry(_state.Global!, cellIdx))
 				throw new InvalidOperationException(
 					"deque overflowed into a full global queue — both are sized to the map, so Capacity is " +
 					"almost certainly below the key map's slot count.");
@@ -126,18 +133,48 @@ public struct WorkStealingScheduler : IKeyScheduler {
 	}
 
 	/// <summary>
+	///   <see cref="GlobalKeyQueue.TryEnqueue" />'s <see langword="false" /> means "not right now" — a
+	///   concurrent dequeuer's claim window, a few instructions wide — never durable fullness (see its
+	///   own doc). A caller that latches a single <see langword="false" /> into a hard failure blames
+	///   sizing for what is usually a transient race; one immediate retry rides out that window.
+	/// </summary>
+	private static bool TryEnqueueGlobalWithRetry(GlobalKeyQueue global, int cellIdx) {
+		var spinner = new SpinWait();
+		for (var attempt = 0; attempt < 64; attempt++) {
+			if (global.TryEnqueue(cellIdx)) return true;
+			spinner.SpinOnce();
+		}
+
+		return false;
+	}
+
+	/// <summary>
 	///   Wake exactly one sleeping worker, not the herd. The fence is the Dekker handshake against
 	///   <c>ActorSystem.WaitForWork</c>: the enqueue above must be visible BEFORE the parked flags are
 	///   read, or we see nobody parked and skip the wake while the sleeper's own armed recheck sees a
 	///   not-yet-visible queue and blocks. Mid-run that stalls one worker; on the last dispatch before
 	///   <c>TryComplete</c> the key is never picked up, quiescence never arrives, and the system hangs.
+	///   <para>
+	///     <b>Rotating scan start, not always index 0.</b> A burst of K schedules in quick succession
+	///     would otherwise re-read <c>Parked[0]</c> every time — the first <c>Set</c> has not cleared it
+	///     yet — so every wake in the burst lands on worker 0 while 1..N-1 stay parked: a real cold-start
+	///     parallelism loss in the scheduler whose whole point is to be benchmarked against B. Same
+	///     motivation as <see cref="TrySteal" />'s randomised victim scan.
+	///   </para>
 	/// </summary>
 	private static void WakeOne(State s) {
 		Interlocked.MemoryBarrier();
 		var parked = s.Parked!;
-		for (var i = 0; i < parked.Length; i++) {
-			if (!Volatile.Read(ref parked[i])) continue;
-			s.WorkAvailable![i].Set();
+		var count = parked.Length;
+		// Unsigned wraparound, same reasoning as RoutedScheduler.Route's NextRoundRobin: the counter
+		// eventually wraps int.MinValue, and C#'s % takes the DIVIDEND's sign, so casting to uint before
+		// the modulo keeps the wrap harmless for any worker count.
+		var start = (int)((uint)Interlocked.Increment(ref s.WakeScanCursor) % (uint)count);
+		for (var i = 0; i < count; i++) {
+			var idx = start + i;
+			if (idx >= count) idx -= count;
+			if (!Volatile.Read(ref parked[idx])) continue;
+			s.WorkAvailable![idx].Set();
 			return;
 		}
 	}
