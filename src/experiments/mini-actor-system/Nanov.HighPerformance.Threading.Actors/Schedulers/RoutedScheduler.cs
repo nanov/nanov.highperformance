@@ -61,7 +61,14 @@ public struct RoutedScheduler : IKeyScheduler {
 
 	/// <summary>
 	///   Maximum consecutive acquisitions from a worker's local stack before its ring gets priority.
-	///   Bounds the starvation described on the type. 16 is a guess pending measurement, not a result.
+	///   Bounds the starvation described on the type.
+	///   <para>
+	///     <b>The bound's effect is now measured, not guessed.</b> <c>StarvationAsymmetryTests</c>
+	///     (spec §6.1) shows it produces victim position exactly <c>LocalDrainBound + 1</c> in the
+	///     dense-hot-key-plus-placed-victim workload — a closed form confirmed across 10 runs on both
+	///     TFMs with zero variance, per the starvation asymmetry in spec §6.1. What remains unmeasured
+	///     is only whether 16 is the right VALUE for that bound, not whether the bound works.
+	///   </para>
 	/// </summary>
 	public int LocalDrainBound { get; set; } = 16;
 

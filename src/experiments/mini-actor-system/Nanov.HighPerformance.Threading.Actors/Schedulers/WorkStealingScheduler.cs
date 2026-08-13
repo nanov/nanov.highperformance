@@ -39,9 +39,14 @@ public struct WorkStealingScheduler : IKeyScheduler {
 		public WorkStealingDeque[]? Deques;
 		public ManualResetEventSlim[]? WorkAvailable;
 
-		// Racy by design. A stale `true` costs one wasted Set on a worker that is already awake and
-		// heading for TryAcquire — which finds the work anyway. A stale `false` cannot lose a wakeup,
-		// because the sleeper re-tests HasWork inside its armed window before it blocks.
+		// Racy by design. A stale `true` costs at most one wasted Set — either on a worker that is
+		// already awake and heading for TryAcquire (which finds the work anyway), or on a worker that
+		// left WaitForWork via IsQuiescent or _stopped, whose Parked[id] then stays `true` forever with
+		// nobody left to read it. Both are safe: once IsQuiescent, no cell can mint a new token, because
+		// ReleaseAndMaybeSchedule only reschedules when Tail != head, which means unprocessed messages
+		// remain — contradicting `sum >= _dispatchedFinal`; and under `_stopped` every worker is exiting
+		// regardless, so a wasted Set on a dead worker's flag reaches nobody. A stale `false` cannot lose
+		// a wakeup, because the sleeper re-tests HasWork inside its armed window before it blocks.
 		public bool[]? Parked;
 
 		public uint[]? Rng; // per-worker xorshift; a shared Random would be a contention point
@@ -116,6 +121,22 @@ public struct WorkStealingScheduler : IKeyScheduler {
 		}
 	}
 
+	/// <summary>
+	///   <b>The throw below is unrecoverable, not a reported error.</b> By the time <c>Schedule</c> runs,
+	///   <c>DispatchCore</c> has already incremented <c>_dispatched</c> and won the cell's
+	///   <c>Free → Scheduled</c> CAS — so a throw here leaves that cell stuck at <c>Scheduled</c> with no
+	///   token in any queue: <c>Activate</c> is unreachable without a token, <c>Harvest</c> skips any cell
+	///   that is not <c>Free</c>, and <c>ReleaseAndMaybeSchedule</c> never runs for it because the cell
+	///   never activates. <c>QuiescentSum()</c> can then never reach <c>_dispatchedFinal</c> — every
+	///   worker parks forever and <c>Completion</c> never resolves; only <see cref="IDisposable.Dispose" />
+	///   on the owning <c>ActorSystem</c> breaks it.
+	///   <para>
+	///     The candidate remedy — having <c>DispatchCore</c> restore the cell to <c>Free</c> before the
+	///     exception escapes — is only PARTIAL even if made: it stops the cell from being stuck forever,
+	///     but quiescence for THIS dispatch still needs a later dispatch to the same key to re-arm and
+	///     drain it. Recorded here as a known gap; not implemented — <b>do not change the logic.</b>
+	///   </para>
+	/// </summary>
 	public readonly void Schedule(int cellIdx) {
 		if (!TryEnqueueGlobalWithRetry(_state, cellIdx))
 			throw new InvalidOperationException(
@@ -156,10 +177,13 @@ public struct WorkStealingScheduler : IKeyScheduler {
 	///   <para>
 	///     <b>Wall-clock cost: up to roughly 65&#160;ms.</b> 64 attempts (1 initial + 63 retries, the last
 	///     of which does not spin before giving up — see the loop below), measured on this machine at
-	///     ~64.75&#160;ms end to end for 64 spins — 44 of the 63 <c>SpinOnce</c> calls this loop actually
-	///     makes land past <c>SpinWait</c>'s internal sleep threshold and are <c>Thread.Sleep(1)</c>, not a
-	///     spin. This runs on the producer or a worker thread once per activation, not per message, but
-	///     anyone budgeting dispatch tail latency for this scheduler needs that number.
+	///     ~64.75&#160;ms end to end for 64 spins — <b>~44</b> of the 63 <c>SpinOnce</c> calls this loop
+	///     actually makes land past <c>SpinWait</c>'s internal sleep threshold and are <c>Thread.Sleep(1)</c>,
+	///     not a spin. That figure is a hedge, not a recount: 44 was derived for a 64-<c>SpinOnce</c> loop,
+	///     the shipped loop makes 63 calls, and the removed call is the most-escalated one — so 43 is the
+	///     defensible number, but this was never re-measured against the 63-call loop, hence ~44. This runs
+	///     on the producer or a worker thread once per activation, not per message, but anyone budgeting
+	///     dispatch tail latency for this scheduler needs that number.
 	///     <see cref="GlobalEnqueueRetries" /> counts how often this path is actually paid.
 	///   </para>
 	/// </summary>
@@ -202,8 +226,7 @@ public struct WorkStealingScheduler : IKeyScheduler {
 	///     yet — so every wake in the burst lands on worker 0 while 1..N-1 stay parked: a real cold-start
 	///     parallelism loss in the scheduler whose whole point is to be benchmarked against B. Same
 	///     motivation as <see cref="TrySteal" />'s randomised victim scan — a per-worker RNG there, a
-	///     shared cursor here (there is exactly one <see cref="WakeOne" /> caller path, so there is
-	///     nothing to shard the cursor across).
+	///     shared cursor here.
 	///   </para>
 	///   <para>
 	///     <b>Plain read/write on <c>WakeScanCursor</c>, not <see cref="Interlocked" />.</b> It is a pure

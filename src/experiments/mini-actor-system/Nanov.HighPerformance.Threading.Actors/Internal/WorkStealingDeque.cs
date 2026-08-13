@@ -8,10 +8,17 @@ using System.Threading;
 /// <summary>
 ///   A Chase-Lev work-stealing deque of key indices, over a FIXED buffer.
 ///   <para>
-///     The owner pushes and pops the <b>bottom</b> — LIFO, and on the uncontended path atomic-free
-///     apart from one fence. Thieves take the <b>top</b> and arbitrate with a CAS. Owner and thieves
-///     only contend when exactly one item remains, which is the case
-///     <see cref="TryPopBottom" />'s CAS exists to settle.
+///     The owner pushes and pops the <b>bottom</b> — LIFO, and <see cref="TryPopBottom" /> has an
+///     uncontended fast path (<c>top != bottom</c>) that is atomic-free apart from one fence. Thieves
+///     take the <b>top</b> and arbitrate with a CAS.
+///   </para>
+///   <para>
+///     <b>In this pairing that fast path is never taken.</b> Spec §6.2's depth-1 finding shows a
+///     worker's own deque never holds more than one item under this <c>ActorSystem</c>/scheduler
+///     pairing — <c>ScheduleLocal</c> pushes and <c>RunLoop</c> immediately pops again before any
+///     second push can land. So every SUCCESSFUL <see cref="TryPopBottom" /> finds <c>top == bottom</c>
+///     and pays the CAS: "owner and thieves only contend when exactly one item remains" describes the
+///     ALWAYS case here, not an edge case the fast path mostly avoids.
 ///   </para>
 ///   <para>
 ///     <b>Memory ordering follows Lê / Pop / Cohen / Zappa Nardelli (2013), not the 2005 paper.</b>

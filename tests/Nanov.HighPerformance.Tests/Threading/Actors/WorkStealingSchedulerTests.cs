@@ -1,6 +1,7 @@
 namespace Nanov.HighPerformance.Tests.Threading.Actors;
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using Nanov.HighPerformance.Threading.Actors;
@@ -57,7 +58,7 @@ public class WorkStealingSchedulerTests {
 
 		Assert.That(scheduler.DequeOverflows, Is.GreaterThan(0), "the overflow path never ran");
 
-		var taken = new System.Collections.Generic.List<int>();
+		var taken = new List<int>();
 		while (scheduler.TryAcquire(0, out var value))
 			taken.Add(value);
 
@@ -183,11 +184,13 @@ public class WorkStealingSchedulerTests {
 
 			// A real wake lands in microseconds; 2s is generous headroom, not a tolerance for slowness.
 			if (!worker.Join(TimeSpan.FromSeconds(2))) return false;
-			// Only dispose on the success path — on failure the worker thread may still be running and
-			// could still reach `started.Set()` after this returns, and CountdownEvent-style primitives
-			// throw ObjectDisposedException unconditionally from a Set/Signal on a disposed instance,
-			// which would crash the test host from a background thread instead of leaving a readable
-			// assertion failure.
+			// Dispose only on the success path. Not because the worker could still reach
+			// `started.Set()` after this returns — `Set()` is the lambda's FIRST statement, and the
+			// assert above already confirmed `started.Wait()` returned, so it has provably already run
+			// by this point. The guard is simply harmless to keep: CountdownEvent-style primitives throw
+			// ObjectDisposedException unconditionally from a Set/Signal on a disposed instance, which
+			// would crash the test host from a background thread instead of leaving a readable
+			// assertion failure, so skipping dispose on the timeout path costs nothing.
 			started.Dispose();
 			return Volatile.Read(ref acquired) == key;
 		}

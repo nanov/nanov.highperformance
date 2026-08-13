@@ -741,10 +741,10 @@ answers "which worker gets this newly-dirty key."
 > `LocalDrainBound = 16` on the unbounded arm yields 17 in all six executions and correctly *fails* that
 > arm's assertion.
 >
-> `RoutedScheduler` still documents `LocalDrainBound = 16` on the property itself as *"a guess pending
-> measurement, not a result."* **That comment is now stale.** The bound's *effect* is measured and exactly
-> predictable (`bound + 1`); what remains unmeasured is only whether **16** is the right value. Follow-up:
-> update that XML doc — it was not touched here because Phase 2b's last task is documentation-only.
+> `RoutedScheduler` used to document `LocalDrainBound = 16` on the property itself as *"a guess pending
+> measurement, not a result."* That comment was stale — the bound's *effect* is measured and exactly
+> predictable (`bound + 1`); what remains unmeasured is only whether **16** is the right value — and the
+> XML doc has now been updated to say so, in this same documentation pass.
 >
 > **Four caveats, without which the table above is misleading:**
 >
@@ -888,6 +888,11 @@ invalidates several things the design above implies:
 - **Every successful steal comes from the narrow window between a worker's push and its own next
   pop.** That is what "work stealing" currently means in D, and it is directly material to the B-vs-D
   benchmark's interpretation.
+- **Depth-1 makes the deque's cheap path unreachable, so D pays more per activation than B in this
+  specific pairing.** Every successful `TryPopBottom` finds `top == bottom` and pays a contended
+  `Interlocked.CompareExchange` plus a full `Interlocked.MemoryBarrier()` fence (see
+  `WorkStealingDeque`'s type doc), where B's equivalent — an uncontended local-stack decrement — is not
+  atomic at all. This is a benchmark suspect, not a measured cost; see §10.
 
 #### The bounded `TryEnqueue` retry costs up to ~65 ms
 
@@ -939,10 +944,12 @@ readonly struct OrderHandler : IActorHandler<long, Order> {
 
 using var system = new ActorSystem<long, Order, OrderHandler, WorkStealingScheduler>(
   handler: new OrderHandler(),
-  workers: 8,
   keyCapacity: 1 << 12,     // live keys
+  chunkCount: 1 << 10,      // max concurrently-dirty keys
   chunkSize: 64,            // messages per key, v1 bound
-  batchBound: 64);          // max per activation; defaults to chunkSize
+  batchBound: 64,           // max per activation; defaults to chunkSize
+  workers: 8,
+  scheduler: new WorkStealingScheduler());
 
 system.Start();
 system.Dispatch(orderId, order);          // blocks on backpressure
@@ -997,12 +1004,16 @@ A work-stealing scheduler whose steal rate you cannot see is unbenchmarkable.
 Two things about them are not what §8 originally proposed:
 
 - **They are not behind a compile-time switch — that was not built.** They are unconditional
-  `Interlocked` increments. What makes that acceptable is that every one of them sits on the
-  **activation** path (or rarer), never on the per-message path: `Schedule` fires roughly once per
-  activation (§5.1), and steals, parks and global dequeues are all per-activation-or-idler events. A
-  compile-time switch remains available if the benchmark ever shows these lines contending. (They are
-  also unpadded and share cache lines, and `StealsAttempted` is incremented once per *victim tried* —
-  both unmeasured, both for the benchmark to triage.)
+  `Interlocked` increments. `Schedule` fires roughly once per activation (§5.1), and `StealsSucceeded`,
+  `Parks` and `GlobalDequeues` are all per-activation-or-idler events — but **`StealsAttempted` is not**:
+  it is incremented once per *victim tried* inside `TrySteal`'s scan, on the **failed-acquire** path,
+  bounded by neither messages nor activations. §9 measures 47k–300k attempts against 80,000 messages at
+  8 workers — up to **3.75 increments per message**, on one unpadded shared field, up to 7 RMWs per
+  failed-acquire scan (`workers - 1` peers tried before giving up). That cost is now measured, not
+  unmeasured, and it lands squarely on the benchmark this counter exists to serve. A compile-time switch
+  remains available if that turns out to matter; the counters are still worth having — `StealsSucceeded`
+  is what says which regime you are in (§6.3) — the point above is only that their cost is not free and
+  is no longer a guess.
 - **`Parks` counts park *intent*, not sleep.** It is incremented on entry to `Wait`, before the block
   runs, so a worker whose event was already `Set` — a wake landing between the armed recheck and the
   call — records a park that never happened.
@@ -1042,10 +1053,22 @@ must genuinely **park** — a lost-wakeup bug passes every test whose workers ne
 
 ### Status after Phase 2b
 
-**Test 8 (steal correctness under churn) is done**, and the "every behavioural test runs against both
-schedulers" requirement is now real: `SchedulerBehaviourTests` is a generic fixture closed over both
-`RoutedScheduler` and `WorkStealingScheduler`, so each of its methods runs twice per TFM. The
-starvation workload behind §6.1 is a third fixture, `StarvationAsymmetryTests`.
+**Test 8 (steal correctness under churn) is done.** `SchedulerBehaviourTests` is a generic fixture
+closed over both `RoutedScheduler` and `WorkStealingScheduler` (5 test methods, each run twice per
+TFM), and the starvation workload behind §6.1 is a third fixture, `StarvationAsymmetryTests`. The plan
+above asked specifically for the *core* behavioural suite to run under both schedulers, and that is
+what `SchedulerBehaviourTests` delivers — the work is in scope.
+
+**"Every behavioural test runs against both schedulers" is not, however, literally true, and the
+Phase 2b task report overstated it on the strength of those 5 methods.** The rest of the suite is still
+scheduler-specific: `ActorSystemTests` (33 tests) and `ActorSystemStressTests` (8 tests) run only under
+`SingleWorkerScheduler`; `FaultPropagationTests` (3 tests) runs only under `RoutedScheduler`; and
+`MultiWorkerTests` (6 tests) runs 5 under `RoutedScheduler` and 1 under `SingleWorkerScheduler`. None of
+these three fixtures runs any test under `WorkStealingScheduler`. Concretely, **the following have never
+run under D**: backpressure (`WaitForMailboxSpace` / `WaitForChunk`, in `ActorSystemTests` /
+`ActorSystemStressTests`), `TryDispatch`, hard-stop semantics, zero-allocation, and fault propagation.
+Nothing structurally prevents extending any of these to `WorkStealingScheduler` — it is unclaimed
+follow-up work, not a blocked one.
 
 **`RejectedClaims == 0` is now asserted under D.** Before Phase 2b it had only ever been checked under
 `SingleWorkerScheduler` and `RoutedScheduler` — neither of which can move a key once scheduled — so
@@ -1113,6 +1136,28 @@ stealing that the global queue actually did.
 **The head-to-head is B vs. D at the same worker count**, both against the two baselines above. That
 is §13's step 6 and it is the only thing that answers §1. Nothing measured before it compares the two
 schedulers on an isolated variable.
+
+#### Two benchmark suspects on D, open going into step 6
+
+Both are unmeasured costs on D's hot path, both follow directly from the depth-1 finding (§6.2), and
+step 6 should be able to tell them apart from genuine stealing overhead rather than lumping everything
+into "D is slower":
+
+1. **`TryPopBottom` writes to `_bottom` on the empty path.** Every call — and, given depth-1, the
+   overwhelming majority of calls are the empty poll, not a successful pop — does two `Volatile.Write`s
+   plus an `Interlocked.MemoryBarrier()`, dirtying the cache line every peer reads in `HasWork`'s scan.
+   `TryAcquire` calls it unconditionally, and `WaitForWork` returns with no backoff whenever `HasWork` is
+   true, so a worker that just lost a steal can re-enter this path in a tight loop — up to 3.75 failed
+   acquires per message by §9's measured numbers. The standard early-out other implementations use
+   (`if (_bottom.Value - Volatile.Read(ref _top.Value) <= 0) return false;`, as .NET's
+   `ThreadPoolWorkQueue` carries) would remove the write-and-fence on the empty path entirely.
+   **Recommended as the first act of Phase 3, before the benchmark runs**, so that D is measured in the
+   form it was designed to have rather than with this avoidable cost baked into every sample.
+2. **Depth-1 makes the deque's cheap path unreachable** (§6.2's fifth consequence): every successful
+   `TryPopBottom` pays a contended CAS plus a full fence per activation, where B's equivalent local-stack
+   pop is a plain, non-atomic decrement. Unlike suspect 1, this one is not a bug to fix before
+   benchmarking — it is a structural property of this `ActorSystem`/scheduler pairing that the benchmark
+   should attribute correctly rather than blaming on stealing.
 
 #### Required workload: dense-hot-key + placed victim (the §6.1 starvation asymmetry)
 
