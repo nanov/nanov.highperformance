@@ -32,8 +32,43 @@ public abstract class ActorThroughputTestBase : IThroughputTest {
 	// startup and JIT, short enough that the whole matrix runs in about two minutes.
 	protected const long Iterations = 10L * 1000L * 1000L;
 
-	/// <summary>Set by the calibration test in Task 3. Do NOT change without re-running it.</summary>
-	protected const int SpinPerMessage = 0; // ← Task 3 replaces this with the measured value
+	/// <summary>
+	///   Measured, not guessed — see <c>ProducerBoundCalibrationTest</c>. Do NOT change without re-running it.
+	///   <para>
+	///     <b>Measured 2026-08-14</b>, Apple M4 Pro (12 logical cores), 8 workers, cardinality 1024, two
+	///     invocations of 7 repeats each. Individual repeats are NOT interpretable on this host — see the
+	///     spread column — so the figures below are per-rung medians across each invocation's 7 repeats:
+	///   </para>
+	///   <code>
+	///     spin |  pass 1  |  pass 2  | pass 2 spread
+	///     -----+----------+----------+--------------
+	///        0 |  2.06M/s |  1.66M/s |    1.48x
+	///        4 |  3.93M/s |  1.83M/s |    5.53x
+	///       16 |  5.69M/s |  2.68M/s |    3.13x   &lt;- pass 1 peak
+	///       32 |  4.39M/s |  5.09M/s |    1.20x   &lt;- pass 2 peak; CHOSEN
+	///       64 |  2.37M/s |  2.82M/s |    1.12x
+	///   </code>
+	///   <para>
+	///     <b>Why 32, and what the choice does and does not rest on.</b> The knee moved between passes
+	///     (16 in pass 1, 32 in pass 2), so it is not pinned to a rung. What both passes agree on is that
+	///     spin 64 sits below spin 32 — the falling side begins at or after 32 — and that the run-to-run
+	///     spread collapses to ~1.2x at 32 and 64 against 3-6x below. That collapse is the property the
+	///     matrix actually needs: it is the point where the per-message cost dominates and the number
+	///     reproduces. 32 is the first rung with it.
+	///   </para>
+	///   <para>
+	///     <b>The rise from spin 0 is not an artefact.</b> At low spin the single producer races ahead,
+	///     workers park and unpark constantly, and wake churn dominates; more handler cost keeps workers
+	///     busy longer and RAISES throughput, until the spin itself dominates and it falls. That is also
+	///     why the low rungs are the noisy ones — they are producer-bound and thrashing.
+	///   </para>
+	///   <para>
+	///     <b>Host caveat that no calibration can remove.</b> <c>ThreadAffinityUtil</c> is a documented
+	///     no-op on macOS — there is no per-core pinning API — so this suite cannot isolate itself from
+	///     placement noise even on an idle machine. Treat differences smaller than the spread as absent.
+	///   </para>
+	/// </summary>
+	protected const int SpinPerMessage = 32;
 
 	private readonly int? _producerCpu;
 
