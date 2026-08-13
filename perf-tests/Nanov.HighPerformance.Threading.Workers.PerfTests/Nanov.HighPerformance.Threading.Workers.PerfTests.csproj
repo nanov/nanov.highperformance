@@ -24,6 +24,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/Nanov.HighPerformance.Threading.Workers/Nanov.HighPerformance.Threading.Workers.csproj" />
+    <ProjectReference Include="../../src/experiments/mini-actor-system/Nanov.HighPerformance.Threading.Actors/Nanov.HighPerformance.Threading.Actors.csproj" />
   </ItemGroup>
 
 </Project>
