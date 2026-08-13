@@ -176,7 +176,8 @@ public class ActorSystemStressTests {
 		producer.Start();
 
 		Assert.That(producer.Join(TimeSpan.FromSeconds(90)), Is.True,
-			$"producer wedged after {Volatile.Read(ref dispatched)}/{total} dispatches — likely a stranded key");
+			$"producer wedged after {Volatile.Read(ref dispatched)}/{total} dispatches — check the chunk-exhaustion " +
+			"wake path, not the ownership protocol");
 		if (producerError is not null)
 			Assert.Fail($"producer threw: {producerError}");
 		Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(total), "a Dispatch was rejected mid-run");

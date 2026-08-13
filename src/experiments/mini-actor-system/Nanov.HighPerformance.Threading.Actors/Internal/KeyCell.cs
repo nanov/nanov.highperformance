@@ -9,11 +9,14 @@ namespace Nanov.HighPerformance.Threading.Actors.Internal;
 ///       <item><c>Key</c>, <c>ChunkBase</c>, <c>CachedHead</c> — <b>producer only</b>.</item>
 ///       <item><c>Tail</c> — <b>producer only</b>.</item>
 ///       <item>
-///         <c>Head</c> — normally the current owning worker during a drain, but the producer also
-///         writes it while no worker can own the cell: in <c>BindChunk</c> (zeroing
-///         <c>Head</c>/<c>Tail</c>/<c>CachedHead</c> together when binding a fresh chunk), in
-///         <c>Place</c> (initializing a fresh or re-keyed slot), and in <c>EvictFree</c> (wiping a
-///         tombstoned slot after claiming it).
+///         <c>Head</c> — normally the current owning worker during a drain, and the producer also
+///         writes it in <c>BindChunk</c> (zeroing <c>Head</c>/<c>Tail</c>/<c>CachedHead</c> together
+///         when binding a fresh chunk), in <c>Place</c> (initializing a fresh or re-keyed slot), and in
+///         <c>EvictFree</c> (wiping a tombstoned slot after claiming it). "While no worker can own the
+///         cell" is <b>not</b> a safe description of these: a worker can be stalled between its own
+///         <c>Exchange(State, Free)</c> and its Tail recheck while the producer's <c>EvictFree</c> claims
+///         and re-keys that very slot out from under it — see <c>ActorSystem.Activate</c>'s
+///         <c>chunk == Chunk.None</c> guard for the mechanism and why the write-back stays a safe no-op.
 ///       </item>
 ///       <item>
 ///         <c>State</c> — producer and workers, mostly via <c>Interlocked</c> (CAS / <c>Exchange</c>);

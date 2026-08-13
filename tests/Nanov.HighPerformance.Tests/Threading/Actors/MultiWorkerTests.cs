@@ -25,8 +25,8 @@ public class MultiWorkerTests {
 
 		Assert.Multiple(() => {
 			Assert.That(state.HandledCount, Is.EqualTo(500));
-			Assert.That(system.QuiescenceWakes, Is.LessThanOrEqualTo(1),
-				"the quiescence broadcast must be idempotent — it is on the per-32-message publish path");
+			Assert.That(system.QuiescenceWakes, Is.EqualTo(1),
+				"the quiescence broadcast must fire exactly once — it is on the per-32-message publish path");
 		});
 	}
 

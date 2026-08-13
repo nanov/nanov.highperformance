@@ -275,9 +275,11 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	}
 
 	/// <summary>
-	///   Park until the worker drains a key, which is what makes a chunk harvestable. There is no
-	///   producer-visible predicate to re-test here — only a harvest adds a chunk, and only this thread
-	///   harvests — so this arms and waits without a recheck.
+	///   Park until the worker drains a key, which is what makes a chunk harvestable. Arm-then-recheck,
+	///   same shape as <see cref="WaitForMailboxSpace" />: the predicate that matters is not "did I just
+	///   harvest" but "has some cell reached <c>Free</c> since my last scan" — which a worker can make
+	///   true at any moment, including inside this method's own armed window — so that predicate is
+	///   producer-visible and must be re-tested before sleeping, not assumed away.
 	/// </summary>
 	private bool WaitForChunk() {
 		_spaceAvailable.Reset();
@@ -285,6 +287,12 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		try {
 			Interlocked.MemoryBarrier();
 			if (_stopped || _completed) return false;
+
+			// Recheck INSIDE the armed window. The predicate is not "did I harvest" but "has a cell
+			// reached Free since my last scan" — which a worker can make true at any moment. Without
+			// this we sleep a full poll interval with a harvestable chunk already available.
+			if (Harvest()) return true;
+
 			_spaceAvailable.Wait(TimeSpan.FromMilliseconds(20));
 			return !_stopped && !_completed;
 		}
@@ -400,10 +408,24 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 
 		var chunk = cell.ChunkBase;
 		if (chunk == Chunk.None) {
-			// Spurious schedule: the producer harvested this cell's chunk while we were between our
-			// State release and our Tail recheck. There is nothing to drain and no chunk to drain from
-			// — release and move on. Without this the drain loop would index the slab at Chunk.None
-			// (-1), and SlotRef is deliberately unchecked.
+			// NOT Harvest — Harvest cannot produce this. Harvest skips any cell that is not Free, and
+			// when it does claim a Free-and-drained cell (Head == Tail) it is racing exactly the same
+			// mid-release worker whose own Tail recheck also finds Head == Tail, so it never mints a
+			// token for a chunkless cell in the first place.
+			//
+			// The reachable path is eviction (KeyCellMap.EvictFree), which is a DIFFERENT claim than
+			// Harvest's: a worker stalls between its own Exchange(State, Free) and its Tail recheck; the
+			// producer harvests the (now-Free, chunkless) cell's slot via EvictFree, tombstones it, and
+			// Place later re-keys the same slot index for an unrelated TKey; the stalled worker's stale
+			// CAS(Free -> Scheduled) can still win — against that re-keyed slot, not the key it was
+			// originally scheduled for. There is nothing to drain and no chunk to drain from — release
+			// and move on. Without this guard the drain loop would index the slab at Chunk.None (-1),
+			// and SlotRef is deliberately unchecked.
+			//
+			// Passing cell.Head as a plain read here is safe only because both EvictFree and the
+			// subsequent Place zero Head when they tombstone/re-place the slot, so the read yields 0 and
+			// ReleaseAndMaybeSchedule's write-back is a no-op — it is not writing anything meaningful
+			// into the re-keyed cell.
 			ReleaseAndMaybeSchedule(w, index, ref cell, cell.Head, fromWorker: true);
 			return;
 		}
@@ -448,10 +470,6 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		if (fromWorker) {
 			Volatile.Write(ref cell.Head, head);
 			PublishProcessed(w!);
-			if (_producerParked) {
-				w!.ProducerWakes++;
-				_spaceAvailable.Set();
-			}
 		}
 
 		// FULL FENCE, deliberately not Volatile.Write: the Tail load below must not be hoisted above
@@ -459,6 +477,20 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		// full fence between (Dekker) — so they cannot both miss each other, and the State CAS (never
 		// the emptiness check) is the arbiter of who reschedules.
 		Interlocked.Exchange(ref cell.State, CellState.Free);
+
+		// Read _producerParked HERE — after the Exchange above frees the cell, before the Tail check
+		// below. Placement matters in both directions: reading it BEFORE the Exchange, the chunk is not
+		// yet harvestable, so a producer woken here would just find nothing and re-park; reading it AFTER
+		// the reschedule CAS further down, the cell may already be back to Scheduled and the wake would be
+		// a no-op. This is also the fix for the chunk-exhaustion lost wakeup (spec §11 known defect (a)):
+		// Interlocked.Exchange is a full fence, so reading _producerParked immediately after it also
+		// StoreLoad-orders the earlier Volatile.Write(ref cell.Head, …) above against this read — the
+		// missing ordering that let a worker publish Head, read a stale (pre-arm) _producerParked, and
+		// skip the Set while the producer armed a moment later and read a stale Head.
+		if (fromWorker && _producerParked) {
+			w!.ProducerWakes++;
+			_spaceAvailable.Set();
+		}
 
 		if (Volatile.Read(ref cell.Tail) == head) return;
 		// else: drained. The chunk is now reclaimable, but we must NOT touch ChunkBase — it is
@@ -542,7 +574,9 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	/// </summary>
 	public bool TryComplete(Exception? exception = null) {
 		if (Interlocked.Exchange(ref _completeGate, 1) != 0) return false;
-		_completionError = exception;
+		// Do NOT clobber a fault a worker already recorded — a soft complete with no exception must not
+		// turn a dead worker into a clean Completion.
+		if (exception is not null) _completionError = exception;
 
 		// Publish the final count BEFORE the flag: the quiescence check reads the flag first, so this
 		// ordering is what makes "observed completed ⇒ observes the full dispatched count" hold.

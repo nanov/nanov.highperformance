@@ -22,6 +22,7 @@ public struct SingleWorkerScheduler : IKeyScheduler {
 		public KeyRing? Ring;
 		public int[]? Local;
 		public int LocalCount;
+		public bool Started;
 	}
 
 	/// <summary>Ring capacity; must be at least the key map's slot count so it can never fill.</summary>
@@ -32,6 +33,14 @@ public struct SingleWorkerScheduler : IKeyScheduler {
 			throw new ArgumentOutOfRangeException(nameof(workerCount),
 				"SingleWorkerScheduler drives exactly one worker — its ring is strictly SPSC. " +
 				"Use RoutedScheduler for more than one.");
+		// A struct SingleWorkerScheduler wraps a reference to shared State; handing the SAME value to a
+		// second ActorSystem would replace the ring out from under a live worker — two consumers on one
+		// KeyRing, which corrupts silently. One instance per system, only — same guard as
+		// RoutedScheduler.Start.
+		if (_state.Started)
+			throw new InvalidOperationException(
+				"this scheduler instance is already driving a system; construct a new one per ActorSystem.");
+		_state.Started = true;
 		_state.Ring = new KeyRing(Capacity);
 		_state.Local = new int[Capacity];
 	}

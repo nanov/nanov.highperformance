@@ -207,7 +207,8 @@ public struct RoutedScheduler : IKeyScheduler {
 	public void Schedule(int cellIdx) {
 		if (!_state.Inbox!.TryEnqueue(cellIdx))
 			throw new InvalidOperationException(
-				"router inbox full — it is sized to the map, so this means a key index was scheduled twice.");
+				"router inbox full — it is sized to the map, so this most likely means Capacity is set below " +
+				"the key map's slot count, not that a key index was scheduled twice.");
 		// StoreLoad fence between publishing the item and reading the router's parked flag. Without it
 		// this read can be hoisted above the enqueue: we would see RouterParked == false and skip the
 		// Set, while the router's own recheck sees a not-yet-visible ring and parks. Mid-run that
@@ -221,8 +222,20 @@ public struct RoutedScheduler : IKeyScheduler {
 		if (_state.RouterParked) _state.InboxNotEmpty.Set();
 	}
 
-	public void ScheduleLocal(int workerId, int cellIdx) =>
-		_state.Local![workerId][_state.LocalCount![workerId]++] = cellIdx;
+	public void ScheduleLocal(int workerId, int cellIdx) {
+		var local = _state.Local![workerId];
+		var count = _state.LocalCount![workerId];
+		// Bounds check deliberately explicit rather than left to the array: an overflow here runs on a
+		// worker thread, and an unguarded IndexOutOfRangeException there is unresolvable — RunLoop's
+		// catch faults Completion, but nothing un-wedges a peer worker or the router that is still
+		// waiting on this one. InvalidOperationException with a diagnosable cause beats a bare NRE.
+		if (count >= local.Length)
+			throw new InvalidOperationException(
+				"worker local schedule stack full — likely cause is Capacity set below the key map's slot " +
+				"count, the same sizing invariant the ring capacity relies on.");
+		local[count] = cellIdx;
+		_state.LocalCount[workerId] = count + 1;
+	}
 
 	public bool TryAcquire(int workerId, out int cellIdx) {
 		var localCount = _state.LocalCount![workerId];
