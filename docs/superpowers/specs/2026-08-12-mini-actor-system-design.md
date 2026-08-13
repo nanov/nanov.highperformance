@@ -428,14 +428,28 @@ already harvested) are evictable — so eviction never contends with an active d
 `CAS(State, Tombstone, Free)`, then tombstone the key. A lost CAS, or a validation failure after
 winning it, goes through the shared `ReleaseAndMaybeSchedule` path (§4.4) — never a plain revert.
 
-> **Residual race — a Phase 2 entry criterion.** Eviction narrows but does not close the window in
-> which a worker delayed between its `State` release and its `Tail` recheck can mint a schedule
-> token for a slot the producer has re-keyed. Closing it needs a generation tag carried with the
-> token and validated on acquire. At one worker the consequence is bounded (a spurious activation
-> on a re-keyed cell). **It must be closed before a second worker exists**, because `Activate`
-> currently does an unconditional `Interlocked.Exchange(State, Owned)` without verifying it won the
-> key — with two tokens and two workers, both would drain one mailbox from the same `Head`,
-> destroying per-key order.
+> **Residual race, revisited — the double-token hole is now closed.** Eviction's `CAS(State,
+> Reclaiming, Free)` used to be followed by a field wipe (`cell = default`) that stomped `State`
+> back to `Free` for one instruction and then republished `Reclaiming` — a window in which a worker
+> delayed between its own `State` release and its `Tail` recheck could win
+> `CAS(State, Scheduled, Free)` and mint a second schedule token for a slot the producer was
+> re-keying. The claim is now held continuously: the wipe touches every field except `State`, so
+> `State` stays `Reclaiming` from the eviction CAS until `Place` republishes `Free` for the new key.
+> A delayed worker's `CAS(State, Scheduled, Free)` therefore always fails against `Reclaiming` for
+> the whole re-keying window — no second token is minted.
+>
+> What remains is not that hole — it's the already-handled, benign case `Activate` already guards
+> for (`chunk == Chunk.None`, above): a token that was legitimately scheduled *before* eviction and
+> is only popped and `Activate`d after the producer has evicted and re-keyed the slot. `Activate`
+> finds no chunk, releases immediately, and does no work — one wasted no-op activation, bounded at
+> one worker, never a second owner. It stays benign because there is still exactly one token in
+> flight per legitimate schedule event.
+>
+> Separately, `Activate`'s unconditional `Interlocked.Exchange(State, Owned)` still does not verify
+> it won the key before taking ownership. That is fine with one worker (there is no second claimant
+> to lose to) but **must become a validating claim before a second worker exists** — with two
+> workers racing to acquire the same popped index, both could otherwise drain one mailbox from the
+> same `Head`, destroying per-key order. That remains a Phase 2 entry criterion.
 
 ### 5.6 Completion and termination detection
 

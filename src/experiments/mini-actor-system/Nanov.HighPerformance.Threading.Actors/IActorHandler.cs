@@ -30,8 +30,9 @@ public interface IActorHandler<in TKey, T> {
 	void OnError(Exception error);
 
 	/// <summary>
-	///   The worker has drained and is exiting. Fires <b>once per worker</b> (so N times for N workers),
-	///   on that worker's own handler copy. <c>null</c> = normal completion.
+	///   The worker has drained and is exiting. At one worker with one shared handler this fires
+	///   <b>once</b>, on that single shared handler. Per-worker copies and N invocations arrive with
+	///   the multi-worker phase. <c>null</c> = normal completion.
 	/// </summary>
 	void OnCompleted(Exception? error);
 

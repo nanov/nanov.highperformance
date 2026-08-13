@@ -147,14 +147,19 @@ internal sealed class KeyCellMap<TKey>
 			// own claim does.
 			if (Interlocked.CompareExchange(ref cell.State, CellState.Reclaiming, CellState.Free) != CellState.Free)
 				continue;
+
+			// Wipe the fields individually and NEVER write State — `cell = default` would stomp it back
+			// to Free (0), dropping the claim we just took. A worker still between its State release and
+			// its Tail recheck would then read the zeroed Tail against its stale head, see "not empty",
+			// win CAS(Free -> Scheduled), and mint a second schedule token for a slot we are re-keying.
+			// Two tokens for one index breaks the "never two" invariant (design 3.1). The claim must be
+			// held continuously from this CAS until Place publishes Free again.
 			ctl = Tombstone;
-			cell = default;
+			cell.Key = default!;
 			cell.ChunkBase = Chunk.None;
-			// Publish Reclaiming LAST: `cell = default` resets State to Free (0), which would drop the
-			// claim we just took and let a worker still between its State release and its Tail recheck
-			// win CAS(Free -> Scheduled) on a slot we are re-keying. Two tokens for one index breaks the
-			// "never two" invariant (design §3.1).
-			Volatile.Write(ref cell.State, CellState.Reclaiming);
+			cell.Head = 0;
+			cell.Tail = 0;
+			cell.CachedHead = 0;
 			_count--;
 			freed = true;
 		}

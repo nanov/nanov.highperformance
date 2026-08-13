@@ -51,7 +51,10 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	private int _completeGate;
 	private int _disposeGate;
 
-	/// <param name="handler">Struct handler; copied into each worker.</param>
+	/// <param name="handler">
+	///   The single shared handler. At one worker there is no per-worker copy — per-worker copies
+	///   arrive with the multi-worker phase.
+	/// </param>
 	/// <param name="keyCapacity">Max live keys.</param>
 	/// <param name="chunkCount">Max concurrently-dirty keys.</param>
 	/// <param name="chunkSize">Messages one key may hold before backpressure.</param>

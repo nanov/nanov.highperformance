@@ -9,9 +9,11 @@ namespace Nanov.HighPerformance.Threading.Actors.Internal;
 ///       <item><c>Key</c>, <c>ChunkBase</c>, <c>CachedHead</c> — <b>producer only</b>.</item>
 ///       <item><c>Tail</c> — <b>producer only</b>.</item>
 ///       <item>
-///         <c>Head</c> — normally the current owning worker only, but the producer also writes it once
-///         when binding a fresh chunk (<c>BindChunk</c> zeroes <c>Head</c>/<c>Tail</c>/<c>CachedHead</c>
-///         together, before the cell is dirty and can have an owner).
+///         <c>Head</c> — normally the current owning worker during a drain, but the producer also
+///         writes it while no worker can own the cell: in <c>BindChunk</c> (zeroing
+///         <c>Head</c>/<c>Tail</c>/<c>CachedHead</c> together when binding a fresh chunk), in
+///         <c>Place</c> (initializing a fresh or re-keyed slot), and in <c>EvictFree</c> (wiping a
+///         tombstoned slot after claiming it).
 ///       </item>
 ///       <item>
 ///         <c>State</c> — producer and workers, mostly via <c>Interlocked</c> (CAS / <c>Exchange</c>);
