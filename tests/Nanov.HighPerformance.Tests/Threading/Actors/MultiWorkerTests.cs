@@ -193,11 +193,34 @@ public class MultiWorkerTests {
 	///   releasing workers.
 	///   <para>
 	///     <c>keyCapacity: 8</c> gives 16 map slots against 400 distinct keys, so once 16 are occupied
-	///     every new key must reach <c>GetOrAddRefCold</c> and evict. <c>chunkCount: 4</c> against those
-	///     same 400 keys means <c>TryRent</c> fails constantly and <c>Harvest()</c> runs on nearly every
-	///     bind. Both paths' correctness argument is entirely about racing a worker between its
+	///     every new key must either reuse a stockpiled tombstone via <c>Place</c> or, failing that, reach
+	///     <c>GetOrAddRefCold</c> and evict — <c>GetOrAddRefCold</c> only calls <c>EvictFree</c> when the
+	///     probe finds no tombstone, so this is not literally "every key evicts": instrumentation measured
+	///     392 evictions against 400 keys, the remainder landing straight on a tombstone. <c>chunkCount: 4</c>
+	///     against those same 400 keys means <c>TryRent</c> fails constantly and <c>Harvest()</c> runs on
+	///     nearly every bind (measured: 396, i.e. every bind past the slab's initial 4 free chunks). Both
+	///     paths' correctness argument is entirely about racing a worker between its
 	///     <c>Exchange(State, Free)</c> and its reschedule CAS, and until this test that race had only
 	///     ever run against one worker on one core.
+	///   </para>
+	///   <para>
+	///     <b>What this proves, and what it does not.</b> This forces both cold paths to RUN constantly —
+	///     it does not force the interleaving. It relies on scheduler jitter across 400 keys and 8 workers
+	///     to land inside the narrow window between a worker's release <c>Exchange(State, Free)</c> and its
+	///     reschedule CAS, the same honest limitation
+	///     <see cref="ActorSystemStressTests.Harvest_Race_On_A_Keys_Final_Message_Is_Never_Stranded" />
+	///     discloses about itself. A targeted guard that pins the exact interleaving would need a hook that
+	///     pauses a worker between those two steps. The real oracle for a cold-path break here is the
+	///     per-key ordering comparison and <c>HandledCount</c> below — a stranded or duplicated message
+	///     from a lost race shows up as a count mismatch or an out-of-order key.
+	///     <c>Assert.That(system.RejectedClaims, Is.EqualTo(0))</c> below is NOT an oracle for that race:
+	///     per <see cref="ActorSystem{TKey,T,THandler,TScheduler}" />'s own comment on the
+	///     <c>chunk == Chunk.None</c> guard in <c>Activate</c>, a delayed worker's stale token that wins its
+	///     CAS against a re-keyed slot is absorbed by that guard, not rejected — its
+	///     <c>Scheduled -&gt; Owned</c> CAS legitimately succeeds by construction. <c>RejectedClaims</c>
+	///     instead guards a different bug class, a genuine double-schedule; it is kept here as the same
+	///     cheap secondary check the sibling multi-worker tests use, not because it detects the
+	///     eviction/harvest race this fixture exists to stress.
 	///   </para>
 	/// </summary>
 	[Test]

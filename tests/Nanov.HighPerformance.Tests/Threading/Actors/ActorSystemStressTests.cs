@@ -398,10 +398,13 @@ public class ActorSystemStressTests {
 	///     <c>keyCapacity: 8</c> rounds up to 16 map slots (§4.2's ~2× load factor). Several hundred
 	///     distinct keys, each dispatched a handful of messages and never revisited, guarantee the map
 	///     fills with no <c>Empty</c> slot left, so once no tombstone is lying around either,
-	///     <c>GetOrAddRefCold</c> is forced into <c>EvictFree</c> for every further new key. <c>chunkCount</c>
-	///     well below both the key count and the slot count forces the producer's cold <c>Harvest</c> path
-	///     too — a cell is only evictable once its chunk has been harvested (§4.4), so this test cannot
-	///     reach <c>EvictFree</c> without first exercising <c>Harvest</c>.
+	///     <c>GetOrAddRefCold</c> is forced to either reuse a stockpiled tombstone via <c>Place</c> or,
+	///     failing that, evict via <c>EvictFree</c> — NOT literally "every further new key evicts":
+	///     <c>GetOrAddRefCold</c> only calls <c>EvictFree</c> when the probe finds no tombstone, so a key
+	///     that lands on one left behind by an earlier eviction reuses it without evicting anything itself.
+	///     <c>chunkCount</c> well below both the key count and the slot count forces the producer's cold
+	///     <c>Harvest</c> path too — a cell is only evictable once its chunk has been harvested (§4.4), so
+	///     this test cannot reach <c>EvictFree</c> without first exercising <c>Harvest</c>.
 	///   </para>
 	/// </summary>
 	[Test]
