@@ -1,5 +1,7 @@
 namespace Nanov.HighPerformance.Threading.Actors;
 
+using System;
+
 /// <summary>
 ///   The scheduling policy: which worker gets which key next. Implement as a <see langword="struct" />
 ///   so the calls devirtualize — the struct wraps a reference to its own shared state, the same shape
@@ -12,8 +14,18 @@ namespace Nanov.HighPerformance.Threading.Actors;
 ///   </para>
 /// </summary>
 public interface IKeyScheduler {
-	/// <summary>Allocate per-worker structures. Called once, before any worker starts.</summary>
-	void Start(int workerCount);
+	/// <summary>
+	///   Allocate per-worker structures and start any scheduler-owned threads. Called once, before any
+	///   worker starts.
+	///   <para>
+	///     <paramref name="onFault" /> is the scheduler's channel back to the system for a fault on a
+	///     thread the scheduler owns. A scheduler-owned thread that dies silently is the worst failure
+	///     mode available: the system's workers park on an unbounded wait, quiescence becomes
+	///     unreachable, and <c>Completion</c> never resolves. Invoke it from any catch on such a thread
+	///     BEFORE stopping, so the exception is recorded rather than lost.
+	///   </para>
+	/// </summary>
+	void Start(int workerCount, Action<Exception> onFault);
 
 	/// <summary>
 	///   Schedule a newly-dirty key from the PRODUCER thread. Must not be called from a worker —

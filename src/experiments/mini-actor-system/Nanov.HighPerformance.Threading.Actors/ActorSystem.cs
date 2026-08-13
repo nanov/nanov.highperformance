@@ -96,7 +96,7 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		_processedPublished = new PaddedLong[workers];
 		_liveWorkers = workers;
 
-		_scheduler.Start(workers);
+		_scheduler.Start(workers, Fault);
 		_batchBound = batchBound > 0 ? batchBound : _chunkSize;
 	}
 
@@ -243,18 +243,19 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	///   <para>
 	///     <b>The recheck above does not cover every window — known debt, not silently relied upon.</b>
 	///     This side of the handshake IS fenced: <c>_producerParked = true</c> →
-	///     <c>Interlocked.MemoryBarrier()</c> → re-read <c>Head</c>. But the worker's wake sites
-	///     (<c>Activate</c>'s periodic flush and <c>ReleaseAndMaybeSchedule</c>) publish
-	///     <c>Head</c> with a plain <c>Volatile.Write</c> and then read <c>_producerParked</c> — a
-	///     release-store followed by an acquire-load of a <b>different</b> location, which is not
-	///     StoreLoad-ordered. So the worker can publish <c>Head</c>, read <c>_producerParked</c> as
-	///     false (we had not armed yet), and skip the <c>Set</c>, while we arm, fence, and then read a
-	///     <i>stale</i> <c>Head</c> — a wake can be missed entirely. It is the bounded 20&#160;ms
-	///     <c>_spaceAvailable.Wait(TimeSpan)</c> below — not the recheck — that covers that case:
-	///     nothing hangs, but a missed wake costs a full 20&#160;ms poll interval, a tail-latency cliff
-	///     on the backpressure path. The fix (a short spin before parking, matching
-	///     <c>SpRingCore.WaitForSpaceSlow</c>, or a fence before the <c>_producerParked</c> read on the
-	///     worker side) is deferred pending measurement.
+	///     <c>Interlocked.MemoryBarrier()</c> → re-read <c>Head</c>. <c>ReleaseAndMaybeSchedule</c> is
+	///     fenced too: its <c>_producerParked</c> read sits after the <c>Interlocked.Exchange</c> on
+	///     <c>cell.State</c>, which is a full fence. The remaining debt is <c>Activate</c>'s mid-batch
+	///     flush alone — it publishes <c>Head</c> with a plain <c>Volatile.Write</c> and then reads
+	///     <c>_producerParked</c> — a release-store followed by an acquire-load of a <b>different</b>
+	///     location, which is not StoreLoad-ordered. So the worker can publish <c>Head</c>, read
+	///     <c>_producerParked</c> as false (we had not armed yet), and skip the <c>Set</c>, while we
+	///     arm, fence, and then read a <i>stale</i> <c>Head</c> — a wake can be missed entirely. It is
+	///     the bounded 20&#160;ms <c>_spaceAvailable.Wait(TimeSpan)</c> below — not the recheck — that
+	///     covers that case: nothing hangs, but a missed wake costs a full 20&#160;ms poll interval, a
+	///     tail-latency cliff on the backpressure path. The fix (a short spin before parking, matching
+	///     <c>SpRingCore.WaitForSpaceSlow</c>, or a fence before the <c>_producerParked</c> read in
+	///     <c>Activate</c>'s flush) is deferred pending measurement.
 	///   </para>
 	/// </summary>
 	private bool WaitForMailboxSpace(ref KeyCell<TKey> cell) {
@@ -291,7 +292,11 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 			// Recheck INSIDE the armed window. The predicate is not "did I harvest" but "has a cell
 			// reached Free since my last scan" — which a worker can make true at any moment. Without
 			// this we sleep a full poll interval with a harvestable chunk already available.
-			if (Harvest()) return true;
+			//
+			// !_stopped, not a bare true: this fast path skips the sleep path's own re-check below, so a
+			// Dispose landing in this exact window would otherwise let a chunk-starved Dispatch return
+			// true for a message that BindChunk then writes into a cell nobody drains — dropped silently.
+			if (Harvest()) return !_stopped;
 
 			_spaceAvailable.Wait(TimeSpan.FromMilliseconds(20));
 			return !_stopped && !_completed;
@@ -313,6 +318,20 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		}
 	}
 
+	/// <summary>
+	///   Record a fault from a background thread and stop the system so everyone can exit.
+	///   <para>
+	///     All three steps are required. Recording alone leaves the survivors parked; stopping alone
+	///     loses the exception; and without the wake, workers already blocked on an unbounded wait
+	///     never re-check <c>_stopped</c>.
+	///   </para>
+	/// </summary>
+	private void Fault(Exception error) {
+		_completionError ??= error;
+		_stopped = true;
+		_scheduler.SignalStop();
+	}
+
 	private void RunLoop(object? state) {
 		WorkerState<THandler>? w = null;
 		try {
@@ -332,10 +351,11 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		}
 		catch (Exception ex) {
 			// A background-thread escape would kill the host process with Completion unresolved.
-			// Fault Completion instead so the failure is observable.
-			_completionError ??= ex;
+			// Fault the system so the failure is observable AND the survivors are released — see Fault's
+			// own doc for why recording the exception alone is not enough.
+			Fault(ex);
 			// Only reachable with a worker identity; if the cast itself failed there is no handler copy
-			// to report through, and _completionError above is what surfaces the failure.
+			// to report through, and Fault above is what surfaces the failure.
 			if (w is not null) SafeOnError(w, ex);
 		}
 		finally {
@@ -377,10 +397,11 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 				// with its peers and can see a stale sum — reporting a cleanly-drained system as
 				// cancelled.
 				var allDrained = _completed && QuiescentSum() >= Volatile.Read(ref _dispatchedFinal);
-				// Hard stop cancels — mirrors the worker family (SpRingCore.SetCompletion). A genuine
-				// soft-complete-with-exception is the only case that actually faults Completion.
-				if (_stopped && !allDrained) _completion.TrySetCanceled();
-				else if (_completionError is not null) _completion.TrySetException(_completionError);
+				// A recorded fault wins over a cancellation: Fault() sets _stopped as part of stopping
+				// the system, so testing _stopped first would report every fault as a plain cancel and
+				// discard the exception. A cancel is what a fault-free hard stop looks like.
+				if (_completionError is not null) _completion.TrySetException(_completionError);
+				else if (_stopped && !allDrained) _completion.TrySetCanceled();
 				else _completion.TrySetResult();
 			}
 		}
@@ -684,6 +705,17 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	// ---- test hooks -------------------------------------------------------------------------------
 
 	internal ref KeyCell<TKey> CellOf(TKey key) => ref _map.GetOrAddRef(key, out _, out _);
+
+	/// <summary>
+	///   Simulate a fault on a scheduler-owned background thread (the router, or an equivalent).
+	///   <para>
+	///     There is no natural trigger for this in-process: the router's own catch has no reachable
+	///     throw site short of a bounds misconfiguration, and a worker-loop escape has no natural
+	///     trigger at all. A hook is the honest instrument for exercising the fault channel rather than
+	///     contriving a fake "natural" failure that would misrepresent what the test is guarding.
+	///   </para>
+	/// </summary>
+	internal void InjectSchedulerFaultForTesting(Exception error) => Fault(error);
 
 	internal long DispatchedCount => _dispatched;
 

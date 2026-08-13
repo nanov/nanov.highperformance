@@ -28,7 +28,10 @@ public struct SingleWorkerScheduler : IKeyScheduler {
 	/// <summary>Ring capacity; must be at least the key map's slot count so it can never fill.</summary>
 	public int Capacity { get; set; } = 1024;
 
-	public void Start(int workerCount) {
+	// onFault is accepted for interface conformance only. This scheduler owns no background thread —
+	// its only thread is the single worker itself, which already reports through ActorSystem.RunLoop's
+	// own catch — so there is nothing here that could die silently and need this channel.
+	public void Start(int workerCount, Action<Exception> onFault) {
 		if (workerCount != 1)
 			throw new ArgumentOutOfRangeException(nameof(workerCount),
 				"SingleWorkerScheduler drives exactly one worker — its ring is strictly SPSC. " +

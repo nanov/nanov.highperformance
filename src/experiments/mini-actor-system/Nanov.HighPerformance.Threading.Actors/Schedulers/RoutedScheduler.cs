@@ -51,6 +51,7 @@ public struct RoutedScheduler : IKeyScheduler {
 		public Thread? Router;
 		public volatile bool Stopping;
 		public int NextRoundRobin;
+		public Action<Exception>? OnFault;
 	}
 
 	/// <summary>Ring capacity; must be at least the key map's slot count so a ring can never fill.</summary>
@@ -64,7 +65,7 @@ public struct RoutedScheduler : IKeyScheduler {
 	/// </summary>
 	public int LocalDrainBound { get; set; } = 16;
 
-	public void Start(int workerCount) {
+	public void Start(int workerCount, Action<Exception> onFault) {
 		if (workerCount < 1) throw new ArgumentOutOfRangeException(nameof(workerCount));
 		// A struct RoutedScheduler wraps a reference to shared State; handing the SAME value to a second
 		// ActorSystem would replace the rings out from under a live router and start a second router
@@ -72,6 +73,7 @@ public struct RoutedScheduler : IKeyScheduler {
 		if (_state.Router is not null)
 			throw new InvalidOperationException(
 				"this scheduler instance is already driving a system; construct a new one per ActorSystem.");
+		_state.OnFault = onFault;
 		_state.Inbox = new KeyRing(Capacity);
 		_state.WorkerRings = new KeyRing[workerCount];
 		_state.Local = new int[workerCount][];
@@ -120,11 +122,11 @@ public struct RoutedScheduler : IKeyScheduler {
 	///     re-snapshot immediately.
 	///   </para>
 	///   <para>
-	///     <b>Otherwise fail-fast.</b> The router has no fault channel back to the system's
-	///     <c>Completion</c> the way a worker's <c>RunLoop</c> does — there is nowhere to report an
-	///     exception except by not letting it kill the process. The outer <c>catch</c> below exists ONLY
-	///     for that: it stops routing and releases every parked primitive so nobody hangs, it does not
-	///     attempt to recover or preserve the in-flight key.
+	///     <b>Otherwise fail-fast.</b> The router now has a fault channel back to the system —
+	///     <see cref="State.OnFault" />, invoked BEFORE the stop-and-signal cleanup below so the
+	///     exception is recorded before anyone can observe <c>_stopped</c>. The outer <c>catch</c> still
+	///     stops routing and releases every parked primitive so nobody hangs; it does not attempt to
+	///     recover or preserve the in-flight key.
 	///   </para>
 	/// </summary>
 	private static void RouteLoop(State s, RoutingPolicy policy) {
@@ -163,10 +165,11 @@ public struct RoutedScheduler : IKeyScheduler {
 				}
 			}
 		}
-		catch (Exception) {
-			// Fail-fast otherwise (see the doc comment above) — this only stops the router from taking
-			// the host process down with it. Release every parked primitive, including this router's own,
-			// so a worker blocked in an unbounded Wait() is not left hanging forever.
+		catch (Exception ex) {
+			// Tell the system first: it records the exception and sets _stopped, which is what lets
+			// the workers exit rather than park forever. Then the existing cleanup releases anyone
+			// already parked.
+			s.OnFault?.Invoke(ex);
 			s.Stopping = true;
 			s.InboxNotEmpty.Set();
 			foreach (var evt in s.WorkAvailable!)
@@ -216,7 +219,7 @@ public struct RoutedScheduler : IKeyScheduler {
 		// never routed at all, quiescence is never reached, and the system hangs. Schedule runs once
 		// per activation, not per message, so the fence is cheap here.
 		//
-		// This is the same StoreLoad gap recorded as known debt on the worker's wake site — do not
+		// This is the same StoreLoad gap recorded as known debt on Activate's mid-batch flush — do not
 		// reproduce it here.
 		Interlocked.MemoryBarrier();
 		if (_state.RouterParked) _state.InboxNotEmpty.Set();
