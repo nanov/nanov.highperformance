@@ -622,7 +622,8 @@ disposal take N seconds. `Completion` resolves as `OperationCanceledException`, 
 
 ## 6. Scheduler seam
 
-The nine members as shipped (`Schedulers/IKeyScheduler.cs` is the authority; this listing is a
+The nine members as shipped (`IKeyScheduler.cs`, at the project root — not under `Schedulers/`,
+which holds only the implementations — is the authority; this listing is a
 convenience and must be re-read against the file before it is relied on):
 
 ```csharp

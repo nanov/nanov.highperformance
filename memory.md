@@ -54,7 +54,7 @@ run. Phase 2b makes D exist and proves it correct, nothing more. Design detail l
   `Parked` write, turning the reversal into a deterministic hang — was deliberately not built.
 - **`TryEnqueue`'s `false` is "not right now", never durable fullness — and throwing on it was a live
   bug.** Reproduced 7/40 on unmutated code, after a review had classified it as "not a live defect"; one
-  retry measured insufficient (5/50). Now a bounded 64-attempt spin-retry, 44 of which escalate to
+  retry measured insufficient (5/50). Now a bounded 64-attempt spin-retry, ~44 of which escalate to
   `Thread.Sleep(1)`: **~65 ms worst case**, which anyone budgeting dispatch tail latency needs to know.
   The escalation is right because a `false` with `CountApprox == 0` proves the blocking stamp is a full
   lap stale — OS-preemption scale, not a few instructions.
