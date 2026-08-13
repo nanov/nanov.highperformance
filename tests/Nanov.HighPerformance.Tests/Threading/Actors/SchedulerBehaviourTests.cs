@@ -70,6 +70,7 @@ public class SchedulerBehaviourTests<TScheduler, TFactory>
 		Assert.That(producer.Join(TimeSpan.FromSeconds(90)), Is.True,
 			$"producer wedged after {Volatile.Read(ref dispatched)}/{total} dispatches");
 		if (producerError is not null) Assert.Fail($"producer threw: {producerError}");
+		Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(total), "a Dispatch was rejected mid-run");
 
 		system.TryComplete();
 		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, total);
@@ -78,13 +79,47 @@ public class SchedulerBehaviourTests<TScheduler, TFactory>
 		Assert.That(byKey, Has.Count.EqualTo(keys));
 		foreach (var (key, values) in byKey)
 			Assert.That(values, Is.EqualTo(Enumerable.Range(0, perKey).ToList()), $"key {key} out of order");
+
+		// Unambiguous here, unlike Eviction_And_Harvest_Under_Eight_Workers_Lose_Nothing below: with 64
+		// keys against chunkCount: 64 (64 of the map's 512 slots), every key keeps its own chunk for the
+		// run's whole lifetime, so neither Harvest nor EvictFree ever runs and no cell is ever tombstoned
+		// or re-keyed. A stale token therefore cannot legitimately win a CAS against a re-keyed slot (the
+		// caveat ActorSystem.Activate's chunk == Chunk.None guard documents, and that
+		// Eviction_And_Harvest_Under_Eight_Workers_Lose_Nothing is NOT free of) — a nonzero count here can
+		// only mean a genuine duplicate token for one key index. That is exactly the failure mode a
+		// scheduler that lets a key move between workers (D's stealing, D's ScheduleLocal spill into the
+		// shared global queue) would expose first, and this invariant was previously asserted only under
+		// RoutedScheduler across the whole suite.
+		Assert.That(system.RejectedClaims, Is.EqualTo(0),
+			"a worker lost the Scheduled -> Owned CAS: two tokens existed for one key index");
 	}
 
 	/// <summary>
-	///   Test 14. Every worker must genuinely PARK, and the system must still complete. A lost-wakeup
-	///   bug passes every test whose workers never sleep, so the sleep here is the point: the dispatch
-	///   is tiny and the pause is long enough that eight workers are certainly blocked before
-	///   TryComplete runs.
+	///   N=8 lifecycle smoke test — NOT a guard for the quiescence broadcast, and not for a lost wakeup on
+	///   the schedule path either. Trace it: 4 messages, <c>batchBound: 0</c>, all handled and published
+	///   long before the 500&#160;ms sleep ends, so by the time <c>TryComplete</c> sets <c>_completed</c>
+	///   no <c>PublishProcessed</c> call is still pending to observe <c>IsQuiescent()</c> true — it reads
+	///   <c>_completed</c> first, and every publish already happened while that flag was false. The
+	///   quiescence broadcast in <c>PublishProcessed</c> therefore never fires; every parked worker is
+	///   released by <c>TryComplete</c>'s own unconditional <c>SignalStop()</c> instead. This test passes
+	///   with that entire broadcast block deleted. It also does not detect a lost wakeup on dispatch: a
+	///   dropped <c>Set</c> during <c>Schedule</c>/<c>ScheduleLocal</c> just leaves the message sitting
+	///   until <c>SignalStop</c>'s own <c>WakeAll</c> releases every worker, which then finds
+	///   <c>HasWork == true</c> and drains it anyway.
+	///   <para>
+	///     What it genuinely guards: that <c>TryComplete</c>'s wake is <b>not</b> flag-gated. If it were,
+	///     all 8 workers would sleep forever and <see cref="WorkerTestUtil.AwaitCompletionOrStall" />
+	///     would throw within its 5&#160;s stall budget — a fast red, not a hang.
+	///   </para>
+	///   <para>
+	///     The "every worker genuinely parked before <c>TryComplete</c> ran" premise in this test's name
+	///     is <b>not</b> verified by anything below and can't be from inside this generic fixture: the
+	///     <c>Parks</c> counter lives only on the concrete <c>WorkStealingScheduler</c>, not on
+	///     <see cref="IKeyScheduler" />, so nothing here — or in CI — holds it. Checked once by hand
+	///     outside this fixture, against this exact shape under D: <c>Parks == 12</c> before
+	///     <c>TryComplete</c> ran, with all 4 messages already handled — genuinely asleep, not merely
+	///     fast — but that check is not repeatable from here and nothing enforces it going forward.
+	///   </para>
 	/// </summary>
 	[Test]
 	[CancelAfter(60_000)]
@@ -164,6 +199,7 @@ public class SchedulerBehaviourTests<TScheduler, TFactory>
 		Assert.That(producer.Join(TimeSpan.FromSeconds(90)), Is.True,
 			$"producer wedged after {Volatile.Read(ref dispatched)}/{total} dispatches");
 		if (producerError is not null) Assert.Fail($"producer threw: {producerError}");
+		Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(total), "a Dispatch was rejected mid-run");
 
 		system.TryComplete();
 		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, total);
@@ -172,6 +208,10 @@ public class SchedulerBehaviourTests<TScheduler, TFactory>
 		Assert.That(byKey, Has.Count.EqualTo(keys));
 		foreach (var (key, values) in byKey)
 			Assert.That(values, Is.EqualTo(Enumerable.Range(0, perKey).ToList()), $"key {key} out of order");
+
+		// The parameters force both cold paths to run today (drift risk, not a present hole): confirm at
+		// least one chunk actually got reclaimed rather than relying on that being incidentally true.
+		Assert.That(state.ChunkReclaimCalls, Is.GreaterThan(0), "chunk harvest/eviction never ran");
 	}
 
 	/// <summary>Test 11 — a throwing handler reports through OnError and does not break the key's order.</summary>
@@ -179,17 +219,40 @@ public class SchedulerBehaviourTests<TScheduler, TFactory>
 	[CancelAfter(60_000)]
 	public void A_Throwing_Handler_Reports_And_The_Key_Keeps_Its_Order() {
 		const int perKey = 200;
+		const int total = perKey * 4;
 		var state = new RecordingState { Throw = (key, value) => key == 1 && value % 10 == 0 };
 		using var system = NewSystem(state, keyCapacity: 64, chunkCount: 16, chunkSize: 64,
 			batchBound: 4, workers: 4, schedulerCapacity: 256);
 		system.Start();
 
-		for (var i = 0; i < perKey; i++)
-			for (var k = 0; k < 4; k++)
-				system.Dispatch(k, i);
+		// perKey: 200 against chunkSize: 64 means the mailbox WILL fill and Dispatch WILL block in
+		// WaitForMailboxSpace — the expected path here, not an edge case. A test-thread Dispatch loop
+		// cannot be interrupted by CancelAfter (ActorSystemStressTests documents this empirically), so if
+		// a D-only defect wedges a worker mid-drain this would hang with no red test instead of failing
+		// fast on the bounded join below.
+		var dispatched = 0;
+		Exception? producerError = null;
+		var producer = new Thread(() => {
+			try {
+				for (var i = 0; i < perKey; i++)
+					for (var k = 0; k < 4; k++) {
+						if (!system.Dispatch(k, i)) return;
+						dispatched++;
+					}
+			}
+			catch (Exception ex) {
+				producerError = ex;
+			}
+		}) { IsBackground = true };
+		producer.Start();
+
+		Assert.That(producer.Join(TimeSpan.FromSeconds(45)), Is.True,
+			$"producer wedged after {Volatile.Read(ref dispatched)}/{total} dispatches");
+		if (producerError is not null) Assert.Fail($"producer threw: {producerError}");
+		Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(total), "a Dispatch was rejected mid-run");
 
 		system.TryComplete();
-		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, perKey * 4);
+		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, total);
 
 		var byKey = state.ByKey();
 		Assert.Multiple(() => {
