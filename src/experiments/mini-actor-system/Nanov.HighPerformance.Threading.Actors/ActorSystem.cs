@@ -38,6 +38,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	private long _processedLocal;    // worker-private running count
 	private long _processedPublished; // published for the quiescence check (Task 7)
 	private int _activations; // test hook: counts Activate calls, so batchBound has a mechanical guard
+	private int _rejectedClaims; // test hook: acquisitions that lost the Scheduled -> Owned CAS
 
 	private readonly TaskCompletionSource _completion =
 		new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -346,7 +347,22 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	private void Activate(int index) {
 		_activations++;
 		ref var cell = ref _map.RefAt(index);
-		Interlocked.Exchange(ref cell.State, CellState.Owned);
+
+		// VALIDATE the claim — do not assume it. A blind Exchange to Owned would let two workers
+		// holding two tokens for one index both "own" the key and drain the same mailbox from the same
+		// Head: duplicate delivery, lost messages, and per-key order gone. Exclusive ownership is the
+		// only thing providing order here (design 3.1), so acquisition must be a CAS whose failure
+		// means "not ours".
+		//
+		// A legitimate token always finds Scheduled: the producer's dispatch CAS only fires
+		// Free -> Scheduled, the worker's release CAS the same, and Harvest/EvictFree only claim
+		// Free -> Reclaiming. Losing this CAS therefore means a duplicate token or a reclaimed cell —
+		// in both cases there is nothing for us to do, and touching the cell would be the bug.
+		if (Interlocked.CompareExchange(ref cell.State, CellState.Owned, CellState.Scheduled) !=
+			CellState.Scheduled) {
+			_rejectedClaims++;
+			return;
+		}
 
 		var chunk = cell.ChunkBase;
 		if (chunk == Chunk.None) {
@@ -541,6 +557,8 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	internal long DispatchedCount => _dispatched;
 
 	internal int Activations => Volatile.Read(ref _activations);
+
+	internal int RejectedClaims => Volatile.Read(ref _rejectedClaims);
 
 	internal int ProducerWakes => Volatile.Read(ref _producerWakes);
 }

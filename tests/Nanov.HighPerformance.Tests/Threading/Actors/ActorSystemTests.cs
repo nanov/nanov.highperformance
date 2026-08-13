@@ -542,4 +542,22 @@ public class ActorSystemTests {
 		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, 200 * 6);
 		Assert.That(state.HandledCount, Is.EqualTo(200 * 6));
 	}
+
+	[Test]
+	public void Activate_Rejects_A_Token_It_Did_Not_Win() {
+		var state = new RecordingState();
+		using var system = New(state, chunkSize: 64);
+		system.Start();
+
+		system.Dispatch(1, 100);
+		WorkerTestUtil.AwaitProgress(() => state.HandledCount, 1);
+		system.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, 1);
+
+		// A legitimately scheduled key is always Scheduled when the worker picks it up — the producer's
+		// dispatch CAS only fires Free -> Scheduled, and Harvest only claims Free -> Reclaiming. So a
+		// correct run must never reject a claim. This is the mechanical guard that the validating CAS
+		// is not spuriously failing; the duplicate-token case it protects against needs two workers.
+		Assert.That(system.RejectedClaims, Is.EqualTo(0));
+	}
 }
