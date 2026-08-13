@@ -227,6 +227,8 @@ public class ActorSystemStressTests {
 		Assert.That(byKey, Has.Count.EqualTo(keys));
 		foreach (var (key, values) in byKey)
 			Assert.That(values, Is.EqualTo(Enumerable.Range(0, perKey).ToList()), $"key {key}");
+		Assert.That(system.RejectedClaims, Is.EqualTo(0),
+			"a worker lost the Scheduled -> Owned CAS: two tokens existed for one key index");
 	}
 
 	/// <summary>

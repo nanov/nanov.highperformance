@@ -130,6 +130,8 @@ public class ActorSystemTests {
 		Assert.That(state.ByKey()[1], Is.EqualTo(Enumerable.Range(0, count).ToList()));
 		Assert.That(system.Activations, Is.GreaterThan(1),
 			"batchBound was not honoured — 100 messages drained in a single activation");
+		Assert.That(system.RejectedClaims, Is.EqualTo(0),
+			"a worker lost the Scheduled -> Owned CAS: two tokens existed for one key index");
 	}
 
 	[Test]
