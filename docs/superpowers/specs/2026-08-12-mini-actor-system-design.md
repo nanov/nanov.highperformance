@@ -509,8 +509,21 @@ same way and test it the same way.
    everything and is never flag-gated. §6.2's "wake exactly one, not the herd" applies to `Schedule`
    only — never to shutdown.
 2. **The last publisher after completion.** The worker whose publish completes the sum must then
-   broadcast. Ordering on that thread: publish → observe the sum is complete → read `_completed`
-   → wake all.
+   broadcast. Ordering on that thread: publish → **read `_completed` first** → then the sum → wake all.
+   In other words, evaluate the *same* quiescence predicate the exit path uses; do not hand-roll a
+   different order here.
+
+   > **This ordering was wrong in an earlier draft of this spec, which said sum-then-flag.** That is
+   > unsound as soon as the broadcast is made idempotent (and it must be — it sits on the per-32-message
+   > publish path). `_dispatchedFinal` is **0 until `TryComplete` publishes it**, so `sum >= dispatched`
+   > is unconditionally true beforehand; a worker that passes that term just before `TryComplete` lands
+   > will then read the fresh flag and broadcast at a *partial* sum, burning the one-shot gate so the
+   > real broadcast can never fire — and every parked peer waits forever.
+   >
+   > The asymmetry is the point: a **suppressed** broadcast is rescued three ways — `TryComplete` sets
+   > the flag and then wakes everything unconditionally, the worker re-publishes within `batchBound`
+   > and again in its exit path, and quiescence latches. A **premature** one is unrescuable. So order
+   > against the harmful direction, not the harmless one.
 
    > **Phase 1 does not implement this edge, and correctly so.** With a single worker, the only
    > thread that could observe quiescence is the one already evaluating the predicate on its own
