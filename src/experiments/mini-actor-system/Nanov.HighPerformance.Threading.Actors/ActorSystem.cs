@@ -1,7 +1,6 @@
 namespace Nanov.HighPerformance.Threading.Actors;
 
 using System;
-using System.Runtime.CompilerServices;
 using System.Threading;
 using Nanov.HighPerformance.Threading.Actors.Internal;
 
@@ -14,21 +13,20 @@ using Nanov.HighPerformance.Threading.Actors.Internal;
 ///     bounded mailbox.
 ///   </para>
 /// </summary>
-public sealed class ActorSystem<TKey, T, THandler> : IDisposable
+public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	where TKey : notnull, IEquatable<TKey>
-	where THandler : struct, IActorHandler<TKey, T> {
+	where THandler : struct, IActorHandler<TKey, T>
+	where TScheduler : struct, IKeyScheduler {
 	private readonly KeyCellMap<TKey> _map;
 	private readonly ChunkSlab<T> _slab;
-	private readonly KeyRing _scheduled;
 	private readonly int _chunkSize;
 	private readonly int _chunkMask;
 	private readonly int _batchBound;
 	private THandler _handler; // mutable struct — calls go through the field so state persists
+	private TScheduler _scheduler; // mutable struct — calls go through the field so they devirtualize
 
 	private long _dispatched; // producer-private; no atomics
 
-	private readonly int[] _local; // worker-private reschedule stack — never touched by the producer
-	private int _localCount;
 	private Thread? _worker;
 
 	// Explicit initializer, not just the implicit default: nothing else assigns this field until
@@ -42,7 +40,6 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 
 	private readonly TaskCompletionSource _completion =
 		new(TaskCreationOptions.RunContinuationsAsynchronously);
-	private readonly ManualResetEventSlim _workAvailable = new(false);
 	private readonly ManualResetEventSlim _spaceAvailable = new(false);
 	private volatile bool _producerParked;
 	private int _producerWakes; // test hook: counts Sets actually delivered to a parked producer
@@ -56,12 +53,15 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	///   The single shared handler. At one worker there is no per-worker copy — per-worker copies
 	///   arrive with the multi-worker phase.
 	/// </param>
+	/// <param name="scheduler">The scheduling policy — see <see cref="IKeyScheduler" />.</param>
 	/// <param name="keyCapacity">Max live keys.</param>
 	/// <param name="chunkCount">Max concurrently-dirty keys.</param>
 	/// <param name="chunkSize">Messages one key may hold before backpressure.</param>
 	/// <param name="batchBound">Max messages per activation; 0 ⇒ <paramref name="chunkSize" />.</param>
-	public ActorSystem(THandler handler, int keyCapacity, int chunkCount, int chunkSize, int batchBound = 0) {
+	public ActorSystem(THandler handler, TScheduler scheduler, int keyCapacity, int chunkCount, int chunkSize,
+		int batchBound = 0) {
 		_handler = handler;
+		_scheduler = scheduler;
 		_slab = new ChunkSlab<T>(chunkCount, chunkSize);
 		_chunkSize = _slab.ChunkSize;
 		_chunkMask = _slab.ChunkMask;
@@ -75,8 +75,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 				$"chunkCount ({_slab.ChunkCount}) must be less than the map's slot count ({_map.SlotCount}); " +
 				"raise keyCapacity or lower chunkCount.");
 
-		_scheduled = new KeyRing(_map.SlotCount);
-		_local = new int[_map.SlotCount];
+		_scheduler.Start(1);
 		_batchBound = batchBound > 0 ? batchBound : _chunkSize;
 	}
 
@@ -136,7 +135,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		Interlocked.MemoryBarrier();
 		if (Volatile.Read(ref cell.State) == CellState.Free &&
 			Interlocked.CompareExchange(ref cell.State, CellState.Scheduled, CellState.Free) == CellState.Free)
-			ScheduleFromProducer(index);
+			_scheduler.Schedule(index);
 
 		return true;
 	}
@@ -273,14 +272,6 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		}
 	}
 
-	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	private void ScheduleFromProducer(int index) {
-		if (!_scheduled.TryEnqueue(index))
-			throw new InvalidOperationException(
-				"scheduler ring full — it is sized to the map, so this indicates a key index was scheduled twice.");
-		_workAvailable.Set();
-	}
-
 	/// <summary>Start the worker thread.</summary>
 	public void Start() {
 		_worker = new Thread(RunLoop) { IsBackground = true, Name = $"Actor<{typeof(TKey).Name}>" };
@@ -290,7 +281,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	private void RunLoop() {
 		try {
 			while (!_stopped) {
-				if (TryAcquire(out var index)) {
+				if (_scheduler.TryAcquire(0, out var index)) {
 					Activate(index);
 					continue;
 				}
@@ -328,20 +319,6 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 			else if (error is not null) _completion.TrySetException(error);
 			else _completion.TrySetResult();
 		}
-	}
-
-	/// <summary>
-	///   Take the next key. The worker-private local stack has priority over the producer's ring, which
-	///   keeps a busy key pinned to this worker (affinity) and — critically — keeps the ring
-	///   single-producer, since self-rescheduled keys never enter it.
-	/// </summary>
-	private bool TryAcquire(out int index) {
-		if (_localCount > 0) {
-			index = _local[--_localCount];
-			return true;
-		}
-
-		return _scheduled.TryDequeue(out index);
 	}
 
 	private void Activate(int index) {
@@ -429,11 +406,9 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		if (Interlocked.CompareExchange(ref cell.State, CellState.Scheduled, CellState.Free) != CellState.Free)
 			return; // the producer got there first and already scheduled it — no double-schedule
 
-		if (fromWorker) PushLocal(index);
-		else ScheduleFromProducer(index);
+		if (fromWorker) _scheduler.ScheduleLocal(0, index);
+		else _scheduler.Schedule(index);
 	}
-
-	private void PushLocal(int index) => _local[_localCount++] = index;
 
 	private void PublishProcessed() => Volatile.Write(ref _processedPublished, _processedLocal);
 
@@ -466,7 +441,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		// Shutdown wakes UNCONDITIONALLY — never flag-gated. Without this, a system that was already
 		// drained and parked when TryComplete arrives would never be woken by anything: no further
 		// message will ever be processed, so no worker will ever re-evaluate the predicate.
-		WakeAll();
+		_scheduler.SignalStop();
 		_spaceAvailable.Set();
 
 		// A system that was constructed but never started has no worker thread, so RunLoop's finally
@@ -480,8 +455,6 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 		return true;
 	}
 
-	private void WakeAll() => _workAvailable.Set();
-
 	/// <summary>
 	///   Park until work arrives or the system should exit. Returns false to exit the loop.
 	///   <para>
@@ -492,22 +465,20 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	/// </summary>
 	private bool WaitForWork() {
 		for (var spin = 0; spin < 32; spin++) {
-			if (HasWork() || _stopped) return !_stopped;
+			if (_scheduler.HasWork(0) || _stopped) return !_stopped;
 			Thread.SpinWait(64);
 		}
 
 		while (true) {
-			_workAvailable.Reset();
+			_scheduler.ArmWait(0);
 			Interlocked.MemoryBarrier();
-			if (HasWork() || _stopped) return !_stopped;
+			if (_scheduler.HasWork(0) || _stopped) return !_stopped;
 			if (IsQuiescent()) return false;
-			_workAvailable.Wait();
-			if (HasWork() || _stopped) return !_stopped;
+			_scheduler.Wait(0);
+			if (_scheduler.HasWork(0) || _stopped) return !_stopped;
 			if (IsQuiescent()) return false;
 		}
 	}
-
-	private bool HasWork() => _localCount > 0 || _scheduled.CountApprox > 0;
 
 	/// <summary>
 	///   Everything dispatched has been processed and completion was signalled.
@@ -539,7 +510,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	public void Dispose() {
 		if (Interlocked.Exchange(ref _disposeGate, 1) != 0) return;
 		_stopped = true;
-		WakeAll();
+		_scheduler.SignalStop();
 		_spaceAvailable.Set();
 		if (_worker is null) _completion.TrySetCanceled();
 		else _worker.Join(TimeSpan.FromSeconds(1));
@@ -551,8 +522,6 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	// ---- test hooks -------------------------------------------------------------------------------
 
 	internal ref KeyCell<TKey> CellOf(TKey key) => ref _map.GetOrAddRef(key, out _, out _);
-
-	internal int ScheduledCountApprox => _scheduled.CountApprox;
 
 	internal long DispatchedCount => _dispatched;
 

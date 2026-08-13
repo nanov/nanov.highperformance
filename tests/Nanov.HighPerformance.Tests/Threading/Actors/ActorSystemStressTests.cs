@@ -2,6 +2,7 @@ namespace Nanov.HighPerformance.Tests.Threading.Actors;
 
 using Nanov.HighPerformance.Tests.Threading.Workers;
 using Nanov.HighPerformance.Threading.Actors;
+using Nanov.HighPerformance.Threading.Actors.Schedulers;
 using NUnit.Framework;
 
 /// <summary>
@@ -14,7 +15,7 @@ using NUnit.Framework;
 ///     attribute available. But <c>CancelAfterCommand.Execute</c> runs the test body <b>synchronously, on
 ///     the calling thread</b>, and merely arms a <see cref="System.Threading.CancellationTokenSource" /> —
 ///     NUnit's own docs say the test has to observe that token itself. Nothing in
-///     <see cref="ActorSystem{TKey,T,THandler}" /> does: <c>Dispatch</c>, <c>WaitForMailboxSpace</c>,
+///     <see cref="ActorSystem{TKey,T,THandler,TScheduler}" /> does: <c>Dispatch</c>, <c>WaitForMailboxSpace</c>,
 ///     <c>WaitForChunk</c> and <c>TryComplete</c> all block on a plain
 ///     <see cref="System.Threading.ManualResetEventSlim" /><c>.Wait(TimeSpan)</c> poll with no token in
 ///     sight. So a wedged <c>Dispatch</c> on the TEST thread would sail straight through its
@@ -43,9 +44,13 @@ using NUnit.Framework;
 /// </summary>
 [TestFixture]
 public class ActorSystemStressTests {
-	private static ActorSystem<int, int, RecordingHandler> New(RecordingState state,
+	private static ActorSystem<int, int, RecordingHandler, SingleWorkerScheduler> New(RecordingState state,
 		int keyCapacity = 128, int chunkCount = 32, int chunkSize = 8, int batchBound = 0) =>
-		new(new RecordingHandler(state), keyCapacity, chunkCount, chunkSize, batchBound);
+		// Capacity: the map rounds keyCapacity up to a power of two and then doubles it (§4.2's load
+		// factor), so keyCapacity * 4 is safely above the map's actual slot count — the ring can never
+		// fill from key indices alone.
+		new(new RecordingHandler(state), new SingleWorkerScheduler { Capacity = keyCapacity * 4 },
+			keyCapacity, chunkCount, chunkSize, batchBound);
 
 	/// <summary>
 	///   §5.3 — the release race. One key, the producer appending continuously while the worker keeps
@@ -339,7 +344,7 @@ public class ActorSystemStressTests {
 	///   never be observed as concurrent ownership — there is nothing else to own it concurrently WITH —
 	///   so it can only ever show up as a harmless-looking symptom: the doubly-scheduled key index gets
 	///   dequeued a second time, finds <c>Tail == Head</c> already (nothing left to drain), and releases
-	///   immediately. That inflates <see cref="ActorSystem{TKey,T,THandler}.Activations" /> without
+	///   immediately. That inflates <see cref="ActorSystem{TKey,T,THandler,TScheduler}.Activations" /> without
 	///   changing the handled count.
 	///   <para>
 	///     Every message is dispatched here <b>before</b> <c>Start()</c> is called, so nothing races the
@@ -385,7 +390,7 @@ public class ActorSystemStressTests {
 	/// <summary>
 	///   §4.4/§5.5 — cell eviction (<c>KeyCellMap.EvictFree</c>) under a live worker.
 	///   <b>Before this test, <c>KeyCellMap.EvictFree</c> never executed inside a running
-	///   <see cref="ActorSystem{TKey,T,THandler}" /> anywhere in this suite</b> — every other actor test
+	///   <see cref="ActorSystem{TKey,T,THandler,TScheduler}" /> anywhere in this suite</b> — every other actor test
 	///   over-sizes the map relative to its key count, so the whole eviction sweep was exercised only by
 	///   <c>KeyCellMapTests</c>' direct, single-threaded calls, never against a live producer/worker pair.
 	///   <para>

@@ -2,14 +2,19 @@ namespace Nanov.HighPerformance.Tests.Threading.Actors;
 
 using Nanov.HighPerformance.Threading.Actors;
 using Nanov.HighPerformance.Threading.Actors.Internal;
+using Nanov.HighPerformance.Threading.Actors.Schedulers;
 using Nanov.HighPerformance.Tests.Threading.Workers;
 using NUnit.Framework;
 
 [TestFixture]
 public class ActorSystemTests {
-	private static ActorSystem<int, int, RecordingHandler> New(RecordingState state,
+	private static ActorSystem<int, int, RecordingHandler, SingleWorkerScheduler> New(RecordingState state,
 		int keyCapacity = 64, int chunkCount = 16, int chunkSize = 8, int batchBound = 0) =>
-		new(new RecordingHandler(state), keyCapacity, chunkCount, chunkSize, batchBound);
+		// Capacity: the map rounds keyCapacity up to a power of two and then doubles it (§4.2's load
+		// factor), so keyCapacity * 4 is safely above the map's actual slot count — the ring can never
+		// fill from key indices alone.
+		new(new RecordingHandler(state), new SingleWorkerScheduler { Capacity = keyCapacity * 4 },
+			keyCapacity, chunkCount, chunkSize, batchBound);
 
 	[Test]
 	public void First_Dispatch_Binds_A_Chunk_And_Schedules() {
@@ -30,7 +35,6 @@ public class ActorSystemTests {
 			Assert.That(tail, Is.EqualTo(1));
 			Assert.That(head, Is.EqualTo(0));
 			Assert.That(cellState, Is.EqualTo(CellState.Scheduled));
-			Assert.That(system.ScheduledCountApprox, Is.EqualTo(1));
 		});
 	}
 
@@ -39,12 +43,20 @@ public class ActorSystemTests {
 		var state = new RecordingState();
 		using var system = New(state);
 
+		// Both dispatches land BEFORE Start(), so the key's whole burst is sitting in its mailbox
+		// before the first activation ever runs — deterministic, not a race against the worker. If the
+		// second dispatch wrongly rescheduled an already-Scheduled key, the scheduler would carry two
+		// tokens for the same index: the first activation drains both messages and releases (Tail ==
+		// Head, no reschedule), then the stale second token surfaces as a spurious extra Activate call
+		// whose claim CAS is rejected (state is Free, not Scheduled) — Activations would be 2, not 1.
 		system.Dispatch(1, 100);
 		system.Dispatch(1, 101);
+		system.Start();
 
+		WorkerTestUtil.AwaitProgress(() => state.HandledCount, 2);
 		Assert.Multiple(() => {
 			Assert.That(system.CellOf(1).Tail, Is.EqualTo(2));
-			Assert.That(system.ScheduledCountApprox, Is.EqualTo(1), "first-dirty gating failed");
+			Assert.That(system.Activations, Is.EqualTo(1), "first-dirty gating failed — key was scheduled twice");
 		});
 	}
 
@@ -53,12 +65,17 @@ public class ActorSystemTests {
 		var state = new RecordingState();
 		using var system = New(state);
 
+		// Same reasoning as Second_Dispatch_To_A_Scheduled_Key_Does_Not_Reschedule: both dispatches per
+		// key land before Start(), so 5 keys gate down to exactly 5 activations if first-dirty gating
+		// holds, or more if any key was double-scheduled.
 		for (var k = 0; k < 5; k++) {
 			system.Dispatch(k, k * 10);
 			system.Dispatch(k, k * 10 + 1);
 		}
 
-		Assert.That(system.ScheduledCountApprox, Is.EqualTo(5));
+		system.Start();
+		WorkerTestUtil.AwaitProgress(() => state.HandledCount, 10);
+		Assert.That(system.Activations, Is.EqualTo(5), "first-dirty gating failed — a key was scheduled twice");
 	}
 
 	[Test]
