@@ -9,6 +9,61 @@ implication ("so don't…"). If something becomes a permanent rule, move it into
 
 ---
 
+## 2026-08-13 — Mini actor system Phase 2b: scheduler D (work stealing) shipped; what it taught
+
+D (`WorkStealingScheduler`) is in, behind the **unchanged** `IKeyScheduler` seam — B and D still differ
+by exactly one type argument at the call site. Both now run the same behavioural fixture
+(`SchedulerBehaviourTests`, generic over the scheduler), so nothing about the seam had to bend to admit
+a pull-side scheduler. **This does not answer the experiment's question**: the B-vs-D benchmark has not
+run. Phase 2b makes D exist and proves it correct, nothing more. Design detail lives in
+`docs/superpowers/specs/2026-08-12-mini-actor-system-design.md`; this entry is the decisions and traps.
+
+- **The global queue is MPMC, not the SPMC the spec described.** Deque overflow means a worker spills
+  into the same queue, so there are `workers + 1` enqueuers. One CAS on a path that runs once per
+  *activation*, not per message — cheaper than a sizing invariant that would be silent to violate.
+- **`HasWork` must consult peer deques, and no correctness test would ever tell you.** Report on only
+  your own deque plus the global queue and workers park while stealable work sits in a peer's deque —
+  D silently degenerates into B without a router. Quiescence still resolves, so the symptom is
+  throughput-only. Mutation-verified as caught deterministically (15/15 both TFMs) only because a test
+  asserts the steal *directly*. Don't "simplify" that peer scan.
+- **A worker's deque never holds more than one item.** `ScheduleLocal` is the only push source, runs on
+  that worker's own thread inside `Activate`, and `RunLoop` goes straight back to `TryAcquire`, which
+  pops its own deque first. So: `DequeOverflows == 0` is **structural, not headroom**; the spill path
+  and its bounded retry are **unreachable at any `DequeCapacity`** (that knob is very nearly dead —
+  don't tune it); the Chase-Lev deque is a depth-1 handoff slot; and every steal comes from the window
+  between one push and its own next pop. Reframes what "work stealing" means in D — carry it into the
+  benchmark's interpretation.
+- **The starvation asymmetry is now measured, with a caveat that must travel with it.** B unbounded
+  starves a ring-queued key for the *entire* hot stream (position 3000/3000); B bounded rescues it at
+  exactly `LocalDrainBound + 1` (17); D at 4 workers rescues it at 0 — zero variance, 20/20 executions,
+  and both B positions are closed forms predicted from `TryAcquire` before being confirmed. **But the
+  comparison varies two factors**: B ran at 1 worker, D at 4, and **D at `workers: 1` has the identical
+  hazard with no bound to fix it**. D's immunity comes from having idle peers, not from structure. The
+  honest asymmetry: under B the ring is per-worker so a starved key is unreachable by idle peers even at
+  N > 1; under D it sits in a shared structure. Severity also scales with producer/consumer imbalance —
+  at near-parity the hazard was intermittent (~60% of runs), total only under sustained backpressure.
+- **Two lost-wakeup races in D's park protocol are undefended, and a green mutation run is not
+  coverage.** (1) `WakeOne`'s fence is **redundant on arm64** (RCsc release/acquire: an `ldar` can't
+  hoist above an earlier `stlr`, and both publish paths end in a `Volatile.Write`) and **load-bearing on
+  x86-64** (plain `mov`s, store buffer permits StoreLoad reordering). 0/70 on Apple Silicon is
+  structurally required, not weak sampling — keep the fence and always name the architecture when
+  quoting a result. (2) `ArmWait`'s reset-before-flag order: 3/80,000 mutated vs 2/80,000 baseline, i.e.
+  the design excludes a rate above ~10⁻⁴/trial and says **nothing** below. It has no power because the
+  arrival floor is the main thread's kernel wake-up (tens of µs) while the worker parks nanoseconds
+  after signalling. The remedy that would work — a test-only probe hook between `Reset()` and the
+  `Parked` write, turning the reversal into a deterministic hang — was deliberately not built.
+- **`TryEnqueue`'s `false` is "not right now", never durable fullness — and throwing on it was a live
+  bug.** Reproduced 7/40 on unmutated code, after a review had classified it as "not a live defect"; one
+  retry measured insufficient (5/50). Now a bounded 64-attempt spin-retry, 44 of which escalate to
+  `Thread.Sleep(1)`: **~65 ms worst case**, which anyone budgeting dispatch tail latency needs to know.
+  The escalation is right because a `false` with `CountApprox == 0` proves the blocking stamp is a full
+  lap stale — OS-preemption scale, not a few instructions.
+- **Process trap worth keeping.** Every fix round in this phase was a failure of *evidence*, never of
+  the scheduler: a mutation result that measured a different bug, a "spin" that was a 30 ms
+  `Thread.Sleep`, a threshold placed inside the distribution it was meant to separate, and a position
+  range quoted from an abandoned calibration. Attribute every number to the configuration that produced
+  it, and say "argued from the code, not measured" when that is what it is.
+
 ## 2026-07-10 — Two spotted concurrency bugs fixed (Conflation NRE + Dispatch/TryComplete race)
 
 Both pre-existing, surfaced during the throughput work; fixed TDD (red repro → fix → green), verified on
