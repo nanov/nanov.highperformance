@@ -43,7 +43,7 @@ internal sealed class ChunkSlab<T> {
 		_slots = new T[(int)total];
 		_nextFree = new int[_chunkCount];
 
-		// Seed the free list with every chunk, ascending so the first rent hands out chunk 0.
+		// Seed the free list with every chunk, descending so the first rent hands out chunk (chunkCount - 1).
 		for (var i = 0; i < _chunkCount; i++)
 			_nextFree[i] = i - 1;
 		_freeHead = _chunkCount - 1;

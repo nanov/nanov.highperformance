@@ -8,8 +8,18 @@ namespace Nanov.HighPerformance.Threading.Actors.Internal;
 ///     <list type="bullet">
 ///       <item><c>Key</c>, <c>ChunkBase</c>, <c>CachedHead</c> — <b>producer only</b>.</item>
 ///       <item><c>Tail</c> — <b>producer only</b>.</item>
-///       <item><c>Head</c> — <b>the current owner only</b>.</item>
-///       <item><c>State</c> — producer and workers, always via <c>Interlocked</c>.</item>
+///       <item>
+///         <c>Head</c> — normally the current owning worker only, but the producer also writes it once
+///         when binding a fresh chunk (<c>BindChunk</c> zeroes <c>Head</c>/<c>Tail</c>/<c>CachedHead</c>
+///         together, before the cell is dirty and can have an owner).
+///       </item>
+///       <item>
+///         <c>State</c> — producer and workers, mostly via <c>Interlocked</c> (CAS / <c>Exchange</c>);
+///         <c>Harvest</c>'s and <c>EvictFree</c>'s final publish, and <c>Place</c>'s initial publish, are
+///         a plain <c>Volatile.Write</c> instead — legal only because each is either preceded by an
+///         <c>Interlocked</c> CAS that already claimed the cell, or (in <c>Place</c>) targets a slot
+///         nothing else can observe yet.
+///       </item>
 ///     </list>
 ///   </para>
 ///   Layout is array-of-structs with no padding on purpose: the worker touches the cell only once per

@@ -107,9 +107,17 @@ internal sealed class KeyCellMap<TKey>
 		var offset = (nint)(uint)slot;
 		Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_control), offset) = Occupied;
 		ref var cell = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_cells), offset);
-		cell = default;
+		// No `cell = default` here: an Empty slot is already zeroed, and a Tombstone slot was zeroed by
+		// EvictFree — re-wiping is provably redundant and every occurrence is a window a delayed worker
+		// can observe a half-built cell through.
 		cell.Key = key;
 		cell.ChunkBase = Chunk.None;
+		cell.Head = 0;
+		cell.Tail = 0;
+		cell.CachedHead = 0;
+		// State published LAST, after the cell is fully initialized: a delayed worker that observes
+		// Free must see a coherent cell, never a half-built one.
+		Volatile.Write(ref cell.State, CellState.Free);
 		_count++;
 	}
 
@@ -117,7 +125,7 @@ internal sealed class KeyCellMap<TKey>
 	///   Tombstone every cell that is <c>Free</c> <b>and</b> holds no chunk, reclaiming its slot.
 	///   Both conditions matter: a cell holding storage must keep its identity until the producer has
 	///   harvested the chunk (§4.4/§5.5), and a non-<c>Free</c> cell is in use by a worker. <c>State</c>
-	///   is acquire-read because the worker publishes it. Cold path.
+	///   is claimed via CAS, not acquire-read — see the comment on the CAS below. Cold path.
 	/// </summary>
 	[MethodImpl(MethodImplOptions.NoInlining)]
 	private bool EvictFree() {
@@ -142,6 +150,11 @@ internal sealed class KeyCellMap<TKey>
 			ctl = Tombstone;
 			cell = default;
 			cell.ChunkBase = Chunk.None;
+			// Publish Reclaiming LAST: `cell = default` resets State to Free (0), which would drop the
+			// claim we just took and let a worker still between its State release and its Tail recheck
+			// win CAS(Free -> Scheduled) on a slot we are re-keying. Two tokens for one index breaks the
+			// "never two" invariant (design §3.1).
+			Volatile.Write(ref cell.State, CellState.Reclaiming);
 			_count--;
 			freed = true;
 		}

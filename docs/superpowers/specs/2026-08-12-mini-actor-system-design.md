@@ -409,6 +409,16 @@ blocking **measurable**: run the same benchmark both ways and the delta is exact
 v1 per-key bound — the number that decides whether v2 chaining is worth building. Both return
 `false` if the system is completed or disposed, as the family does.
 
+> **Known debt — the worker's side of the parked-flag handshake has no StoreLoad fence.** The
+> producer's side is fenced (`_producerParked = true` → `Interlocked.MemoryBarrier()` → re-read
+> `Head`), but the worker's wake sites publish `Head` with a plain `Volatile.Write` and then read
+> `_producerParked` — a release-store then an acquire-load of a *different* location, not
+> StoreLoad-ordered. A wake can be missed entirely. Nothing hangs — the bounded 20 ms wait, not the
+> recheck, covers that case — but it costs a full poll interval on the tail: a measurable
+> tail-latency cliff on the backpressure path. Fix (a short spin before parking, matching
+> `SpRingCore.WaitForSpaceSlow`, or a fence before the worker's `_producerParked` read) is deferred
+> pending measurement.
+
 A rejected `TryDispatch` does **not** increment `_dispatched` (§5.6).
 
 ### 5.5 Eviction
@@ -417,6 +427,15 @@ Cold LRU sweep, producer-side. Only cells with `State == Free` **and** `ChunkBas
 already harvested) are evictable — so eviction never contends with an active drain. Guarded by
 `CAS(State, Tombstone, Free)`, then tombstone the key. A lost CAS, or a validation failure after
 winning it, goes through the shared `ReleaseAndMaybeSchedule` path (§4.4) — never a plain revert.
+
+> **Residual race — a Phase 2 entry criterion.** Eviction narrows but does not close the window in
+> which a worker delayed between its `State` release and its `Tail` recheck can mint a schedule
+> token for a slot the producer has re-keyed. Closing it needs a generation tag carried with the
+> token and validated on acquire. At one worker the consequence is bounded (a spurious activation
+> on a re-keyed cell). **It must be closed before a second worker exists**, because `Activate`
+> currently does an unconditional `Interlocked.Exchange(State, Owned)` without verifying it won the
+> key — with two tokens and two workers, both would drain one mailbox from the same `Head`,
+> destroying per-key order.
 
 ### 5.6 Completion and termination detection
 
@@ -428,7 +447,7 @@ stable observation.
 #### The scheme: message counts, not in-flight key counts
 
 ```
-producer:  int _dispatched                 // producer-private, plain increment, no atomics
+producer:  long _dispatched                // producer-private, plain increment, no atomics
 worker i:  long _processed[i]              // padded, worker-private; published at Head-flush cadence
 
 TryComplete():                             // producer thread, its last act

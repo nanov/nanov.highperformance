@@ -269,6 +269,20 @@ public class ActorSystemTests {
 		system.Dispose();
 		gate.Set();
 
+		// Bounded settle before asserting: if hard stop did NOT honour _stopped, the worker needs only
+		// microseconds to drain the remaining 49 messages once gate.Set() unblocks it — reading
+		// HandledCount immediately here would race that drain and pass regardless of whether _stopped
+		// actually worked. Waiting (bounded) on Completion gives the worker a real chance to either exit
+		// promptly (the honoured case) or finish draining everything (the broken case), so the assertion
+		// below actually distinguishes the two instead of passing either way.
+		try {
+			system.Completion.Wait(TimeSpan.FromMilliseconds(500));
+		}
+		catch {
+			// Completion settling as Cancelled/Faulted is expected here — only used to let the worker
+			// settle before the assertion below, not asserted on directly.
+		}
+
 		Assert.That(state.HandledCount, Is.LessThan(50), "hard stop should have dropped queued messages");
 	}
 

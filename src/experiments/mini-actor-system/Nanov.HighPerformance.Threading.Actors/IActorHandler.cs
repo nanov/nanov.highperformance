@@ -6,8 +6,11 @@ using System;
 ///   Per-message logic plus lifecycle hooks. Implement as a <see langword="struct" /> so the calls
 ///   devirtualize and inline — never store one as an interface reference.
 ///   <para>
-///     Each worker receives its <b>own copy</b> of the handler, so handler fields are per-worker state.
-///     Shared state must live behind a reference the struct captures.
+///     There is currently <b>one</b> <c>THandler</c> field, shared between the producer and worker
+///     threads: the producer calls <see cref="OnSlotReused" />/<see cref="OnChunkReclaimed" /> on it
+///     and the worker calls <see cref="Handle" />/<see cref="OnCompleted" />, so handler state must be
+///     thread-safe. Per-worker copies (so each worker gets its own, thread-local instance) arrive with
+///     the multi-worker phase.
 ///   </para>
 /// </summary>
 public interface IActorHandler<in TKey, T> {
@@ -18,9 +21,11 @@ public interface IActorHandler<in TKey, T> {
 	void Handle(TKey key, T message);
 
 	/// <summary>
-	///   <see cref="Handle" /> threw. Always synchronous. The message is <b>consumed</b>, not retried,
-	///   and the worker continues with the next message of the same key — so a poison message cannot
-	///   stall the key, and per-key ordering is unaffected.
+	///   An error was reported through the safe-error path. Always synchronous. Most commonly
+	///   <see cref="Handle" /> threw — the message is then <b>consumed</b>, not retried, and the worker
+	///   continues with the next message of the same key, so a poison message cannot stall the key and
+	///   per-key ordering is unaffected. But this also fires on the <b>producer</b> thread when
+	///   <see cref="OnSlotReused" /> or <see cref="OnChunkReclaimed" /> throws.
 	/// </summary>
 	void OnError(Exception error);
 

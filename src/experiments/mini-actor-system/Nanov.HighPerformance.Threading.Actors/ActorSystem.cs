@@ -25,7 +25,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	private readonly int _batchBound;
 	private THandler _handler; // mutable struct — calls go through the field so state persists
 
-	private int _dispatched; // producer-private; no atomics
+	private long _dispatched; // producer-private; no atomics
 
 	private readonly int[] _local; // worker-private reschedule stack — never touched by the producer
 	private int _localCount;
@@ -216,6 +216,22 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	///   worker that advanced Head just before we armed will not Set, so the recheck is the only thing
 	///   that catches it. Returns false if the system stopped or completed while parked, so a dispatch
 	///   racing shutdown is rejected rather than committed into a ring whose consumer has exited.
+	///   <para>
+	///     <b>The recheck above does not cover every window — known debt, not silently relied upon.</b>
+	///     This side of the handshake IS fenced: <c>_producerParked = true</c> →
+	///     <c>Interlocked.MemoryBarrier()</c> → re-read <c>Head</c>. But the worker's wake sites
+	///     (<c>Activate</c>'s periodic flush and <c>ReleaseAndMaybeSchedule</c>) publish
+	///     <c>Head</c> with a plain <c>Volatile.Write</c> and then read <c>_producerParked</c> — a
+	///     release-store followed by an acquire-load of a <b>different</b> location, which is not
+	///     StoreLoad-ordered. So the worker can publish <c>Head</c>, read <c>_producerParked</c> as
+	///     false (we had not armed yet), and skip the <c>Set</c>, while we arm, fence, and then read a
+	///     <i>stale</i> <c>Head</c> — a wake can be missed entirely. It is the bounded 20&#160;ms
+	///     <c>_spaceAvailable.Wait(TimeSpan)</c> below — not the recheck — that covers that case:
+	///     nothing hangs, but a missed wake costs a full 20&#160;ms poll interval, a tail-latency cliff
+	///     on the backpressure path. The fix (a short spin before parking, matching
+	///     <c>SpRingCore.WaitForSpaceSlow</c>, or a fence before the <c>_producerParked</c> read on the
+	///     worker side) is deferred pending measurement.
+	///   </para>
 	/// </summary>
 	private bool WaitForMailboxSpace(ref KeyCell<TKey> cell) {
 		_spaceAvailable.Reset();
@@ -277,6 +293,12 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 
 				if (!WaitForWork()) break;
 			}
+		}
+		catch (Exception ex) {
+			// A background-thread escape would kill the host process with Completion unresolved.
+			// Fault Completion instead so the failure is observable.
+			_completionError ??= ex;
+			SafeOnError(ex);
 		}
 		finally {
 			PublishProcessed();
@@ -483,7 +505,9 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 	private bool IsQuiescent() {
 		if (!_completed) return false;
 		var processed = Volatile.Read(ref _processedPublished);
-		return processed == Volatile.Read(ref _dispatchedFinal);
+		// >= not ==: an undercount only delays quiescence, but any overshoot with == would hang
+		// forever rather than exit late.
+		return processed >= Volatile.Read(ref _dispatchedFinal);
 	}
 
 	/// <summary>
@@ -511,7 +535,7 @@ public sealed class ActorSystem<TKey, T, THandler> : IDisposable
 
 	internal int ScheduledCountApprox => _scheduled.CountApprox;
 
-	internal int DispatchedCount => _dispatched;
+	internal long DispatchedCount => _dispatched;
 
 	internal int Activations => Volatile.Read(ref _activations);
 

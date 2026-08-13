@@ -379,4 +379,66 @@ public class ActorSystemStressTests {
 			$"Activations ({system.Activations}) != the deterministic minimum ({expected}) — too high points at " +
 			"a double-schedule (a spurious extra activation); too low is contradicted by HandledCount above");
 	}
+
+	/// <summary>
+	///   §4.4/§5.5 — cell eviction (<c>KeyCellMap.EvictFree</c>) under a live worker.
+	///   <b>Before this test, <c>KeyCellMap.EvictFree</c> never executed inside a running
+	///   <see cref="ActorSystem{TKey,T,THandler}" /> anywhere in this suite</b> — every other actor test
+	///   over-sizes the map relative to its key count, so the whole eviction sweep was exercised only by
+	///   <c>KeyCellMapTests</c>' direct, single-threaded calls, never against a live producer/worker pair.
+	///   <para>
+	///     <c>keyCapacity: 8</c> rounds up to 16 map slots (§4.2's ~2× load factor). Several hundred
+	///     distinct keys, each dispatched a handful of messages and never revisited, guarantee the map
+	///     fills with no <c>Empty</c> slot left, so once no tombstone is lying around either,
+	///     <c>GetOrAddRefCold</c> is forced into <c>EvictFree</c> for every further new key. <c>chunkCount</c>
+	///     well below both the key count and the slot count forces the producer's cold <c>Harvest</c> path
+	///     too — a cell is only evictable once its chunk has been harvested (§4.4), so this test cannot
+	///     reach <c>EvictFree</c> without first exercising <c>Harvest</c>.
+	///   </para>
+	/// </summary>
+	[Test]
+	[CancelAfter(120_000)]
+	public void Eviction_Under_Live_Worker_Preserves_Order_And_Loses_Nothing() {
+		const int keys = 400;
+		const int perKey = 3;
+		const int total = keys * perKey;
+		var state = new RecordingState();
+		using var system = New(state, keyCapacity: 8, chunkCount: 4, chunkSize: 4, batchBound: 2);
+		system.Start();
+
+		// Bounded producer thread, not the test thread — see the class doc comment. Each key gets its
+		// small burst and is never revisited, so cells and chunks for earlier keys go idle and become
+		// harvestable/evictable while the producer works its way through the remaining keys.
+		var dispatched = 0;
+		Exception? producerError = null;
+		var producer = new Thread(() => {
+			try {
+				var n = 0;
+				for (var k = 0; k < keys; k++)
+					for (var i = 0; i < perKey; i++) {
+						if (!system.Dispatch(k, i)) return;
+						Volatile.Write(ref dispatched, ++n);
+					}
+			}
+			catch (Exception ex) {
+				producerError = ex;
+			}
+		}) { IsBackground = true };
+		producer.Start();
+
+		Assert.That(producer.Join(TimeSpan.FromSeconds(90)), Is.True,
+			$"producer wedged after {Volatile.Read(ref dispatched)}/{total} dispatches — likely a stranded key");
+		if (producerError is not null)
+			Assert.Fail($"producer threw: {producerError}");
+		Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(total), "a Dispatch was rejected mid-run");
+
+		system.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, total);
+
+		Assert.That(state.HandledCount, Is.EqualTo(total));
+		var byKey = state.ByKey();
+		Assert.That(byKey, Has.Count.EqualTo(keys));
+		foreach (var (key, values) in byKey)
+			Assert.That(values, Is.EqualTo(Enumerable.Range(0, perKey).ToList()), $"key {key} out of order");
+	}
 }
