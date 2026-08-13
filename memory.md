@@ -9,6 +9,66 @@ implication ("so don't…"). If something becomes a permanent rule, move it into
 
 ---
 
+## 2026-08-14 — Mini actor system Phase 3: B vs D measured on throughput — no difference; skew costs 40%
+
+The head-to-head finally ran. Branch `experiment/mini-actor-system`, commits `27858ca` (deque empty-poll
+early-out) → `2abeb79` (key streams + cells) → `63fae03` (calibration) → `45af696` (the matrix). Apple M4
+Pro, 12 logical cores, macOS; 8 workers, 1 producer; constant handler cost `SpinWait(32)`; 10M messages
+per cell; 7 repeats per cell; **three independent passes** of a 2 schedulers × 2 skews × 2 cardinalities
+matrix. Detail and the full configuration live in
+`docs/superpowers/specs/2026-08-12-mini-actor-system-design.md` §6.3 and §10.
+
+- **No measurable throughput difference between B (routed) and D (work stealing) at any coordinate.**
+  Ratios 1.003x–1.176x. **The evidence is not the ratio sizes — it is that the winner alternates between
+  passes at every one of the four coordinates** (uniform/64: B,D,D; uniform/8192: B,D,B; zipf/64: B,D,D;
+  zipf/8192: D,B,B). A small real effect does not change sign three times. Ranges overlap in all three
+  passes at both cardinality-64 coordinates and in two of three at cardinality 8192, and intra-cell
+  spread (1.10x–1.50x over 7 repeats) is as large as every median gap. **So: don't pick B or D on
+  throughput; there is nothing there to pick on.**
+- **The §6.3 prediction ("D wins under skew") was aimed at the wrong metric.** Throughput at 8 saturated
+  workers cannot see what dynamic scheduling buys — which message gets handled *when*. That shows up in
+  latency, and Phase 2b already measured it exactly in positions (17 / 3000 / 0, §6.1). **A falsified
+  prediction recorded beats a hedge:** the metric, not the scheduler, was the wrong choice.
+- **Skew costs ~40% of throughput and neither scheduler recovers any of it** — uniform medians ~4.0–5.2M
+  ops/s, Zipf(s=1) medians ~2.2–3.3M, at both cardinalities under both schedulers. Expected, and it is a
+  confirmation of the design's own logic rather than a surprise: **D can move a key between workers but
+  it cannot split a key**, so under skew the limit is the hot key's own serialisation, which no
+  scheduling policy can address. At Zipf/64 key 0 takes `1/H(64)` ≈ 20% of traffic, capping the system at
+  roughly 5x one worker's rate before any scheduler decides anything. **Implication: if skew throughput
+  ever matters, the answer is a different affinity contract, not a different scheduler.**
+- **THE TRANSFERABLE ONE — a single-producer system benchmarked with a cheap handler measures the
+  producer, and that null result is indistinguishable from "the schedulers are equivalent".** With 8
+  workers and a near-free handler every scheduler saturates at the same dispatch rate. So the handler
+  cost is not a free parameter: calibrate it until the system is consumer-bound *before* believing any
+  scheduler comparison. Here the ladder `spin ∈ {0..64}` was run first; the **knee moved between passes**
+  (16 → 32) so it is *not* pinned, and **32 was chosen because run-to-run spread collapses to ~1.2x there
+  against 3–6x below — reproducibility, not peak.** The rise from spin 0 is real, not an artefact: at low
+  spin the producer races ahead, workers park/unpark and wake churn dominates, so *more* handler cost
+  raises throughput. The low rungs are the noisy ones precisely because they are the producer-bound ones.
+- **The mutation-methodology rule, sharpened (extends the Phase 2b entry below).** *A mutation must
+  remove the defective behaviour's **arbitrating effect**, not just its reported result.* Overriding a
+  CAS's returned bool while leaving the atomic RMW in place is still a genuine defect, but the real
+  atomic keeps serialising the threads underneath, collapsing detection to two nested nanosecond windows
+   — 20,000 barrier-synchronised rounds sampled it essentially never and came back **green with the race
+  counter still non-zero**, i.e. it even looked exercised. Removing the CAS entirely: 17,721/20,000 and
+  18,888/20,000. **So: when a mutation comes back green, first ask whether the mutant is still broken in
+  an *observable* way before concluding the test is blind.**
+- **macOS host caveats, permanent.** `ThreadAffinityUtil` is a documented no-op on macOS (no per-core
+  pinning API), so this perf suite **cannot** isolate itself from placement noise even on an idle
+  machine. And the first calibration attempt was unusable on a loaded host — three ladders that
+  disagreed on *which rung is fastest*, load average 7.8–11.8 on 12 cores with ~32 dotnet-family
+  background processes against a test needing 9 dedicated cores. It only became readable after the
+  background .NET tooling was quieted. **Quiet the host or you are measuring the host** — and report any
+  difference smaller than the observed spread as absent.
+- **The Phase 2b D-side suspects (depth-1 contended CAS per activation, ~0.54 failed steal acquires per
+  message) did not show up** — but they were not disproved either: at spin 32 the per-message work is
+  ~196–228 ns/msg *aggregate over 8 workers*, so nanosecond-scale per-activation costs are unresolvable
+  against it. Isolating them needs the cheap-handler regime this cut had to leave.
+- **Still open, and easy to misread the above as having settled: neither baseline was built.** No
+  hash-sharded `SpWorker`s, no `Channel<T>` + `ConcurrentDictionary`. "B ≈ D" says nothing about whether
+  this substrate beats static sharding — §1's actual question is untouched. Also open: p99, worker
+  sweep, handler-cost variance.
+
 ## 2026-08-13 — Mini actor system Phase 2b: scheduler D (work stealing) shipped; what it taught
 
 D (`WorkStealingScheduler`) is in, behind the **unchanged** `IKeyScheduler` seam — B and D still differ

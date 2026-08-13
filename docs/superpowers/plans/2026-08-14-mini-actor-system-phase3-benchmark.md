@@ -1,5 +1,75 @@
 # Mini Actor System — Phase 3: the B-vs-D measurement (first cut)
 
+## Where to pick up
+
+**This plan is complete.** Read this section first; the rest of the file is the executed plan, kept for
+provenance. Everything is on branch **`experiment/mini-actor-system`** (base `1075df1`).
+
+**Done, and where it lives**
+
+| Task | Commit | What it added |
+| --- | --- | --- |
+| 1 | `27858ca` | Empty-poll early-out in `WorkStealingDeque.TryPopBottom` (+ its test) — removes a D-side cost before measuring D |
+| 2 | `2abeb79` | `Throughput/Actors/`: `KeySequence` (uniform/Zipf/hot-key), constant-cost handler, `ActorThroughputTestBase` |
+| 3 | `63fae03` | `ProducerBoundCalibrationTest`; fixed `SpinPerMessage = 32` |
+| 4 | `45af696` | `Cells.cs` — the 8 cells; the matrix run (3 passes × 7 repeats) |
+| 5 | this commit | Spec §6.3 / §10 / §11 / §13 and `memory.md` updated with the result |
+
+**The result, in two sentences.** No measurable throughput difference between scheduler B (routed) and
+D (work stealing) at any of the four (skew × cardinality) coordinates — ratios 1.003x–1.176x, and the
+winner alternates between passes at *every* coordinate, which a small real effect would not do. Skew
+costs ~40% of throughput (uniform ~4.0–5.2M ops/s, Zipf ~2.2–3.3M) and **neither scheduler recovers
+any of it**, because D can move a key between workers but cannot split one — under skew the limit is
+the hot key's own serialisation. Full numbers and configuration: spec §6.3 and §10.
+
+**Next options, in the order they are worth doing**
+
+- **(a) The latency cut — the strongest candidate.** Throughput at 8 saturated workers is structurally
+  blind to what dynamic scheduling buys: *which* message is handled *when*. That is where B and D
+  already differ measurably — Phase 2b's starved-key positions were 17 (bounded B) / 3000 i.e. never
+  (unbounded B) / 0 (D at 4 workers), but those varied worker count alongside the scheduler. Needed:
+  p99 per-message latency and the §10 "dense-hot-key + placed victim" workload, run at N > 1 **under
+  both schedulers**. The harness already has an `ILatencyTest` path and HdrHistogram is already
+  referenced — no new dependency.
+- **(b) The external baselines — the bigger question.** N hash-sharded `SpWorker`s, and
+  `Channel<T>` + `ConcurrentDictionary`. Neither exists. Until one does, §1's actual question — does
+  N-way dynamic balancing beat N static shards — is **unanswered**; "B ≈ D" says nothing about whether
+  this substrate is worth its two-random-accesses-per-message cost at all.
+- **(c) The sweeps.** Worker count (fixed at 8 here) and handler-cost variance (constant only here —
+  and §6.3's original prediction named variable cost as one of the two regimes D was expected to win).
+  Cheapest to add, weakest per unit of runtime.
+
+**Debts not to trip over**
+
+- `KeySequence.HotKey`'s non-hot branch is `rng.Next(1, Math.Max(2, cardinality))`, which at
+  `cardinality == 1` returns key **1 — out of range**. Dead code today (no cell drives `HotKey`);
+  **fix it before the latency cut uses it** at low cardinality.
+- The perf-test project is still named `…Threading.Workers.PerfTests` while hosting actor cells.
+  Cosmetic; a rename touches the harness's reflection discovery, so do it deliberately or not at all.
+- Two **undefended lost-wakeup races** in D's park protocol (spec §11) and the **depth-1 deque** finding
+  (§6.2) are recorded, not fixed. Depth-1 in particular reframes what "work stealing" means in D and
+  makes `DequeCapacity` a near-dead knob.
+- The two D-side cost suspects (per-activation contended CAS, ~0.54 failed steal acquires per message)
+  are **unmeasured, not disproved** — at spin 32 they are unresolvable against the handler cost.
+
+**How to re-run anything**
+
+```bash
+# whole matrix (~3 min/pass on an M4 Pro); --target takes a substring of the cell class name
+dotnet run -c Release --project perf-tests/Nanov.HighPerformance.Threading.Workers.PerfTests -- \
+  --target Actors --report false --print-spec false
+# one cell, e.g.:            --target ActorsBZipfCard8192
+# recalibrate the spin knee: --target ProducerBoundCalibration
+```
+
+**The host must be quiet or the numbers are noise.** These cells ask for 9 dedicated cores; with Rider/
+ReSharper, OmniSharp or the Roslyn LSP running, three calibration ladders disagreed on *which rung is
+fastest*. Close the IDE tooling, `dotnet build-server shutdown`, check `uptime`. And on macOS
+`ThreadAffinityUtil` is a **no-op** (no per-core pinning API) — so even a quiet host removes contention
+noise, never placement noise. Report any difference smaller than the observed spread as **absent**.
+
+---
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Answer the question the experiment was started to ask — does dynamic scheduling (D, work stealing) beat static push-side routing (B) under key skew, and at what key cardinality — using a throughput harness, and report the answer honestly including when it is "no" or "no difference".

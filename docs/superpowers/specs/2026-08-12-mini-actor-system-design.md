@@ -919,11 +919,60 @@ in `ScheduleLocal` is unreachable through this `ActorSystem`/scheduler pairing (
 above). So the ~65 ms worst case belongs entirely to the **producer's `Schedule`** — which sharpens the
 latency point rather than softening it: the tail sits on the dispatch path, not on a worker's.
 
-### 6.3 Expected outcome
+### 6.3 Expected outcome — superseded by measurement
 
-B should win on low skew (fewer atomics, one predictable hop). D should win on skew and variable
-cost (idle workers self-serve instead of waiting for a router judging by a stale `QueuedApprox`).
-**Steal rate is the number that says which regime you are in** — hence the counters in §8.
+**The prediction, written before anything was measured:** *B should win on low skew (fewer atomics,
+one predictable hop). D should win on skew and variable cost (idle workers self-serve instead of
+waiting for a router judging by a stale `QueuedApprox`). Steal rate is the number that says which
+regime you are in* — hence the counters in §8.
+
+**For throughput, it did not hold.** The first cut of §10's matrix (Phase 3, commit `45af696`)
+measured B against D on an Apple M4 Pro (12 logical cores, macOS), **8 workers**, constant handler
+cost at **`SpinPerMessage = 32`** (calibrated — §10), **10M messages per cell**, **7 repeats per
+cell**, over **three independent passes** of the whole 8-cell matrix:
+
+| Coordinate | Ratio (higher/lower median), across the 3 passes | Winner per pass |
+| --- | --- | --- |
+| Uniform, cardinality 64 | 1.005x – 1.067x | B, D, D |
+| Uniform, cardinality 8192 | 1.068x – 1.176x | B, D, B |
+| Zipf(s=1), cardinality 64 | 1.003x – 1.066x | B, D, D |
+| Zipf(s=1), cardinality 8192 | 1.088x – 1.172x | D, B, B |
+
+**No measurable difference between B and D at any of the four coordinates.** The load-bearing evidence
+is not the size of the ratios — it is that **the winner alternates between passes at every
+coordinate**, which a small real effect would not do. Min–max ranges of the two cells overlap in all
+three passes at both cardinality-64 coordinates and in two of three at both cardinality-8192
+coordinates, and the intra-cell spread within a single pass's 7 repeats (1.10x–1.50x) is as large as
+or larger than every B-vs-D median gap in the table. Anything at this magnitude on this host must be
+reported as absent, not as a result (host caveats: §10).
+
+**Why the prediction failed: it was aimed at the wrong metric for this workload.** What dynamic
+scheduling buys is that an idle peer can pick up work a busy worker is sitting on — which changes
+*when a particular message is handled*, not *how many messages per second the system retires* while
+all eight workers already have work. Throughput at 8 saturated workers is structurally unable to see
+it. Where it does show up is the starved key's **latency**, and Phase 2b measured that exactly, in
+message positions rather than durations: **17** under bounded B, **3000/3000** (never, within the hot
+stream) under unbounded B, **0** under D at 4 workers (§6.1) — with the caveat, which must travel
+with those figures, that B ran at 1 worker and D at 4, so they vary two factors at once. No p99 has
+been measured under either scheduler.
+
+**The skew finding — expected from the design's own logic, and confirmed.** Zipf costs ~40% of
+throughput relative to uniform, and **neither scheduler recovers any of it**: uniform medians cluster
+at ~4.0–5.2M ops/s, Zipf medians at ~2.2–3.3M ops/s, at both cardinalities, under both schedulers.
+The structural reason is in the design: **D can move a key between workers, but it cannot split a
+key.** Under skew the limit is the hot key's own serialisation, which no scheduling policy can
+address. At Zipf(s=1) over 64 keys, key 0 takes `1/H(64)` ≈ 20% of the traffic, so the one worker
+holding it caps the whole system at roughly 5x a single worker's rate — before any scheduler makes a
+decision. Read this as a confirmation of §1's key-affinity contract, not as a defect and not as a
+surprise.
+
+**The two D-side benchmark suspects below (§10) did not surface as a measurable cost** — but that is
+not evidence they are free. `SpinPerMessage = 32` was chosen precisely because it is where per-message
+work dominates: the calibration's own ns/msg at that rung is ~196–228 ns **aggregate across 8
+workers**, i.e. on the order of a microsecond of wall time per message on the worker that handles it.
+A per-activation `CompareExchange` and a failed steal scan are nanoseconds-scale against that, and
+far below this host's run-to-run spread. They remain unmeasured, not disproved — isolating them needs
+a cheap-handler configuration, which is exactly the producer-bound regime this cut had to leave.
 
 > **Steal rate alone turned out not to be that number.** At the one configuration measured so far,
 > `GlobalDequeues` exceeded `StealsSucceeded` in **all 10 samples** (§9), and in the starvation workload
@@ -1137,6 +1186,73 @@ stealing that the global queue actually did.
 is §13's step 6 and it is the only thing that answers §1. Nothing measured before it compares the two
 schedulers on an isolated variable.
 
+#### First cut, run 2026-08-14 — exactly what it covered, and what it did not
+
+The B-vs-D **throughput** comparison has now run (Phase 3; harness in
+`perf-tests/…Workers.PerfTests/Throughput/Actors/`, commits `2abeb79` → `63fae03` → `45af696`). The
+result is in §6.3. What produced it, in full, because no number here means anything detached from it:
+
+| Parameter | Value |
+| --- | --- |
+| Host | Apple M4 Pro, 12 logical cores, macOS |
+| Cells | 2 schedulers (B, D) × 2 skews (uniform, Zipf s=1) × 2 cardinalities (64, 8192) = 8 |
+| Workers | 8 (fixed), 1 producer thread; `chunkSize: 256`, `batchBound: 16` |
+| Handler | constant cost, `Thread.SpinWait(32)` per message — calibrated, see below |
+| Messages | 10M per cell, key stream pre-generated so it is scheduler-independent |
+| Repeats | 7 per cell per pass, **3 independent passes** of the whole matrix |
+| Metric | throughput (ops/sec) only |
+| Wall clock | 163 s / 179 s / 177 s per pass |
+
+**The calibration (`ProducerBoundCalibrationTest`, commit `63fae03`).** The system is
+**single-producer**: with a cheap handler the producer is the bottleneck, every scheduler saturates at
+the same dispatch rate, and B and D measure identical — a null result manufactured by the harness. So
+the handler cost was calibrated first, at cardinality 1024, 8 workers, over the ladder
+`spin ∈ {0,1,2,4,8,16,32,64}`, 7 repeats per rung, per-rung medians (individual repeats are not
+interpretable on this host). Pass 1 medians: 2.06 / 2.42 / 3.48 / 3.93 / 3.86 / **5.69** / 4.39 / 2.37
+M/s. Pass 2 medians: 1.66 / 1.93 / 1.70 / 1.83 / 2.56 / 2.68 / **5.09** / 2.82 M/s.
+
+The **knee moved between passes** — 16 in pass 1, 32 in pass 2 — so it is **not pinned to a rung**, and
+nothing here should be read as "the knee is at 32". What both passes agree on is that spin 64 sits
+below spin 32 (the falling side begins at or after 32) and that run-to-run spread **collapses to ~1.2x
+at 32** against 3–6x at every rung below it. **32 was chosen for that reproducibility, not for peak
+throughput.** The rise from spin 0 is explicable rather than an artefact: at low spin the producer
+races ahead, workers park and unpark constantly, and wake churn dominates — more handler cost keeps
+workers busy and *raises* throughput until the spin itself dominates. Which is also why the low rungs
+are the noisy ones: they are the producer-bound, thrashing ones.
+
+**Two host caveats that bound how much anyone may read into a small difference.**
+
+1. `ThreadAffinityUtil.SetThreadAffinity` is a **documented no-op on macOS** — there is no per-core
+   pinning API, so on this host the suite raises priority and nothing more. It therefore **cannot
+   isolate itself from placement noise even on a completely idle machine.** This is permanent for
+   macOS, not a property of one run.
+2. The calibration was **initially unusable on a loaded host**: three ladders that disagreed on *which
+   rung is fastest*, not merely on magnitude (one peaked at spin 0 at 10.9M/s; the next made spin 0 its
+   *worst* rung at 2.2M/s; a third inverted the tail's ordering again), with load average 7.8–11.8 on a
+   12-core box and ~32 dotnet-family background processes against a test that asks for 9 dedicated
+   cores. It became readable only after the background .NET tooling was quieted. Any re-run needs a
+   quiet host or it is measuring the host.
+
+**What this cut did *not* cover.** All of it remains open:
+
+- **Neither external baseline.** Not the N hash-sharded `SpWorker`s, not `Channel<T>` +
+  `ConcurrentDictionary`. **So §10's own question — "does N-way dynamic balancing beat N statically
+  sharded workers under skew?" — is still unanswered.** This cut compared B against D; it compared
+  neither of them against static sharding. That is the easiest thing here to get wrong on a later
+  read: "no difference between B and D" says nothing about whether this substrate is worth its cost.
+- **No p99 or any latency figure** — and §6.3 argues latency is where the two schedulers actually
+  differ, so the metric that could separate them was the one not taken.
+- **No single-hot-key throughput cell**, dropped on principle: one key is processed by one worker by
+  construction, so both schedulers serialise identically and the cell would report ~1/8 of the uniform
+  rate for reasons the design mandates, not for scheduling reasons. The interesting hot-key question is
+  the starved victim's latency (§6.1).
+- **No worker-count sweep** (fixed at 8) and **no middle cardinality** — 64 and 8192 straddle the
+  resident/non-resident boundary; a mid point describes the shape of a curve, which is a later question
+  than whether a difference exists at all.
+- **No handler-cost variance** — constant cost only, and the prediction in §6.3 named variable cost as
+  one of the two regimes D was expected to win.
+- **No BenchmarkDotNet entry**; this is still the scrappy harness.
+
 #### Two benchmark suspects on D, open going into step 6
 
 Both are unmeasured costs on D's hot path, both follow directly from the depth-1 finding (§6.2), and
@@ -1154,7 +1270,10 @@ into "D is slower":
    (`if (_bottom.Value - Volatile.Read(ref _top.Value) <= 0) return false;`, as .NET's
    `ThreadPoolWorkQueue` carries) would remove the write-and-fence on the empty path entirely.
    **Recommended as the first act of Phase 3, before the benchmark runs**, so that D is measured in the
-   form it was designed to have rather than with this avoidable cost baked into every sample.
+   form it was designed to have rather than with this avoidable cost baked into every sample. **Done —
+   commit `27858ca`**, before any number in §6.3 was taken; the early-out is mutation-verified (defeating
+   the arbitrating CAS produces 17,721/20,000 and 18,888/20,000 double-takes, so it does not shield the
+   single-element race from the test that guards it).
 2. **Depth-1 makes the deque's cheap path unreachable** (§6.2's fifth consequence): every successful
    `TryPopBottom` pays a contended CAS plus a full fence per activation, where B's equivalent local-stack
    pop is a plain, non-atomic decrement. Unlike suspect 1, this one is not a bug to fix before
@@ -1194,14 +1313,16 @@ it will not. Measure cardinality independently of skew for that reason.
 
 ## 11. Known limitations and upgrade path
 
-**Phase 2b delivered the second scheduler, not the result.** The experiment's central question —
-push-side (B) vs. pull-side (D) — is still unanswered: the head-to-head B-vs-D benchmark (§10, §13
-step 6) has not run. What exists today is an N-worker key-affine processor running behind a pluggable
-scheduler seam with **both** schedulers proven correct under churn and under one shared behavioural
-suite — not a comparison, and not evidence that dynamic balancing beats static sharding. Treat every
-throughput number produced so far as a sanity check on one scheduler at a time, not as an answer to
-§1's question. The single measured B-vs-D difference is the starvation asymmetry in §6.1, and it
-varies worker count alongside the scheduler.
+**Phase 2b delivered the second scheduler, not the result; Phase 3 answered only half the question.**
+The head-to-head B-vs-D **throughput** benchmark has now run (§6.3, §10) and found **no measurable
+difference at any of its four coordinates** — but latency was not measured, and §1's actual question
+(dynamic balancing vs. static hash sharding) is untouched because **neither baseline has been built**.
+Phase 3 added a harness and one metric, not a verdict on §1. What exists today is an N-worker
+key-affine processor running behind a pluggable scheduler seam, with **both** schedulers proven
+correct under churn and under one shared behavioural suite, and measured **equivalent on throughput**
+at the eight coordinates of §10's first cut — which is not evidence that dynamic balancing beats
+static sharding, because static sharding was never run. The only measured B-vs-D *difference* remains
+the starvation asymmetry in §6.1, and it varies worker count alongside the scheduler.
 
 | Limitation | v1 stance | Upgrade |
 | --- | --- | --- |
@@ -1415,7 +1536,15 @@ either cost. Superseded.
 5. ~~**D**: global queue, Chase-Lev deque, steal scan, parking (test 8; re-run all under D).~~
    **Done** (Phase 2b) — §6.2 records the four deviations, the depth-1 deque finding, and the
    retry cost; §9 records what test 8 measured.
-6. Harness + baselines; B-vs-D measurement. **← the only open step.**
+6. Harness + baselines; B-vs-D measurement. **← still the only open step — now partially done.**
+   - **Done** (Phase 3, 2026-08-14): the actor throughput harness and the **B-vs-D throughput
+     comparison** — 8 workers, constant handler cost, uniform/Zipf × cardinality 64/8192, three
+     passes. Result: **no measurable difference**; skew costs ~40% and neither scheduler recovers it.
+     See §6.3 for the result and §10 for the configuration and its limits.
+   - **Open:** both baselines (N hash-sharded `SpWorker`s; `Channel<T>` + `ConcurrentDictionary`) —
+     so "does dynamic balancing beat static sharding" is **untouched**; p99 / latency, which §6.3
+     argues is where the schedulers actually differ; the worker-count sweep; handler-cost variance;
+     the §10 dense-hot-key + placed-victim workload; a BenchmarkDotNet entry.
 
 Steps 1–3 carried the correctness risk; 4–5 carry the performance question — and **step 6 is what
 actually answers it.** Phase 2b makes D exist and proves it correct; it does not measure D against B.
