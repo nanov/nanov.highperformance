@@ -49,8 +49,8 @@ public class ActorSystemStressTests {
 		// Capacity: the map rounds keyCapacity up to a power of two and then doubles it (§4.2's load
 		// factor), so keyCapacity * 4 is safely above the map's actual slot count — the ring can never
 		// fill from key indices alone.
-		new(new RecordingHandler(state), new SingleWorkerScheduler { Capacity = keyCapacity * 4 },
-			keyCapacity, chunkCount, chunkSize, batchBound);
+		new(new RecordingHandler(state), keyCapacity, chunkCount, chunkSize, batchBound, workers: 1,
+			new SingleWorkerScheduler { Capacity = keyCapacity * 4 });
 
 	/// <summary>
 	///   §5.3 — the release race. One key, the producer appending continuously while the worker keeps

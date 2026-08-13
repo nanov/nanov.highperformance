@@ -13,8 +13,8 @@ public class ActorSystemTests {
 		// Capacity: the map rounds keyCapacity up to a power of two and then doubles it (§4.2's load
 		// factor), so keyCapacity * 4 is safely above the map's actual slot count — the ring can never
 		// fill from key indices alone.
-		new(new RecordingHandler(state), new SingleWorkerScheduler { Capacity = keyCapacity * 4 },
-			keyCapacity, chunkCount, chunkSize, batchBound);
+		new(new RecordingHandler(state), keyCapacity, chunkCount, chunkSize, batchBound, workers: 1,
+			new SingleWorkerScheduler { Capacity = keyCapacity * 4 });
 
 	[Test]
 	public void First_Dispatch_Binds_A_Chunk_And_Schedules() {

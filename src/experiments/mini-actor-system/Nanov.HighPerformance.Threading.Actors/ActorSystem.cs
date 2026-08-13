@@ -1,6 +1,7 @@
 namespace Nanov.HighPerformance.Threading.Actors;
 
 using System;
+using System.Diagnostics;
 using System.Threading;
 using Nanov.HighPerformance.Threading.Actors.Internal;
 
@@ -22,27 +23,29 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	private readonly int _chunkSize;
 	private readonly int _chunkMask;
 	private readonly int _batchBound;
-	private THandler _handler; // mutable struct — calls go through the field so state persists
+
+	// The PRODUCER's own copy — the one that services OnSlotReused and OnChunkReclaimed, which run on
+	// the producer thread. Each worker carries a FURTHER copy of its own in WorkerState.Handler. Total
+	// handler copies in the system: workers + 1 (one per worker, plus this one). Do not "deduplicate"
+	// these — a handler shared across worker threads is exactly the race per-worker copies exist to
+	// avoid; at one worker a single shared handler was survivable, at N it is not.
+	private THandler _handler;
 	private TScheduler _scheduler; // mutable struct — calls go through the field so they devirtualize
 
 	private long _dispatched; // producer-private; no atomics
 
-	private Thread? _worker;
+	private readonly WorkerState<THandler>[] _workers;
+	private readonly PaddedLong[] _processedPublished; // one padded slot per worker; quiescence sums these
+	private int _liveWorkers; // decremented as each worker exits; only the one that hits zero resolves Completion
 
 	// Explicit initializer, not just the implicit default: nothing else assigns this field until
 	// Dispose (Task 8), and an unassigned field trips CS0649, which is a build error here.
 	private volatile bool _stopped = false;
 
-	private long _processedLocal;    // worker-private running count
-	private long _processedPublished; // published for the quiescence check (Task 7)
-	private int _activations; // test hook: counts Activate calls, so batchBound has a mechanical guard
-	private int _rejectedClaims; // test hook: acquisitions that lost the Scheduled -> Owned CAS
-
 	private readonly TaskCompletionSource _completion =
 		new(TaskCreationOptions.RunContinuationsAsynchronously);
 	private readonly ManualResetEventSlim _spaceAvailable = new(false);
 	private volatile bool _producerParked;
-	private int _producerWakes; // test hook: counts Sets actually delivered to a parked producer
 	private long _dispatchedFinal;
 	private volatile bool _completed;
 	private Exception? _completionError;
@@ -50,16 +53,26 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	private int _disposeGate;
 
 	/// <param name="handler">
-	///   The single shared handler. At one worker there is no per-worker copy — per-worker copies
-	///   arrive with the multi-worker phase.
+	///   The handler prototype. The producer keeps its own copy of it, and every worker gets a further
+	///   copy of its own — see the remarks on the private <c>_handler</c> field for why.
 	/// </param>
-	/// <param name="scheduler">The scheduling policy — see <see cref="IKeyScheduler" />.</param>
 	/// <param name="keyCapacity">Max live keys.</param>
 	/// <param name="chunkCount">Max concurrently-dirty keys.</param>
 	/// <param name="chunkSize">Messages one key may hold before backpressure.</param>
 	/// <param name="batchBound">Max messages per activation; 0 ⇒ <paramref name="chunkSize" />.</param>
-	public ActorSystem(THandler handler, TScheduler scheduler, int keyCapacity, int chunkCount, int chunkSize,
-		int batchBound = 0) {
+	/// <param name="workers">Number of worker threads; must be at least 1.</param>
+	/// <param name="scheduler">The scheduling policy — see <see cref="IKeyScheduler" />.</param>
+	public ActorSystem(
+		THandler handler,
+		int keyCapacity,
+		int chunkCount,
+		int chunkSize,
+		int batchBound,
+		int workers,
+		TScheduler scheduler) {
+		if (workers < 1)
+			throw new ArgumentOutOfRangeException(nameof(workers), "at least one worker is required.");
+
 		_handler = handler;
 		_scheduler = scheduler;
 		_slab = new ChunkSlab<T>(chunkCount, chunkSize);
@@ -75,7 +88,13 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 				$"chunkCount ({_slab.ChunkCount}) must be less than the map's slot count ({_map.SlotCount}); " +
 				"raise keyCapacity or lower chunkCount.");
 
-		_scheduler.Start(1);
+		_workers = new WorkerState<THandler>[workers];
+		for (var i = 0; i < workers; i++)
+			_workers[i] = new WorkerState<THandler>(i, handler);
+		_processedPublished = new PaddedLong[workers];
+		_liveWorkers = workers;
+
+		_scheduler.Start(workers);
 		_batchBound = batchBound > 0 ? batchBound : _chunkSize;
 	}
 
@@ -187,7 +206,7 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 				// It went dirty between the check and the claim. Releasing this is NOT a plain revert:
 				// Reclaiming is a non-Free state, so a worker's release-recheck may have lost its CAS and
 				// skipped scheduling. Restoring Free without re-testing the mailbox strands the key.
-				ReleaseAndMaybeSchedule(slot, ref cell, head, fromWorker: false);
+				ReleaseAndMaybeSchedule(null, slot, ref cell, head, fromWorker: false);
 				continue;
 			}
 
@@ -272,57 +291,67 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		}
 	}
 
-	/// <summary>Start the worker thread.</summary>
+	/// <summary>Start one thread per worker.</summary>
 	public void Start() {
-		_worker = new Thread(RunLoop) { IsBackground = true, Name = $"Actor<{typeof(TKey).Name}>" };
-		_worker.Start();
+		for (var i = 0; i < _workers.Length; i++) {
+			var w = _workers[i];
+			w.Thread = new Thread(RunLoop) {
+				IsBackground = true,
+				Name = $"Actor<{typeof(TKey).Name}>#{w.Id}",
+			};
+			w.Thread.Start(w);
+		}
 	}
 
-	private void RunLoop() {
+	private void RunLoop(object? state) {
+		var w = (WorkerState<THandler>)state!;
 		try {
 			while (!_stopped) {
-				if (_scheduler.TryAcquire(0, out var index)) {
-					Activate(index);
+				if (_scheduler.TryAcquire(w.Id, out var index)) {
+					Activate(w, index);
 					continue;
 				}
 
-				if (!WaitForWork()) break;
+				if (!WaitForWork(w)) break;
 			}
 		}
 		catch (Exception ex) {
 			// A background-thread escape would kill the host process with Completion unresolved.
 			// Fault Completion instead so the failure is observable.
 			_completionError ??= ex;
-			SafeOnError(ex);
+			SafeOnError(w, ex);
 		}
 		finally {
-			PublishProcessed();
+			PublishProcessed(w);
 
 			// _completed means a drain was REQUESTED, not that it finished. A Dispose racing an
 			// in-flight TryComplete drops messages, so the exit is only clean if we actually reached
 			// quiescence. Read _completed BEFORE the counters — same acquire ordering rule as
 			// IsQuiescent, and && short-circuits in the right order.
-			var drainedCleanly = _completed &&
-				Volatile.Read(ref _processedPublished) == Volatile.Read(ref _dispatchedFinal);
+			var drainedCleanly = _completed && QuiescentSum() >= Volatile.Read(ref _dispatchedFinal);
 			var hardStopped = _stopped && !drainedCleanly;
 			Exception? error = hardStopped ? new OperationCanceledException() : _completionError;
 			try {
-				_handler.OnCompleted(error);
+				w.Handler.OnCompleted(error); // once per worker — the documented contract
 			}
 			catch (Exception ex) {
-				SafeOnError(ex);
+				SafeOnError(w, ex);
 			}
 
-			// Hard stop cancels — mirrors the worker family (SpRingCore.SetCompletion). A genuine
-			// soft-complete-with-exception is the only case that actually faults Completion.
-			if (hardStopped) _completion.TrySetCanceled();
-			else if (error is not null) _completion.TrySetException(error);
-			else _completion.TrySetResult();
+			// Only the LAST worker out resolves Completion; otherwise the first to exit would report
+			// the system finished while its peers are still draining.
+			if (Interlocked.Decrement(ref _liveWorkers) == 0) {
+				// Hard stop cancels — mirrors the worker family (SpRingCore.SetCompletion). A genuine
+				// soft-complete-with-exception is the only case that actually faults Completion.
+				if (hardStopped) _completion.TrySetCanceled();
+				else if (error is not null) _completion.TrySetException(error);
+				else _completion.TrySetResult();
+			}
 		}
 	}
 
-	private void Activate(int index) {
-		_activations++;
+	private void Activate(WorkerState<THandler> w, int index) {
+		w.Activations++;
 		ref var cell = ref _map.RefAt(index);
 
 		// VALIDATE the claim — do not assume it. A blind Exchange to Owned would let two workers
@@ -337,7 +366,7 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		// in both cases there is nothing for us to do, and touching the cell would be the bug.
 		if (Interlocked.CompareExchange(ref cell.State, CellState.Owned, CellState.Scheduled) !=
 			CellState.Scheduled) {
-			_rejectedClaims++;
+			w.RejectedClaims++;
 			return;
 		}
 
@@ -347,7 +376,7 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 			// State release and our Tail recheck. There is nothing to drain and no chunk to drain from
 			// — release and move on. Without this the drain loop would index the slab at Chunk.None
 			// (-1), and SlotRef is deliberately unchecked.
-			ReleaseAndMaybeSchedule(index, ref cell, cell.Head, fromWorker: true);
+			ReleaseAndMaybeSchedule(w, index, ref cell, cell.Head, fromWorker: true);
 			return;
 		}
 
@@ -356,39 +385,43 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		while (n < _batchBound && head != Volatile.Read(ref cell.Tail)) {
 			if (_stopped) break;
 			try {
-				_handler.Handle(cell.Key, _slab.SlotRef(chunk, head & _chunkMask));
+				w.Handler.Handle(cell.Key, _slab.SlotRef(chunk, head & _chunkMask));
 			}
 			catch (Exception ex) {
-				SafeOnError(ex);
+				SafeOnError(w, ex);
 			}
 
 			head++;
 			n++;
-			_processedLocal++;
+			w.ProcessedLocal++;
 			if ((n & 31) == 0) {
 				Volatile.Write(ref cell.Head, head);
-				PublishProcessed();
+				PublishProcessed(w);
 				if (_producerParked) {
-					_producerWakes++;
+					w.ProducerWakes++;
 					_spaceAvailable.Set();
 				}
 			}
 		}
 
-		ReleaseAndMaybeSchedule(index, ref cell, head, fromWorker: true);
+		ReleaseAndMaybeSchedule(w, index, ref cell, head, fromWorker: true);
 	}
 
 	/// <summary>
 	///   Release ownership, and reschedule if the mailbox is not empty. The ordering here is
 	///   load-bearing — see §5.3. Shared by the worker and by the producer's cold paths (Task 10), which
 	///   is why it takes <paramref name="fromWorker" /> rather than being open-coded twice.
+	///   <paramref name="w" /> is the calling worker's own state when <paramref name="fromWorker" /> is
+	///   true, and null on the producer's cold path — the worker-only block below is guarded on
+	///   <paramref name="fromWorker" /> precisely so it never dereferences a null <paramref name="w" />.
 	/// </summary>
-	private void ReleaseAndMaybeSchedule(int index, ref KeyCell<TKey> cell, int head, bool fromWorker) {
+	private void ReleaseAndMaybeSchedule(WorkerState<THandler>? w, int index, ref KeyCell<TKey> cell, int head,
+		bool fromWorker) {
 		if (fromWorker) {
 			Volatile.Write(ref cell.Head, head);
-			PublishProcessed();
+			PublishProcessed(w!);
 			if (_producerParked) {
-				_producerWakes++;
+				w!.ProducerWakes++;
 				_spaceAvailable.Set();
 			}
 		}
@@ -406,22 +439,32 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		if (Interlocked.CompareExchange(ref cell.State, CellState.Scheduled, CellState.Free) != CellState.Free)
 			return; // the producer got there first and already scheduled it — no double-schedule
 
-		if (fromWorker) _scheduler.ScheduleLocal(0, index);
+		if (fromWorker) _scheduler.ScheduleLocal(w!.Id, index);
 		else _scheduler.Schedule(index);
 	}
 
-	private void PublishProcessed() => Volatile.Write(ref _processedPublished, _processedLocal);
+	private void PublishProcessed(WorkerState<THandler> w) =>
+		Volatile.Write(ref _processedPublished[w.Id].Value, w.ProcessedLocal);
 
 	private void SafeOnError(Exception error) {
 		try {
 			_handler.OnError(error);
 		}
 		catch {
+			// A throwing OnError must not kill the producer.
+		}
+	}
+
+	private void SafeOnError(WorkerState<THandler> w, Exception error) {
+		try {
+			w.Handler.OnError(error);
+		}
+		catch {
 			// A throwing OnError must not kill the worker.
 		}
 	}
 
-	/// <summary>Resolves once the worker has drained and exited.</summary>
+	/// <summary>Resolves once every worker has drained and exited.</summary>
 	public Task Completion => _completion.Task;
 
 	/// <summary>
@@ -447,7 +490,9 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		// A system that was constructed but never started has no worker thread, so RunLoop's finally
 		// — the only other place Completion resolves — will never run. Resolve it here instead;
 		// TrySet* is idempotent so this cannot race a worker that starts resolving concurrently.
-		if (_worker is null) {
+		// _workers[0].Thread is null iff Start() was never called — Start() creates every worker's
+		// thread in one pass, so checking the first is checking them all.
+		if (_workers[0].Thread is null) {
 			if (exception is null) _completion.TrySetResult();
 			else _completion.TrySetException(exception);
 		}
@@ -463,21 +508,29 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	///     every test whose worker never actually sleeps.
 	///   </para>
 	/// </summary>
-	private bool WaitForWork() {
+	private bool WaitForWork(WorkerState<THandler> w) {
 		for (var spin = 0; spin < 32; spin++) {
-			if (_scheduler.HasWork(0) || _stopped) return !_stopped;
+			if (_scheduler.HasWork(w.Id) || _stopped) return !_stopped;
 			Thread.SpinWait(64);
 		}
 
 		while (true) {
-			_scheduler.ArmWait(0);
+			_scheduler.ArmWait(w.Id);
 			Interlocked.MemoryBarrier();
-			if (_scheduler.HasWork(0) || _stopped) return !_stopped;
+			if (_scheduler.HasWork(w.Id) || _stopped) return !_stopped;
 			if (IsQuiescent()) return false;
-			_scheduler.Wait(0);
-			if (_scheduler.HasWork(0) || _stopped) return !_stopped;
+			_scheduler.Wait(w.Id);
+			if (_scheduler.HasWork(w.Id) || _stopped) return !_stopped;
 			if (IsQuiescent()) return false;
 		}
+	}
+
+	/// <summary>Sums every worker's published processed count. Shared by <see cref="IsQuiescent" /> and RunLoop's exit, so the two cannot drift.</summary>
+	private long QuiescentSum() {
+		var processed = 0L;
+		for (var i = 0; i < _processedPublished.Length; i++)
+			processed += Volatile.Read(ref _processedPublished[i].Value);
+		return processed;
 	}
 
 	/// <summary>
@@ -490,30 +543,37 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	///     count beside a fresh flag: false quiescence, and messages silently dropped on dispose.
 	///   </para>
 	///   This mirrors the family's existing soft-complete rule (re-read Tail after observing
-	///   _completed) with the processed count as the new Tail.
+	///   _completed) with the summed processed count as the new Tail.
 	/// </summary>
 	private bool IsQuiescent() {
-		if (!_completed) return false;
-		var processed = Volatile.Read(ref _processedPublished);
+		if (!_completed) return false; // flag FIRST — see the doc comment; do not reorder
 		// >= not ==: an undercount only delays quiescence, but any overshoot with == would hang
 		// forever rather than exit late.
-		return processed >= Volatile.Read(ref _dispatchedFinal);
+		return QuiescentSum() >= Volatile.Read(ref _dispatchedFinal);
 	}
 
 	/// <summary>
 	///   Hard stop: drop queued messages and exit. The message currently inside the handler still
 	///   finishes — tearing down under a running handler is something the family never does.
-	///   Workers are joined against one shared budget, not one per worker. A system that was
-	///   constructed but never started has no worker thread to resolve <see cref="Completion" />, so
-	///   this resolves it directly as cancelled in that case.
+	///   Workers are joined against ONE SHARED budget, not one per worker — N workers must not make
+	///   disposal take N seconds. A system that was constructed but never started has no worker thread
+	///   to resolve <see cref="Completion" />, so this resolves it directly as cancelled in that case.
 	/// </summary>
 	public void Dispose() {
 		if (Interlocked.Exchange(ref _disposeGate, 1) != 0) return;
 		_stopped = true;
 		_scheduler.SignalStop();
 		_spaceAvailable.Set();
-		if (_worker is null) _completion.TrySetCanceled();
-		else _worker.Join(TimeSpan.FromSeconds(1));
+		if (_workers[0].Thread is null)
+			_completion.TrySetCanceled();
+		else {
+			var deadline = Stopwatch.StartNew();
+			var budget = TimeSpan.FromSeconds(1);
+			foreach (var w in _workers) {
+				var remaining = budget - deadline.Elapsed;
+				if (remaining > TimeSpan.Zero) w.Thread?.Join(remaining);
+			}
+		}
 		// The events are deliberately NOT disposed: the producer is a caller-owned thread that may be
 		// parked inside Wait() right now, and disposing under it throws ObjectDisposedException on
 		// their thread. Letting the finalizer reclaim them is the correct trade here.
@@ -525,9 +585,27 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 
 	internal long DispatchedCount => _dispatched;
 
-	internal int Activations => Volatile.Read(ref _activations);
+	internal int Activations {
+		get {
+			var sum = 0;
+			foreach (var w in _workers) sum += Volatile.Read(ref w.Activations);
+			return sum;
+		}
+	}
 
-	internal int RejectedClaims => Volatile.Read(ref _rejectedClaims);
+	internal int RejectedClaims {
+		get {
+			var sum = 0;
+			foreach (var w in _workers) sum += Volatile.Read(ref w.RejectedClaims);
+			return sum;
+		}
+	}
 
-	internal int ProducerWakes => Volatile.Read(ref _producerWakes);
+	internal int ProducerWakes {
+		get {
+			var sum = 0;
+			foreach (var w in _workers) sum += Volatile.Read(ref w.ProducerWakes);
+			return sum;
+		}
+	}
 }
