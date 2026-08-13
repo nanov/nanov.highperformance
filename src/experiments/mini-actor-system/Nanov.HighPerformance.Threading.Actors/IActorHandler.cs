@@ -6,11 +6,13 @@ using System;
 ///   Per-message logic plus lifecycle hooks. Implement as a <see langword="struct" /> so the calls
 ///   devirtualize and inline — never store one as an interface reference.
 ///   <para>
-///     There is currently <b>one</b> <c>THandler</c> field, shared between the producer and worker
-///     threads: the producer calls <see cref="OnSlotReused" />/<see cref="OnChunkReclaimed" /> on it
-///     and the worker calls <see cref="Handle" />/<see cref="OnCompleted" />, so handler state must be
-///     thread-safe. Per-worker copies (so each worker gets its own, thread-local instance) arrive with
-///     the multi-worker phase.
+///     There are <c>workers + 1</c> independent COPIES of the <c>THandler</c> struct: one per worker,
+///     plus one for the producer. <see cref="OnSlotReused" /> and <see cref="OnChunkReclaimed" /> run
+///     on the producer's copy; <see cref="Handle" /> and <see cref="OnCompleted" /> run on a worker's
+///     own copy. A copy's value-type fields are therefore private to the thread that owns it — only
+///     state reached through a shared REFERENCE (e.g. a field holding a class instance or a
+///     <c>ConcurrentQueue</c>) is actually visible across copies, and that shared state must still be
+///     thread-safe.
 ///   </para>
 /// </summary>
 public interface IActorHandler<in TKey, T> {
@@ -30,9 +32,9 @@ public interface IActorHandler<in TKey, T> {
 	void OnError(Exception error);
 
 	/// <summary>
-	///   The worker has drained and is exiting. At one worker with one shared handler this fires
-	///   <b>once</b>, on that single shared handler. Per-worker copies and N invocations arrive with
-	///   the multi-worker phase. <c>null</c> = normal completion.
+	///   A worker has drained and is exiting, called on that worker's own handler copy. Fires
+	///   <b>once per worker</b> — at <c>workers</c> workers, <c>workers</c> total invocations, one per
+	///   copy, never on the producer's copy. <c>null</c> = normal completion.
 	/// </summary>
 	void OnCompleted(Exception? error);
 

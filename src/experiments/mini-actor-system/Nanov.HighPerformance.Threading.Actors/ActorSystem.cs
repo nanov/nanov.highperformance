@@ -304,8 +304,13 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	}
 
 	private void RunLoop(object? state) {
-		var w = (WorkerState<THandler>)state!;
+		WorkerState<THandler>? w = null;
 		try {
+			// The cast lives INSIDE the try so a malformed `state` — never reachable via Start(), which
+			// always passes a worker its own WorkerState, but defensive nonetheless — is caught and
+			// reported through the same fault path as any other RunLoop exception, rather than escaping
+			// the thread unhandled before the try even begins.
+			w = (WorkerState<THandler>)state!;
 			while (!_stopped) {
 				if (_scheduler.TryAcquire(w.Id, out var index)) {
 					Activate(w, index);
@@ -319,32 +324,40 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 			// A background-thread escape would kill the host process with Completion unresolved.
 			// Fault Completion instead so the failure is observable.
 			_completionError ??= ex;
-			SafeOnError(w, ex);
+			SafeOnError(w!, ex);
 		}
 		finally {
-			PublishProcessed(w);
+			PublishProcessed(w!);
 
 			// _completed means a drain was REQUESTED, not that it finished. A Dispose racing an
 			// in-flight TryComplete drops messages, so the exit is only clean if we actually reached
 			// quiescence. Read _completed BEFORE the counters — same acquire ordering rule as
-			// IsQuiescent, and && short-circuits in the right order.
+			// IsQuiescent, and && short-circuits in the right order. This is this worker's OWN view,
+			// used only for the OnCompleted callback below — see the recompute inside the decrement
+			// branch for why the SYSTEM verdict cannot reuse it.
 			var drainedCleanly = _completed && QuiescentSum() >= Volatile.Read(ref _dispatchedFinal);
 			var hardStopped = _stopped && !drainedCleanly;
 			Exception? error = hardStopped ? new OperationCanceledException() : _completionError;
 			try {
-				w.Handler.OnCompleted(error); // once per worker — the documented contract
+				w!.Handler.OnCompleted(error); // once per worker — the documented contract
 			}
 			catch (Exception ex) {
-				SafeOnError(w, ex);
+				SafeOnError(w!, ex);
 			}
 
 			// Only the LAST worker out resolves Completion; otherwise the first to exit would report
 			// the system finished while its peers are still draining.
 			if (Interlocked.Decrement(ref _liveWorkers) == 0) {
+				// Recompute HERE, not above: this read is ordered after our own Interlocked.Decrement,
+				// which is ordered after every peer's decrement, which is ordered after each peer's
+				// final PublishProcessed. Computed before the decrement, the last worker has no edge
+				// with its peers and can see a stale sum — reporting a cleanly-drained system as
+				// cancelled.
+				var allDrained = _completed && QuiescentSum() >= Volatile.Read(ref _dispatchedFinal);
 				// Hard stop cancels — mirrors the worker family (SpRingCore.SetCompletion). A genuine
 				// soft-complete-with-exception is the only case that actually faults Completion.
-				if (hardStopped) _completion.TrySetCanceled();
-				else if (error is not null) _completion.TrySetException(error);
+				if (_stopped && !allDrained) _completion.TrySetCanceled();
+				else if (_completionError is not null) _completion.TrySetException(_completionError);
 				else _completion.TrySetResult();
 			}
 		}
