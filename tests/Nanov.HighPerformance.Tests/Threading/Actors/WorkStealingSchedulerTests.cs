@@ -276,4 +276,69 @@ public class WorkStealingSchedulerTests {
 		foreach (var (key, values) in byKey)
 			Assert.That(values, Is.EqualTo(Enumerable.Range(0, perKey).ToList()), $"key {key} out of order");
 	}
+
+	/// <summary>
+	///   Spec §9 test 8 — steal correctness under churn: many workers, few keys, so most workers are
+	///   starved of local work and must steal to make progress.
+	///   <para>
+	///     <b>The counters are the point.</b> Order and loss assertions would pass against a scheduler
+	///     whose steal path never ran even once; asserting <c>StealsSucceeded &gt; 0</c> is what makes
+	///     this a test of STEALING rather than another test of the cell machine. It is a floor, not a
+	///     target: the exact rate is a benchmark question, not a correctness one.
+	///   </para>
+	/// </summary>
+	[Test]
+	[CancelAfter(120_000)]
+	public void Steals_Happen_Under_Churn_And_Preserve_Per_Key_Order() {
+		const int keys = 4;
+		const int perKey = 20_000;
+		const int total = keys * perKey;
+		var state = new RecordingState();
+		var scheduler = new WorkStealingScheduler { Capacity = 256, DequeCapacity = 64 };
+		using var system = new ActorSystem<int, int, RecordingHandler, WorkStealingScheduler>(
+			new RecordingHandler(state), keyCapacity: 64, chunkCount: 16, chunkSize: 64,
+			batchBound: 1, workers: 8, scheduler: scheduler);
+		system.Start();
+
+		var dispatched = 0;
+		Exception? producerError = null;
+		var producer = new Thread(() => {
+			try {
+				for (var i = 0; i < perKey; i++)
+					for (var k = 0; k < keys; k++) {
+						if (!system.Dispatch(k, i)) return;
+						dispatched++;
+					}
+			}
+			catch (Exception ex) {
+				producerError = ex;
+			}
+		}) { IsBackground = true };
+		producer.Start();
+
+		Assert.That(producer.Join(TimeSpan.FromSeconds(90)), Is.True,
+			$"producer wedged after {Volatile.Read(ref dispatched)}/{total} dispatches");
+		if (producerError is not null) Assert.Fail($"producer threw: {producerError}");
+		Assert.That(Volatile.Read(ref dispatched), Is.EqualTo(total), "a Dispatch was rejected mid-run");
+
+		system.TryComplete();
+		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, total);
+
+		var byKey = state.ByKey();
+		Assert.Multiple(() => {
+			Assert.That(byKey, Has.Count.EqualTo(keys));
+			Assert.That(scheduler.StealsAttempted, Is.GreaterThan(0), "the steal scan never ran");
+			Assert.That(scheduler.StealsSucceeded, Is.GreaterThan(0),
+				"no steal ever succeeded — D is behaving as a global-queue scheduler, not a stealing one");
+		});
+
+		foreach (var (key, values) in byKey)
+			Assert.That(values, Is.EqualTo(Enumerable.Range(0, perKey).ToList()),
+				$"key {key} out of order — a stolen key was processed concurrently with its owner");
+
+		TestContext.Out.WriteLine(
+			$"steals {scheduler.StealsSucceeded}/{scheduler.StealsAttempted}, " +
+			$"global {scheduler.GlobalDequeues}, overflows {scheduler.DequeOverflows}, parks {scheduler.Parks}, " +
+			$"enqueueRetries {scheduler.GlobalEnqueueRetries}");
+	}
 }
