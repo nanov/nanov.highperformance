@@ -67,8 +67,10 @@ public class StarvationAsymmetryTests {
 	// still surfaced once in 20 executions. At this file's final calibration — SpinWait(5000) below —
 	// 20/20 executions (10 runs x net9.0 + net10.0) landed at EXACTLY position 3000 (fully exhausted),
 	// zero variance, matching the closed form (position == HotMessages, because with one worker the
-	// ring is unreachable until the producer stops). The D test's positions are 0-28 across every run
-	// measured, always far below this threshold. 200 sits ~15x BELOW the stable unbounded position and
+	// ring is unreachable until the producer stops). At that same final calibration the D test lands at
+	// EXACTLY position 0, zero variance, in every execution measured. (The 0-28 spread recorded in the
+	// task report belongs to the ABANDONED SpinWait(200) calibration, not to this one — do not quote it
+	// as a property of the shipped configuration.) 200 sits ~15x BELOW the stable unbounded position and
 	// ~12x ABOVE the bounded position (bound + 1 = 17, also a closed form — see
 	// Bounded_Local_Draining_Rescues_A_Ring_Queued_Key): inside the measured gap, not inside either
 	// distribution, with slack against machines slower or noisier than this one. The Step 3 vacuity
