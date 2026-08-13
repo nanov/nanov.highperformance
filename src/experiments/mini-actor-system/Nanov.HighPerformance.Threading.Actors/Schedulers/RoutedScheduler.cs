@@ -66,6 +66,12 @@ public struct RoutedScheduler : IKeyScheduler {
 
 	public void Start(int workerCount) {
 		if (workerCount < 1) throw new ArgumentOutOfRangeException(nameof(workerCount));
+		// A struct RoutedScheduler wraps a reference to shared State; handing the SAME value to a second
+		// ActorSystem would replace the rings out from under a live router and start a second router
+		// thread — two consumers on one KeyRing, which corrupts silently. One instance per system, only.
+		if (_state.Router is not null)
+			throw new InvalidOperationException(
+				"this scheduler instance is already driving a system; construct a new one per ActorSystem.");
 		_state.Inbox = new KeyRing(Capacity);
 		_state.WorkerRings = new KeyRing[workerCount];
 		_state.Local = new int[workerCount][];
@@ -95,55 +101,86 @@ public struct RoutedScheduler : IKeyScheduler {
 	///     <see cref="Schedule" /> sets the event when it sees the flag up.
 	///   </para>
 	///   <para>
-	///     <b><c>Stopping</c> is read AFTER the recheck, never before.</b> <c>SignalStop</c> only ever
-	///     runs (from <c>TryComplete</c>/<c>Dispose</c>) once every <see cref="Schedule" /> call the
-	///     single producer will ever make has already returned, so its <c>Stopping = true</c> write is
-	///     always sequenced-after every prior <c>TryEnqueue</c> on the producer thread, and the CLR
-	///     preserves that relative order of volatile writes across threads. That only helps a reader who
-	///     checks <b>the flag first and the data second</b> — checking data (<c>TryDequeue</c>) before
-	///     the flag, as an earlier draft of this loop did, reads the two in the wrong order and can
-	///     observe <c>Stopping == true</c> while a genuinely-fresh <c>TryDequeue</c> would still have
-	///     found an item: the router exits with that key stranded in <see cref="State.Inbox" /> forever,
-	///     and quiescence — which needs every scheduled key routed and processed — is never reached.
-	///     Confirmed by instrumentation: the stall reproduces with <c>Inbox.CountApprox &gt; 0</c> at the
-	///     moment of exit. So <c>Stopping</c> is consulted only once more, after the armed recheck has
-	///     already proven the inbox empty — never before a dequeue attempt.
+	///     <b><c>Stopping</c> is snapshotted BEFORE the final <c>TryDequeue</c>, never after.</b>
+	///     <c>SignalStop</c> only ever runs (from <c>TryComplete</c>/<c>Dispose</c>) once every
+	///     <see cref="Schedule" /> call the single producer will ever make has already returned, so its
+	///     <c>Stopping = true</c> write is always sequenced-after every prior <c>TryEnqueue</c> on the
+	///     producer thread, and the CLR preserves that relative order of volatile writes across threads.
+	///     That only helps a reader who reads <b>the flag first and the data second</b> — reading data
+	///     (<c>TryDequeue</c>) before the flag, as an earlier draft of this loop did, reads the two in the
+	///     wrong order: the router can observe an empty ring, then <c>Stopping == true</c>, for a key that
+	///     was enqueued and made <c>RouterParked</c>-visible in between — a window of a few nanoseconds,
+	///     but a real one, confirmed by a targeted repro harness. The router would exit with that key
+	///     stranded in <see cref="State.Inbox" /> forever; quiescence — which needs every scheduled key
+	///     routed and processed — is never reached, and every worker parks forever on an unbounded
+	///     <see cref="Wait" />. So <c>Stopping</c> is read into a local BEFORE the armed recheck's
+	///     <c>TryDequeue</c>, and only consulted after that dequeue comes up empty: a stale
+	///     <c>false</c> snapshot racing a concurrent <see cref="SignalStop" /> is harmless, because
+	///     <see cref="SignalStop" />'s <c>Set()</c> is unconditional and wakes the next iteration's
+	///     re-snapshot immediately.
+	///   </para>
+	///   <para>
+	///     <b>Otherwise fail-fast.</b> The router has no fault channel back to the system's
+	///     <c>Completion</c> the way a worker's <c>RunLoop</c> does — there is nowhere to report an
+	///     exception except by not letting it kill the process. The outer <c>catch</c> below exists ONLY
+	///     for that: it stops routing and releases every parked primitive so nobody hangs, it does not
+	///     attempt to recover or preserve the in-flight key.
 	///   </para>
 	/// </summary>
 	private static void RouteLoop(State s, RoutingPolicy policy) {
-		while (true) {
-			if (s.Inbox!.TryDequeue(out var cellIdx)) {
-				Route(s, policy, cellIdx);
-				continue;
-			}
-
-			s.InboxNotEmpty.Reset();
-			s.RouterParked = true;
-			try {
-				Interlocked.MemoryBarrier(); // flag visible before the recheck below
-
-				// Recheck INSIDE the armed window: a producer that enqueued just before we armed saw
-				// the flag down and did not Set, so this recheck is the only thing that catches it.
-				if (s.Inbox.TryDequeue(out cellIdx)) {
+		try {
+			while (true) {
+				if (s.Inbox!.TryDequeue(out var cellIdx)) {
 					Route(s, policy, cellIdx);
 					continue;
 				}
 
-				// Only now — after a fresh, empty recheck — is it safe to consult Stopping; see the
-				// ordering argument on the doc comment above.
-				if (s.Stopping) return;
+				s.InboxNotEmpty.Reset();
+				s.RouterParked = true;
+				try {
+					Interlocked.MemoryBarrier(); // flag visible before the recheck below
 
-				s.InboxNotEmpty.Wait();
+					// Snapshot BEFORE the final dequeue. SignalStop's write is sequenced-after every
+					// Schedule the producer will ever make, so a TryDequeue issued AFTER observing
+					// Stopping sees every enqueue. Reading the flag after the dequeue leaves a window in
+					// which a key enqueued between the two is abandoned — quiescence then never arrives
+					// and every worker parks forever on an unbounded Wait.
+					var stopping = s.Stopping;
+
+					// Recheck INSIDE the armed window: a producer that enqueued just before we armed saw
+					// the flag down and did not Set, so this recheck is the only thing that catches it.
+					if (s.Inbox.TryDequeue(out cellIdx)) {
+						Route(s, policy, cellIdx);
+						continue;
+					}
+
+					if (stopping) return;
+
+					s.InboxNotEmpty.Wait();
+				}
+				finally {
+					s.RouterParked = false;
+				}
 			}
-			finally {
-				s.RouterParked = false;
-			}
+		}
+		catch (Exception) {
+			// Fail-fast otherwise (see the doc comment above) — this only stops the router from taking
+			// the host process down with it. Release every parked primitive, including this router's own,
+			// so a worker blocked in an unbounded Wait() is not left hanging forever.
+			s.Stopping = true;
+			s.InboxNotEmpty.Set();
+			foreach (var evt in s.WorkAvailable!)
+				evt.Set();
 		}
 	}
 
 	private static void Route(State s, RoutingPolicy policy, int cellIdx) {
+		// Unsigned wraparound: NextRoundRobin++ eventually wraps int.MinValue after 2^31 routings, and
+		// C#'s % takes the DIVIDEND's sign — a negative index would throw IndexOutOfRangeException on the
+		// router thread. Casting both operands to uint before the modulo makes the wrap harmless for any
+		// worker count, not just powers of two.
 		var target = policy == RoutingPolicy.RoundRobin
-			? s.NextRoundRobin++ % s.WorkerRings!.Length
+			? (int)((uint)s.NextRoundRobin++ % (uint)s.WorkerRings!.Length)
 			: LeastLoadedIndex(s);
 
 		if (!s.WorkerRings![target].TryEnqueue(cellIdx))

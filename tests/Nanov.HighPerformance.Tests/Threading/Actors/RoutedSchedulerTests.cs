@@ -47,6 +47,9 @@ public class RoutedSchedulerTests {
 		system.TryComplete();
 		WorkerTestUtil.AwaitCompletionOrStall(system.Completion, () => state.HandledCount, 4_000);
 
+		// AwaitCompletionOrStall catches a lost message (progress stalls) and a faulted completion, but
+		// not a DUPLICATED one — that would inflate HandledCount and pass silently otherwise.
+		Assert.That(state.HandledCount, Is.EqualTo(4_000));
 		Assert.That(system.WorkersThatActivated, Is.GreaterThan(1),
 			"only one worker ever activated — routing is not distributing");
 	}
