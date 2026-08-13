@@ -193,8 +193,8 @@ public class MultiWorkerTests {
 	///   releasing workers.
 	///   <para>
 	///     <c>keyCapacity: 8</c> gives 16 map slots against 400 distinct keys, so once 16 are occupied
-	///     every new key must either reuse a stockpiled tombstone via <c>Place</c> or, failing that, reach
-	///     <c>GetOrAddRefCold</c> and evict — <c>GetOrAddRefCold</c> only calls <c>EvictFree</c> when the
+	///     every new key must reach <c>GetOrAddRefCold</c>, which either reuses a stockpiled tombstone via
+	///     <c>Place</c> or, failing that, evicts via <c>EvictFree</c> — it only calls <c>EvictFree</c> when the
 	///     probe finds no tombstone, so this is not literally "every key evicts": instrumentation measured
 	///     392 evictions against 400 keys, the remainder landing straight on a tombstone. <c>chunkCount: 4</c>
 	///     against those same 400 keys means <c>TryRent</c> fails constantly and <c>Harvest()</c> runs on
