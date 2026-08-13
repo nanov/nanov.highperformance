@@ -7,6 +7,7 @@ using Nanov.HighPerformance.Threading.Actors;
 internal sealed class RecordingState {
 	public readonly ConcurrentQueue<(int Key, int Value)> Seen = new();
 	public readonly ConcurrentQueue<Exception> Errors = new();
+	public readonly ConcurrentQueue<Exception?> CompletedWith = new();
 	public int Handled;
 	public int CompletedCalls;
 	public int SlotReuseCalls;
@@ -50,7 +51,10 @@ internal readonly struct RecordingHandler : IActorHandler<int, int> {
 		Interlocked.Increment(ref _state.Handled); // consumed, even though it threw
 	}
 
-	public void OnCompleted(Exception? error) => Interlocked.Increment(ref _state.CompletedCalls);
+	public void OnCompleted(Exception? error) {
+		_state.CompletedWith.Enqueue(error);
+		Interlocked.Increment(ref _state.CompletedCalls);
+	}
 
 	public void OnSlotReused(ref int slot) => Interlocked.Increment(ref _state.SlotReuseCalls);
 

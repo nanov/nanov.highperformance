@@ -22,7 +22,10 @@ public interface IKeyScheduler {
 	///     thread the scheduler owns. A scheduler-owned thread that dies silently is the worst failure
 	///     mode available: the system's workers park on an unbounded wait, quiescence becomes
 	///     unreachable, and <c>Completion</c> never resolves. Invoke it from any catch on such a thread
-	///     BEFORE stopping, so the exception is recorded rather than lost.
+	///     BEFORE stopping, so the exception is recorded rather than lost. <paramref name="onFault" />
+	///     itself must not throw — a caller invoking it from a catch block should wrap the call in its
+	///     own <see langword="try" />/<see langword="catch" /> so a throwing implementation cannot skip
+	///     that catch's own cleanup or escape the thread unhandled.
 	///   </para>
 	/// </summary>
 	void Start(int workerCount, Action<Exception> onFault);

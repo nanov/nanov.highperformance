@@ -169,7 +169,19 @@ public struct RoutedScheduler : IKeyScheduler {
 			// Tell the system first: it records the exception and sets _stopped, which is what lets
 			// the workers exit rather than park forever. Then the existing cleanup releases anyone
 			// already parked.
-			s.OnFault?.Invoke(ex);
+			//
+			// Guarded in its own try/catch: IKeyScheduler.Start documents onFault as must-not-throw, but
+			// ActorSystem.Fault calls SignalStop() on a public-interface TScheduler, so a third-party
+			// scheduler makes a throwing callback reachable. Without this guard, a throw here would skip
+			// the cleanup below AND escape this thread unhandled — the exact silent-death failure mode
+			// this fault channel exists to prevent.
+			try {
+				s.OnFault?.Invoke(ex);
+			}
+			catch {
+				// Deliberately swallowed — see above. The cleanup below must still run.
+			}
+
 			s.Stopping = true;
 			s.InboxNotEmpty.Set();
 			foreach (var evt in s.WorkAvailable!)

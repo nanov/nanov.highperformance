@@ -66,6 +66,19 @@ public class FaultPropagationTests {
 		Assert.That(agg!.InnerException, Is.InstanceOf<InvalidOperationException>());
 		Assert.That(agg.InnerException!.Message, Is.EqualTo("router boom"),
 			"the fault was recorded but the wrong exception surfaced");
+
+		// Completion.Wait having returned means every worker already passed its own OnCompleted call —
+		// each worker's finally calls it strictly before its own Interlocked.Decrement, and the last
+		// decrement (the one that resolves Completion) only runs after every worker's has. Guards the
+		// RunLoop-finally regression where a fault also sets _stopped, so hardStopped was tested first
+		// and every handler got a synthetic OperationCanceledException instead of the real fault while
+		// Completion correctly reported it — the two must agree.
+		Assert.That(state.CompletedWith, Has.Count.EqualTo(4));
+		foreach (var completedWith in state.CompletedWith) {
+			Assert.That(completedWith, Is.InstanceOf<InvalidOperationException>(),
+				"OnCompleted must be handed the real fault, not a synthetic cancellation");
+			Assert.That(completedWith!.Message, Is.EqualTo("router boom"));
+		}
 	}
 
 	[Test]

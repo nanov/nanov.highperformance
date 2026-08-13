@@ -96,6 +96,10 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		_processedPublished = new PaddedLong[workers];
 		_liveWorkers = workers;
 
+		// Passing Fault here hands out `this` before the constructor finishes (Start may launch a
+		// background thread that calls it immediately). Safe today only because Fault touches nothing
+		// but already-assigned fields (_completionError, _stopped, _scheduler) — _batchBound below is
+		// NOT among them. A future edit to Fault that reads a field assigned after this line would race.
 		_scheduler.Start(workers, Fault);
 		_batchBound = batchBound > 0 ? batchBound : _chunkSize;
 	}
@@ -321,15 +325,19 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	/// <summary>
 	///   Record a fault from a background thread and stop the system so everyone can exit.
 	///   <para>
-	///     All three steps are required. Recording alone leaves the survivors parked; stopping alone
-	///     loses the exception; and without the wake, workers already blocked on an unbounded wait
-	///     never re-check <c>_stopped</c>.
+	///     All the steps are required. Recording alone leaves the survivors parked; stopping alone
+	///     loses the exception; and without the wakes, workers already blocked on an unbounded wait
+	///     never re-check <c>_stopped</c>, and a producer parked in <see cref="WaitForMailboxSpace" />
+	///     or <see cref="WaitForChunk" /> is left to the 20&#160;ms poll instead of released
+	///     immediately — the same pairing <see cref="TryComplete" /> and <see cref="Dispose" /> already
+	///     use for <see cref="IKeyScheduler.SignalStop" />.
 	///   </para>
 	/// </summary>
 	private void Fault(Exception error) {
 		_completionError ??= error;
 		_stopped = true;
 		_scheduler.SignalStop();
+		_spaceAvailable.Set();
 	}
 
 	private void RunLoop(object? state) {
@@ -378,7 +386,11 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 				// branch for why the SYSTEM verdict cannot reuse it.
 				var drainedCleanly = _completed && QuiescentSum() >= Volatile.Read(ref _dispatchedFinal);
 				var hardStopped = _stopped && !drainedCleanly;
-				Exception? error = hardStopped ? new OperationCanceledException() : _completionError;
+				// Same precedence as the resolution below: a recorded fault wins over a cancellation,
+				// because Fault() sets _stopped as part of stopping the system. Testing hardStopped first
+				// would hand every handler a synthetic OperationCanceledException while Completion reports
+				// the real fault — the two must agree.
+				Exception? error = _completionError ?? (hardStopped ? new OperationCanceledException() : null);
 				try {
 					w.Handler.OnCompleted(error); // once per worker — the documented contract
 				}
