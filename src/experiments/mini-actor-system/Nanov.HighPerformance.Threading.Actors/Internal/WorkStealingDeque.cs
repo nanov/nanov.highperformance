@@ -82,6 +82,20 @@ internal sealed class WorkStealingDeque {
 
 	/// <summary>OWNER ONLY. Takes the newest item — the one whose cell lines are warmest.</summary>
 	internal bool TryPopBottom(out int value) {
+		// Early-out on the empty path. Without it every failed acquire writes _bottom twice and issues a
+		// full fence — and with a depth that never exceeds 1 (see the type docs), the empty poll IS the
+		// common case: TryAcquire calls this unconditionally and WaitForWork re-enters with no backoff
+		// whenever HasWork is true, so a worker that loses a steal spins here. Those writes dirty the one
+		// line every peer reads in HasWork's scan, which is O(N^2) coherence traffic on the idle path.
+		//
+		// Safe for the same reason the slow path is: _top only increases and _bottom is owner-private, so
+		// a stale-low _top can only make the deque look NON-empty, which falls through to the code below
+		// and is handled there. It cannot make a non-empty deque look empty.
+		if (_bottom.Value - Volatile.Read(ref _top.Value) <= 0) {
+			value = 0;
+			return false;
+		}
+
 		var bottom = _bottom.Value - 1;
 		Volatile.Write(ref _bottom.Value, bottom);
 

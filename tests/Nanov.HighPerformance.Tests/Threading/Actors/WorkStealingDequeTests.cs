@@ -117,6 +117,32 @@ public class WorkStealingDequeTests {
 	}
 
 	/// <summary>
+	///   The empty poll must not disturb the cursors. This is the path <c>TryAcquire</c> takes on every
+	///   failed acquire — the overwhelming majority of calls, since a worker's deque never exceeds depth
+	///   1 — so an early-out that got the cursor arithmetic wrong would corrupt the next push rather than
+	///   fail visibly.
+	/// </summary>
+	[Test]
+	public void An_Empty_Poll_Leaves_The_Cursors_Untouched_And_The_Deque_Usable() {
+		var deque = new WorkStealingDeque(8);
+
+		for (var i = 0; i < 1_000; i++)
+			Assert.That(deque.TryPopBottom(out _), Is.False, $"poll {i} claimed an item from an empty deque");
+
+		Assert.That(deque.CountApprox, Is.EqualTo(0), "an empty poll moved a cursor");
+
+		// The real damage an off-by-one here would do is silent: the next push writes the wrong slot.
+		for (var i = 0; i < 8; i++)
+			Assert.That(deque.TryPushBottom(i), Is.True, $"push {i} failed after 1000 empty polls");
+
+		var popped = new List<int>();
+		while (deque.TryPopBottom(out var value))
+			popped.Add(value);
+
+		Assert.That(popped, Is.EqualTo(new List<int> { 7, 6, 5, 4, 3, 2, 1, 0 }));
+	}
+
+	/// <summary>
 	///   Sustained concurrent stress: one owner pushing and popping while three thieves steal.
 	///   The oracle is set equality — every pushed value taken exactly once, by exactly one taker.
 	/// </summary>
