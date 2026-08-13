@@ -49,16 +49,42 @@ internal sealed class GlobalKeyQueue {
 		_mask = n - 1;
 	}
 
+	/// <summary>The number of slots — the constructor's <c>capacity</c> argument rounded up to a power of two (minimum 2).</summary>
 	internal int Capacity => _cells.Length;
 
-	/// <summary>Approximate depth. Racy by design — read before parking, never for correctness.</summary>
+	/// <summary>
+	///   Approximate depth. Racy by design — read before parking, never for correctness.
+	///   <para>
+	///     Reads <c>_dequeuePos</c> before <c>_enqueuePos</c> on purpose: a concurrent op landing between
+	///     the two reads then biases the result toward OVER-counting (a wasted spin) rather than
+	///     under-counting (a park on a queue that still has work) — "read before parking" only holds if
+	///     under-reporting can't happen. The opposite of <see cref="WorkStealingDeque.CountApprox" />,
+	///     where under-reporting is the safe direction (you just skip a victim) — don't make these two
+	///     match.
+	///   </para>
+	/// </summary>
 	internal int CountApprox {
 		get {
-			var count = Volatile.Read(ref _enqueuePos.Value) - Volatile.Read(ref _dequeuePos.Value);
+			var dequeuePos = Volatile.Read(ref _dequeuePos.Value);
+			var enqueuePos = Volatile.Read(ref _enqueuePos.Value);
+			var count = enqueuePos - dequeuePos;
 			return count < 0 ? 0 : (int)count;
 		}
 	}
 
+	/// <summary>
+	///   Claims the next slot and publishes <paramref name="value" /> into it. Returns
+	///   <see langword="false" /> when the slot a lap behind has not been consumed yet.
+	///   <para>
+	///     <b><see langword="false" /> means "not right now", never "the queue is full".</b> A dequeuer
+	///     that has already won its CAS on <c>_dequeuePos</c> but has not yet reached its stamp write in
+	///     <see cref="TryDequeue" /> leaves that slot looking unavailable for a few instructions, even
+	///     though the item it guards is already spoken for and about to be freed. A caller must retry (or
+	///     fall back to another sink) rather than latch a single <see langword="false" /> onto "the queue
+	///     is at capacity" — see the type docs' "cannot fill in normal operation" note for what a
+	///     PERSISTENT <see langword="false" /> actually means here.
+	///   </para>
+	/// </summary>
 	internal bool TryEnqueue(int value) {
 		while (true) {
 			var pos = Volatile.Read(ref _enqueuePos.Value);
@@ -76,6 +102,21 @@ internal sealed class GlobalKeyQueue {
 		}
 	}
 
+	/// <summary>
+	///   Claims the oldest published slot and returns its value. Returns <see langword="false" /> when
+	///   the slot has not been published yet.
+	///   <para>
+	///     <b><see langword="false" /> means "not right now", never "the queue is empty".</b> An
+	///     enqueuer that has already won its CAS on <c>_enqueuePos</c> but has not yet reached its stamp
+	///     write in <see cref="TryEnqueue" /> leaves that slot looking unpublished for a few
+	///     instructions, even though the item is already committed and about to appear. A single
+	///     <see langword="false" /> is not a drain signal: if a worker claims the last visible item and
+	///     is descheduled mid-window, every other worker can see <see langword="false" /> here, conclude
+	///     the queue is drained, and park — while the item behind that window is still queued. Callers
+	///     must retry or back off, never treat one <see langword="false" /> as "empty, nothing left to
+	///     do".
+	///   </para>
+	/// </summary>
 	internal bool TryDequeue(out int value) {
 		while (true) {
 			var pos = Volatile.Read(ref _dequeuePos.Value);
