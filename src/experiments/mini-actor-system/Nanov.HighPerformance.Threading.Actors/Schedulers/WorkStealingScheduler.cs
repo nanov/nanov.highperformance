@@ -119,7 +119,7 @@ public struct WorkStealingScheduler : IKeyScheduler {
 	public readonly void Schedule(int cellIdx) {
 		if (!TryEnqueueGlobalWithRetry(_state, cellIdx))
 			throw new InvalidOperationException(
-				"global key queue enqueue failed after 64 retries over roughly 65ms — either Capacity is set " +
+				"global key queue enqueue failed after 64 attempts over roughly 65ms — either Capacity is set " +
 				"below the key map's slot count, or a dequeuer has been stalled (e.g. preempted) that long " +
 				"holding a claim on the slot this position wrapped onto. Not necessarily a duplicate schedule.");
 		WakeOne(_state);
@@ -132,7 +132,7 @@ public struct WorkStealingScheduler : IKeyScheduler {
 			Interlocked.Increment(ref _state.DequeOverflows);
 			if (!TryEnqueueGlobalWithRetry(_state, cellIdx))
 				throw new InvalidOperationException(
-					"deque overflowed into a global queue that then failed to enqueue after 64 retries over " +
+					"deque overflowed into a global queue that then failed to enqueue after 64 attempts over " +
 					"roughly 65ms — either Capacity is set below the key map's slot count, or a dequeuer has " +
 					"been stalled that long holding a claim on the slot this position wrapped onto.");
 		}
@@ -154,11 +154,12 @@ public struct WorkStealingScheduler : IKeyScheduler {
 	///   rather than a fixed busy-spin budget: a busy-spin-only retry would not survive a stalled
 	///   participant that has genuinely been preempted for a scheduling quantum.
 	///   <para>
-	///     <b>Wall-clock cost: up to roughly 65&#160;ms.</b> 64 attempts, measured on this machine at
-	///     ~64.75&#160;ms end to end — 44 of the 64 <c>SpinOnce</c> calls land past
-	///     <c>SpinWait</c>'s internal sleep threshold and are <c>Thread.Sleep(1)</c>, not a spin. This
-	///     runs on the producer or a worker thread once per activation, not per message, but anyone
-	///     budgeting dispatch tail latency for this scheduler needs that number.
+	///     <b>Wall-clock cost: up to roughly 65&#160;ms.</b> 64 attempts (1 initial + 63 retries, the last
+	///     of which does not spin before giving up — see the loop below), measured on this machine at
+	///     ~64.75&#160;ms end to end for 64 spins — 44 of the 63 <c>SpinOnce</c> calls this loop actually
+	///     makes land past <c>SpinWait</c>'s internal sleep threshold and are <c>Thread.Sleep(1)</c>, not a
+	///     spin. This runs on the producer or a worker thread once per activation, not per message, but
+	///     anyone budgeting dispatch tail latency for this scheduler needs that number.
 	///     <see cref="GlobalEnqueueRetries" /> counts how often this path is actually paid.
 	///   </para>
 	/// </summary>
@@ -168,7 +169,10 @@ public struct WorkStealingScheduler : IKeyScheduler {
 		for (var attempt = 0; attempt < 64; attempt++) {
 			if (global.TryEnqueue(cellIdx)) return true;
 			Interlocked.Increment(ref s.GlobalEnqueueRetries);
-			spinner.SpinOnce();
+			// Only spin if there is a next attempt to make — spinning after the LAST failed attempt pays
+			// up to a full Thread.Sleep(1) (SpinWait has long since escalated past its busy-spin phase by
+			// attempt 64) that this call can never use before giving up.
+			if (attempt < 63) spinner.SpinOnce();
 		}
 
 		return false;

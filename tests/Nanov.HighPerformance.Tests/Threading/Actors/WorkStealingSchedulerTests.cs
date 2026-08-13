@@ -66,9 +66,10 @@ public class WorkStealingSchedulerTests {
 	}
 
 	/// <summary>
-	///   The wake edge. A parked worker must be released by a schedule from another thread — the Dekker
-	///   handshake between <c>Schedule</c>'s enqueue-then-flag-read (<c>WakeOne</c>'s fence) and
-	///   <c>ArmWait</c>'s Reset-before-flag ordering.
+	///   The wake edge — a parked worker must be released by a <c>Schedule</c> call from another thread.
+	///   A wake-path SMOKE TEST (see the head-start paragraph below for exactly what that does and does
+	///   not mean it catches) built around <c>Schedule</c>'s enqueue-then-flag-read (<c>WakeOne</c>'s
+	///   fence) and <c>ArmWait</c>'s Reset-before-flag ordering.
 	///   <para>
 	///     <b>Why 200 independent trials, not a single Set/Wait handshake.</b> An earlier version of this
 	///     test had the worker signal a separate <see cref="ManualResetEventSlim" /> AFTER its own
@@ -107,18 +108,43 @@ public class WorkStealingSchedulerTests {
 	///     so <c>Schedule</c> does not trivially always win by running before the worker even starts.
 	///   </para>
 	///   <para>
-	///     <b>The head start after <c>started</c> is a nanosecond-scale <c>Thread.SpinWait</c>, never a
-	///     sleep.</b> An earlier version used 40 <c>SpinWait.SpinOnce()</c> calls, believing that was a
-	///     "handful of spin cycles" — it measures ~30&#160;ms on this machine, because
-	///     <c>SpinOnce</c> escalates to <c>Thread.Sleep(1)</c> after its 20th call. That reintroduced the
-	///     ORIGINAL sleep under a different name: <c>Schedule</c> landed ~30&#160;ms after the worker was
-	///     already blocked in <c>Wait</c> in essentially every trial, so the test only ever proved <c>Set</c>
-	///     wakes an already-blocked waiter, exactly the thing the rewrite was meant to stop doing.
-	///     <c>Thread.SpinWait</c> below never sleeps and sweeps a genuine nanosecond-scale range across
-	///     trials (scaled to <c>iterations</c>, not a fixed modulus — a fixed <c>iter % 2048</c> against
-	///     only 200 trials only ever covers the bottom tenth of that range, biasing every trial toward a
-	///     near-zero head start and measurably raising the false-failure rate), so some trials really do
-	///     land inside the arm window instead of always racing well clear of it.
+	///     <b>The head start after <c>started</c> no longer sleeps — but it has NO MEASURED POWER against
+	///     the <c>ArmWait</c> reversal, and the doc comment must not claim otherwise.</b> An earlier
+	///     version used 40 <c>SpinWait.SpinOnce()</c> calls, believing that was a "handful of spin
+	///     cycles" — it measures ~30&#160;ms on this machine, because <c>SpinOnce</c> escalates to
+	///     <c>Thread.Sleep(1)</c> after its 20th call, silently reintroducing the ORIGINAL sleep under a
+	///     different name. The version below, <c>Thread.SpinWait</c> scaled to <c>iterations</c>, never
+	///     sleeps and genuinely varies arrival — but only across a MICROSECOND-scale range (up to roughly
+	///     100&#160;µs at the top of the sweep on x86-64), not nanoseconds. And that sweep is added ON
+	///     TOP of the real arrival floor, which is <c>started.Wait()</c>'s own return latency: the main
+	///     thread blocks on a KERNEL event before the worker thread even exists, and typically resumes
+	///     tens of microseconds after <c>started.Set()</c> fires — by which point the worker, which does
+	///     not wait on anything after <c>Set()</c>, has already executed <c>ArmWait(0); Wait(0)</c>, a
+	///     handful of nanoseconds of work. Essentially every trial arrives after the worker is already
+	///     parked. A dedicated 10,000-trial measurement confirms this directly: 3/80,000 failures with
+	///     <c>ArmWait</c>'s two statements reversed vs. 2/80,000 on the correct baseline — statistically
+	///     indistinguishable, and consistent with NO trial ever landing inside the arm window at all.
+	///   </para>
+	///   <para>
+	///     <b>So treat this as a wake-path smoke test, not an ordering-race detector.</b> What it DOES
+	///     catch reliably (~200/200 trials, by construction — not measured, since these are gross
+	///     breakages rather than narrow races): <c>WakeOne</c>'s fence removed, on x86-64 (NOT on arm64,
+	///     where that fence is architecturally redundant — see <c>WakeOne</c>'s own doc); <c>WakeOne</c>
+	///     never called at all; <c>Set</c> landing on the wrong worker's event; a scan bug that skips an
+	///     index; <c>ArmWait</c> failing to reset the event before parking. What it does NOT catch:
+	///     <c>ArmWait</c>'s Reset-before-flag statement order — that window is narrower than a
+	///     wall-clock/thread-scheduling race can resolve from outside. The design that WOULD catch it
+	///     deterministically, named here rather than implemented: a test-only <c>internal Action?
+	///     ArmWaitProbe</c> hook on <c>State</c>, invoked inside <c>ArmWait</c> between <c>Reset()</c> and
+	///     the <c>Parked</c> write. With the statements correctly ordered the probe is a no-op window; with
+	///     them reversed, the probe instead sits between the <c>Parked</c> write and <c>Reset()</c>, and a
+	///     probe body that spins ~1&#160;µs there gives a concurrent <c>Schedule</c> time to observe
+	///     <c>Parked == true</c>, call <c>Set</c>, and have that <c>Set</c> erased by the <c>Reset</c> that
+	///     follows — a deterministic hang (detection ≈1) instead of this design's near-zero power (a
+	///     10,000-trial measurement excludes a mutation-induced rate above ~1.2×10⁻⁴/trial and says
+	///     nothing below that). Cost: one null-check per park, off the per-message path — but it is a real
+	///     production-code change made solely to make a unit test's power tractable, and nobody has asked
+	///     for that trade yet.
 	///   </para>
 	/// </summary>
 	[Test]
@@ -126,11 +152,19 @@ public class WorkStealingSchedulerTests {
 	public void A_Parked_Worker_Is_Woken_By_A_Schedule() {
 		const int iterations = 200;
 		for (var iter = 0; iter < iterations; iter++) {
+			if (RunTrial(iter)) continue;
+			// Measured baseline false-positive ~2.5e-5/trial: a Schedule whose WakeOne beats the worker's
+			// ArmWait sees Parked=false, skips the Set, and this test deliberately omits the armed recheck
+			// that would rescue it. A real lost wakeup is deterministic, so it fails the retry too.
+			Assert.That(RunTrial(iter), Is.True, $"iteration {iter}: lost wakeup on the schedule path");
+		}
+
+		bool RunTrial(int iter) {
 			var scheduler = new WorkStealingScheduler { Capacity = 64, DequeCapacity = 64 };
 			scheduler.Start(2, _ => { });
 
 			var acquired = -1;
-			using var started = new ManualResetEventSlim(false);
+			var started = new ManualResetEventSlim(false);
 			var worker = new Thread(() => {
 				started.Set(); // absorb thread-creation latency only — see the doc comment above
 				scheduler.ArmWait(0);
@@ -140,17 +174,22 @@ public class WorkStealingSchedulerTests {
 			worker.Start();
 			Assert.That(started.Wait(TimeSpan.FromSeconds(5)), Is.True,
 				$"iteration {iter}: worker thread never started");
-			// Nanosecond-scale, never sleeps (unlike SpinWait.SpinOnce past its ~20-call escalation
-			// threshold) — scaled to `iterations` so the full 0..2047-cycle sweep is covered regardless of
-			// how many trials this run does. See the doc comment above.
+			// Microsecond-scale, never sleeps — see the doc comment above for exactly what this does and
+			// does not give this test power against.
 			Thread.SpinWait(iter * 2048 / iterations);
 
 			var key = 1000 + iter;
 			scheduler.Schedule(key); // deliberately racing the worker's arm cycle — no further handshake
 
-			Assert.That(worker.Join(TimeSpan.FromSeconds(10)), Is.True,
-				$"iteration {iter}: the parked worker was never woken — lost wakeup on the schedule path");
-			Assert.That(Volatile.Read(ref acquired), Is.EqualTo(key), $"iteration {iter}: wrong/missing key");
+			// A real wake lands in microseconds; 2s is generous headroom, not a tolerance for slowness.
+			if (!worker.Join(TimeSpan.FromSeconds(2))) return false;
+			// Only dispose on the success path — on failure the worker thread may still be running and
+			// could still reach `started.Set()` after this returns, and CountdownEvent-style primitives
+			// throw ObjectDisposedException unconditionally from a Set/Signal on a disposed instance,
+			// which would crash the test host from a background thread instead of leaving a readable
+			// assertion failure.
+			started.Dispose();
+			return Volatile.Read(ref acquired) == key;
 		}
 	}
 
@@ -169,7 +208,7 @@ public class WorkStealingSchedulerTests {
 		scheduler.Start(3, _ => { });
 
 		var released = 0;
-		using var armed = new CountdownEvent(3);
+		var armed = new CountdownEvent(3);
 		var threads = new Thread[3];
 		for (var i = 0; i < threads.Length; i++) {
 			var id = i;
@@ -183,6 +222,12 @@ public class WorkStealingSchedulerTests {
 		}
 
 		Assert.That(armed.Wait(TimeSpan.FromSeconds(5)), Is.True, "not every worker armed in time");
+		// Dispose only once every thread has already called Signal() — guaranteed by the true above,
+		// since a CountdownEvent only reaches zero after all 3 have signalled. Disposing any earlier
+		// (e.g. via `using`, torn down on an assertion failure above) risks a thread reaching Signal()
+		// afterwards; CountdownEvent.Signal throws ObjectDisposedException unconditionally, which would
+		// crash the test host from a background thread instead of leaving a readable assertion failure.
+		armed.Dispose();
 		scheduler.SignalStop();
 		foreach (var thread in threads)
 			Assert.That(thread.Join(TimeSpan.FromSeconds(10)), Is.True, "a worker was left parked");
