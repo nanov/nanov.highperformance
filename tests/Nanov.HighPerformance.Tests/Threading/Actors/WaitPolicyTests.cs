@@ -1,6 +1,5 @@
 namespace Nanov.HighPerformance.Tests.Threading.Actors;
 
-using System.Collections.Generic;
 using Nanov.HighPerformance.Threading.Actors;
 using Nanov.HighPerformance.Threading.Actors.Schedulers;
 using Nanov.HighPerformance.Threading.Actors.WaitPolicies;
@@ -17,6 +16,16 @@ public class WaitPolicyTests {
 	[Test]
 	public void Legacy_Ladder_Is_Thirty_Two_Spins_Then_Unbounded_Blocks() {
 		var policy = new LegacyWaitPolicy();
+
+		// Pin the LITERALS, not just the relationship. Every assertion below is expressed in terms of
+		// these constants, so without this a later edit of SpinRungs to 8 would leave the whole fixture
+		// green while the method name still claims thirty-two — and every Phase 4 measurement would be
+		// against a baseline that is no longer the pre-Phase-4 ladder. That is precisely the drift this
+		// test exists to prevent.
+		Assert.Multiple(() => {
+			Assert.That(LegacyWaitPolicy.SpinRungs, Is.EqualTo(32), "the baseline ladder's rung count changed");
+			Assert.That(LegacyWaitPolicy.SpinIterations, Is.EqualTo(64), "the baseline ladder's spin size changed");
+		});
 
 		for (var attempt = 0; attempt < LegacyWaitPolicy.SpinRungs; attempt++) {
 			var step = policy.Next(attempt);
@@ -35,9 +44,16 @@ public class WaitPolicyTests {
 		}
 	}
 
-	/// <summary>The seam must not have changed the default: an unspecified policy is the legacy ladder.</summary>
+	/// <summary>
+	///   The optional policy parameter did not break construction or the drain path.
+	///   <para>
+	///     <b>This does NOT observe which policy was chosen</b> — it would pass under any policy that
+	///     eventually blocks. Verifying the default really is the legacy ladder needs an injected spy,
+	///     which nothing yet requires. Named for what it checks, not for what it was first called.
+	///   </para>
+	/// </summary>
 	[Test]
-	public void An_Unspecified_Policy_Defaults_To_Legacy() {
+	public void An_Unspecified_Policy_Constructs_And_Drains() {
 		var state = new RecordingState();
 		using var system = new ActorSystem<int, int, RecordingHandler, SingleWorkerScheduler>(
 			new RecordingHandler(state), keyCapacity: 16, chunkCount: 8, chunkSize: 16,

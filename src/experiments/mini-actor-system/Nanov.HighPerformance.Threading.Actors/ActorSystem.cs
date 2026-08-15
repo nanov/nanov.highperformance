@@ -653,7 +653,15 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	///   </para>
 	/// </summary>
 	private bool WaitForWork(WorkerState<THandler> w) {
-		for (var attempt = 0; ; attempt++) {
+		// Saturating, not wrapping. `attempt` advances once per WAKEUP-without-work, not per unit time —
+		// an unbounded Wait() means a worker parked on a quiet system increments zero times — so reaching
+		// int.MaxValue needs ~2^31 spurious wakeups inside ONE park. Unreachable in practice, but the
+		// consequence of wrapping is not benign: int.MinValue satisfies `attempt < SpinRungs`, so the
+		// ladder would hand back Spin and a parked worker would burn a core for ~2^31 rungs. Worse, the
+		// Spin branch never calls IsQuiescent(), so a system that drains during that window would have
+		// completion delayed until the worker climbed back to a Block rung. The pre-seam code had no
+		// counter and so could not do this; saturating restores that guarantee for one token.
+		for (var attempt = 0; ; attempt = attempt == int.MaxValue ? attempt : attempt + 1) {
 			var step = _waitPolicy.Next(attempt);
 
 			if (step.Kind == WaitStepKind.Spin) {
