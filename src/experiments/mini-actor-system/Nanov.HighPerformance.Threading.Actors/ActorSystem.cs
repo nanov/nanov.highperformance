@@ -4,6 +4,7 @@ using System;
 using System.Diagnostics;
 using System.Threading;
 using Nanov.HighPerformance.Threading.Actors.Internal;
+using Nanov.HighPerformance.Threading.Actors.WaitPolicies;
 
 /// <summary>
 ///   Key-affine message processor: a single producer dispatches <c>(key, message)</c>; workers process
@@ -23,6 +24,7 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	private readonly int _chunkSize;
 	private readonly int _chunkMask;
 	private readonly int _batchBound;
+	private readonly IWaitPolicy _waitPolicy;
 
 	// The PRODUCER's own copy — the one that services OnSlotReused and OnChunkReclaimed, which run on
 	// the producer thread. Each worker carries a FURTHER copy of its own in WorkerState.Handler. Total
@@ -64,6 +66,11 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	/// <param name="batchBound">Max messages per activation; 0 ⇒ <paramref name="chunkSize" />.</param>
 	/// <param name="workers">Number of worker threads; must be at least 1.</param>
 	/// <param name="scheduler">The scheduling policy — see <see cref="IKeyScheduler" />.</param>
+	/// <param name="waitPolicy">
+	///   The idle-worker wait ladder — see <see cref="IWaitPolicy" />. <see langword="null" /> (the
+	///   default) reproduces pre-Phase-4 behaviour exactly via <see cref="LegacyWaitPolicy" />, so no
+	///   existing call site needs to change.
+	/// </param>
 	public ActorSystem(
 		THandler handler,
 		int keyCapacity,
@@ -71,12 +78,14 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 		int chunkSize,
 		int batchBound,
 		int workers,
-		TScheduler scheduler) {
+		TScheduler scheduler,
+		IWaitPolicy? waitPolicy = null) {
 		if (workers < 1)
 			throw new ArgumentOutOfRangeException(nameof(workers), "at least one worker is required.");
 
 		_handler = handler;
 		_scheduler = scheduler;
+		_waitPolicy = waitPolicy ?? new LegacyWaitPolicy();
 		_slab = new ChunkSlab<T>(chunkCount, chunkSize);
 		_chunkSize = _slab.ChunkSize;
 		_chunkMask = _slab.ChunkMask;
@@ -644,12 +653,24 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	///   </para>
 	/// </summary>
 	private bool WaitForWork(WorkerState<THandler> w) {
-		for (var spin = 0; spin < 32; spin++) {
-			if (_scheduler.HasWork(w.Id) || _stopped) return !_stopped;
-			Thread.SpinWait(64);
-		}
+		for (var attempt = 0; ; attempt++) {
+			var step = _waitPolicy.Next(attempt);
 
-		while (true) {
+			if (step.Kind == WaitStepKind.Spin) {
+				if (_scheduler.HasWork(w.Id) || _stopped) return !_stopped;
+				Thread.SpinWait(step.SpinIterations);
+				continue;
+			}
+
+			if (step.Kind == WaitStepKind.Yield) {
+				if (_scheduler.HasWork(w.Id) || _stopped) return !_stopped;
+				Thread.Yield();
+				continue;
+			}
+
+			// Arm-then-recheck, unchanged: clear the flag, fence, re-test work AND quiescence, and only
+			// then block. Collapsing this into check-then-park is the classic lost wakeup, and it passes
+			// every test whose worker never actually sleeps.
 			_scheduler.ArmWait(w.Id);
 			Interlocked.MemoryBarrier();
 			if (_scheduler.HasWork(w.Id) || _stopped) return !_stopped;
