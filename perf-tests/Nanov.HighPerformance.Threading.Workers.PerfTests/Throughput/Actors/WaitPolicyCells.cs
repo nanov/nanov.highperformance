@@ -207,6 +207,13 @@ public abstract class WaitPolicyPairedCellBase : IThroughputTest {
 
 		sessionContext.Start();
 		for (var round = 0; round < Rounds; round++) {
+			// Rotating the lead balances POSITION exactly — over each 3-round cycle every arm leads, runs
+			// second and trails once, so across 9 rounds each does so three times. It does NOT cover all
+			// six orderings: only the three cyclic rotations of (Legacy, Bounded, Backoff) are emitted, so
+			// ADJACENCY is fixed — Bounded always immediately follows Legacy, never Backoff. What that
+			// leaves unbalanced is arm-specific state inherited from a fixed predecessor, which the full
+			// collect before every arm-run largely removes. Stated because this file documents its other
+			// residual biases and should not go quiet about this one.
 			var leadArm = round % ArmCount;
 			var opsByArm = new double[ArmCount];
 			for (var slot = 0; slot < ArmCount; slot++) {
@@ -265,9 +272,17 @@ public abstract class WaitPolicyPairedCellBase : IThroughputTest {
 	}
 
 	/// <summary>
-	///   Runs one arm's round: collects outside the timer so the previous arm's <c>ChunkSlab</c> finalizers
-	///   don't run concurrently with this arm's measurement, constructs the policy (also outside the timer)
+	///   Runs one arm's round: collects outside the timer, constructs the policy (also outside the timer)
 	///   and a fresh handler state, then a fresh system, a full drain, and a disposal.
+	///   <para>
+	///     <b>Why the collect, precisely.</b> Not finalizers — nothing in this tree has one, and
+	///     <c>ChunkSlab</c> is a plain managed array cleaned up through <c>Dispose</c>. What it actually
+	///     removes is the previous arm's garbage: each system allocates a multi-megabyte LOH slab, and the
+	///     session collects only once per <c>--runs</c> iteration, so without this an arm can pay for its
+	///     predecessor's collection inside its own measured window. Arm alternation would average that
+	///     across rounds rather than bias the median, so this buys variance, not correctness — it is
+	///     cheap, so it is worth taking.
+	///   </para>
 	/// </summary>
 	private double RunArm(int armIndex, int[] keys, ref long totalHandled) {
 		GC.Collect();
