@@ -68,7 +68,7 @@ public abstract class ActorThroughputTestBase : IThroughputTest {
 	///     placement noise even on an idle machine. Treat differences smaller than the spread as absent.
 	///   </para>
 	/// </summary>
-	protected const int SpinPerMessage = 32;
+	protected virtual int SpinPerMessage => 32;
 
 	private readonly int? _producerCpu;
 
@@ -111,12 +111,17 @@ public abstract class ActorThroughputTestBase : IThroughputTest {
 	///   so harvest does not run. Both cold paths are producer-side and scheduler-independent, so leaving
 	///   them out of the measurement removes noise that would land on both cells equally but unevenly.
 	/// </summary>
+	/// <param name="waitPolicy">
+	///   The idle-worker wait ladder to drive the system with. <see langword="null" /> (the default)
+	///   reproduces the Phase 3 cells' behaviour exactly — <see cref="ActorSystem{TKey,T,THandler,TScheduler}" />
+	///   falls back to its own legacy default — so existing call sites need no change.
+	/// </param>
 	protected static long Drive<TScheduler>(TScheduler scheduler, int cardinality, int[] keys,
-		ActorPerfState state, int? producerCpu)
+		ActorPerfState state, int? producerCpu, IWaitPolicy? waitPolicy = null)
 		where TScheduler : struct, IKeyScheduler {
 		using var system = new ActorSystem<int, long, ActorPerfHandler, TScheduler>(
 			new ActorPerfHandler(state), keyCapacity: cardinality * 2, chunkCount: cardinality,
-			chunkSize: 256, batchBound: 16, workers: Workers, scheduler: scheduler);
+			chunkSize: 256, batchBound: 16, workers: Workers, scheduler: scheduler, waitPolicy: waitPolicy);
 		system.Start();
 
 		using (ThreadAffinityUtil.SetThreadAffinity(producerCpu)) {

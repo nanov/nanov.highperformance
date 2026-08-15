@@ -348,9 +348,10 @@ public struct WorkStealingScheduler : IKeyScheduler {
 		Volatile.Write(ref _state.Parked![workerId], true);
 	}
 
-	public readonly void Wait(int workerId) {
+	public readonly bool Wait(int workerId, int millisecondsTimeout) {
 		Interlocked.Increment(ref _state.Parks);
-		_state.WorkAvailable![workerId].Wait();
+		var signalled = _state.WorkAvailable![workerId].Wait(millisecondsTimeout);
 		Volatile.Write(ref _state.Parked![workerId], false);
+		return signalled;
 	}
 }

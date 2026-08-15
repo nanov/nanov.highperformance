@@ -683,7 +683,11 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 			Interlocked.MemoryBarrier();
 			if (_scheduler.HasWork(w.Id) || _stopped) return !_stopped;
 			if (IsQuiescent()) return false;
-			_scheduler.Wait(w.Id);
+			// The bool return (signalled vs. timed out) is deliberately unused: a timeout is not an error,
+			// and the two rechecks below run unconditionally either way — see IKeyScheduler.Wait's doc.
+			// Reordering around the return value here would be the reintroduction the seam was built to
+			// avoid.
+			_scheduler.Wait(w.Id, step.BlockMilliseconds);
 			if (_scheduler.HasWork(w.Id) || _stopped) return !_stopped;
 			if (IsQuiescent()) return false;
 		}

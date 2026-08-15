@@ -63,6 +63,15 @@ public interface IKeyScheduler {
 	/// </summary>
 	void ArmWait(int workerId);
 
-	/// <summary>Block this worker until signalled.</summary>
-	void Wait(int workerId);
+	/// <summary>
+	///   Block this worker until signalled or until <paramref name="millisecondsTimeout" /> elapses.
+	///   <para>
+	///     Returns <see langword="false" /> on timeout, <see langword="true" /> if signalled. A timeout is
+	///     <b>not</b> an error — it is a rung of the wait ladder, same as a signal. Either way the caller
+	///     must re-test work and quiescence before parking again, which <c>WaitForWork</c> already does
+	///     unconditionally after this call, so the return value is informational rather than
+	///     branch-worthy.
+	///   </para>
+	/// </summary>
+	bool Wait(int workerId, int millisecondsTimeout);
 }

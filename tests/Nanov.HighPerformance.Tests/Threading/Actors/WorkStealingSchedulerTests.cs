@@ -169,7 +169,7 @@ public class WorkStealingSchedulerTests {
 			var worker = new Thread(() => {
 				started.Set(); // absorb thread-creation latency only — see the doc comment above
 				scheduler.ArmWait(0);
-				scheduler.Wait(0);
+				scheduler.Wait(0, Timeout.Infinite);
 				if (scheduler.TryAcquire(0, out var value)) Volatile.Write(ref acquired, value);
 			}) { IsBackground = true };
 			worker.Start();
@@ -216,7 +216,7 @@ public class WorkStealingSchedulerTests {
 			threads[id] = new Thread(() => {
 				scheduler.ArmWait(id);
 				armed.Signal();
-				scheduler.Wait(id);
+				scheduler.Wait(id, Timeout.Infinite);
 				Interlocked.Increment(ref released);
 			}) { IsBackground = true };
 			threads[id].Start();

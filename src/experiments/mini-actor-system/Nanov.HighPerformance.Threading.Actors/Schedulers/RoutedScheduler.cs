@@ -301,5 +301,6 @@ public struct RoutedScheduler : IKeyScheduler {
 
 	public void ArmWait(int workerId) => _state.WorkAvailable![workerId].Reset();
 
-	public void Wait(int workerId) => _state.WorkAvailable![workerId].Wait();
+	public bool Wait(int workerId, int millisecondsTimeout) =>
+		_state.WorkAvailable![workerId].Wait(millisecondsTimeout);
 }

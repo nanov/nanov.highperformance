@@ -74,5 +74,5 @@ public struct SingleWorkerScheduler : IKeyScheduler {
 
 	public void ArmWait(int workerId) => _state.WorkAvailable.Reset();
 
-	public void Wait(int workerId) => _state.WorkAvailable.Wait();
+	public bool Wait(int workerId, int millisecondsTimeout) => _state.WorkAvailable.Wait(millisecondsTimeout);
 }
