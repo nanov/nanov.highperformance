@@ -88,6 +88,36 @@ public class WaitPolicyTests {
 	}
 
 	/// <summary>
+	///   The same shape, pinned at a second point in the constructor's parameter space so the arithmetic
+	///   isn't only verified at the one configuration (256 / 64) the default happens to use. Small
+	///   <c>maxSpinIterations</c> means the cap is hit while the budget still has a long way to go, so this
+	///   also exercises the "many repeated max-rungs" tail the default's 4 repeats barely reaches.
+	/// </summary>
+	[Test]
+	public void Backoff_Ladder_Shape_Holds_At_A_NonDefault_Configuration() {
+		var policy = new BackoffWaitPolicy(spinBudget: 64, maxSpinIterations: 8);
+
+		var expectedRungs = new[] { 1, 2, 4, 8, 8, 8, 8, 8, 8, 8, 8 };
+		for (var attempt = 0; attempt < expectedRungs.Length; attempt++) {
+			var step = policy.Next(attempt);
+			var expected = expectedRungs[attempt];
+			Assert.Multiple(() => {
+				Assert.That(step.Kind, Is.EqualTo(WaitStepKind.Spin), $"attempt {attempt}");
+				Assert.That(step.SpinIterations, Is.EqualTo(expected), $"attempt {attempt}");
+			});
+		}
+
+		var cumulativeSpin = 0;
+		for (var attempt = 0; attempt < expectedRungs.Length; attempt++)
+			cumulativeSpin += policy.Next(attempt).SpinIterations;
+		Assert.That(cumulativeSpin, Is.LessThanOrEqualTo(policy.SpinBudget + policy.MaxSpinIterations),
+			"cumulative spin overshot the budget by more than one rung");
+
+		Assert.That(policy.Next(expectedRungs.Length).Kind, Is.EqualTo(WaitStepKind.Yield));
+		Assert.That(policy.Next(expectedRungs.Length + 1).Kind, Is.EqualTo(WaitStepKind.Block));
+	}
+
+	/// <summary>
 	///   The trap from Task 1's review: <c>WaitForWork</c> treats anything that is not <c>Spin</c> or
 	///   <c>Yield</c> as <c>Block</c>, and <c>default(WaitStep)</c> is <c>Kind = Spin, SpinIterations = 0</c>
 	///   — a tight, uninterruptible busy loop. Attempt values the ladder should never see in practice
@@ -105,15 +135,21 @@ public class WaitPolicyTests {
 	}
 
 	[Test]
-	public void Backoff_Constructor_Rejects_NonPositive_Arguments() {
+	public void Backoff_Constructor_Rejects_Invalid_Arguments() {
 		Assert.Multiple(() => {
 			Assert.That(() => new BackoffWaitPolicy(spinBudget: 0), Throws.TypeOf<ArgumentOutOfRangeException>());
 			Assert.That(() => new BackoffWaitPolicy(spinBudget: -1), Throws.TypeOf<ArgumentOutOfRangeException>());
+			Assert.That(() => new BackoffWaitPolicy(spinBudget: BackoffWaitPolicy.MaxSpinBudget + 1),
+				Throws.TypeOf<ArgumentOutOfRangeException>());
+			Assert.That(() => new BackoffWaitPolicy(spinBudget: int.MaxValue), Throws.TypeOf<ArgumentOutOfRangeException>());
 			Assert.That(() => new BackoffWaitPolicy(maxSpinIterations: 0), Throws.TypeOf<ArgumentOutOfRangeException>());
 			Assert.That(() => new BackoffWaitPolicy(maxSpinIterations: -1), Throws.TypeOf<ArgumentOutOfRangeException>());
 			Assert.That(() => new BackoffWaitPolicy(blockMilliseconds: 0), Throws.TypeOf<ArgumentOutOfRangeException>());
 			Assert.That(() => new BackoffWaitPolicy(blockMilliseconds: -1), Throws.TypeOf<ArgumentOutOfRangeException>());
 		});
+
+		// The bound itself must still construct — this is an upper bound on the argument, not a lower one.
+		Assert.That(() => new BackoffWaitPolicy(spinBudget: BackoffWaitPolicy.MaxSpinBudget), Throws.Nothing);
 	}
 
 	/// <summary>

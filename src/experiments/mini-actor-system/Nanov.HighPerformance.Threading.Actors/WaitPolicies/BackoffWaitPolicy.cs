@@ -26,11 +26,21 @@ using System.Collections.Generic;
 public sealed class BackoffWaitPolicy : IWaitPolicy {
 	private readonly int[] _ladder;
 
+	/// <summary>
+	///   Upper bound on <see cref="SpinBudget" />. <c>spent += next</c> in the constructor is unchecked, so
+	///   an unbounded budget can overflow <c>spent</c> negative around rung ~33.5M and never terminate; and
+	///   long before that, a merely-large-looking budget (e.g. 100M) builds a ladder with well over a
+	///   million entries, which defeats the "precomputed so <c>Next()</c> is an array read" rationale this
+	///   type exists for. <c>1 &lt;&lt; 20</c> is generous for any plausible idle-wait tuning.
+	/// </summary>
+	public const int MaxSpinBudget = 1 << 20;
+
 	/// <param name="spinBudget">
-	///   Total spin iterations to spend climbing the ladder before the yield rung. Must be positive — zero
-	///   or negative would leave the precomputed ladder empty, and attempt 0 would land straight on the
-	///   yield rung with attempt 1 going straight to a block, silently collapsing the whole exponential
-	///   tier.
+	///   Total spin iterations to spend climbing the ladder before the yield rung. Must be positive and at
+	///   most <see cref="MaxSpinBudget" /> — zero or negative would leave the precomputed ladder empty, and
+	///   attempt 0 would land straight on the yield rung with attempt 1 going straight to a block, silently
+	///   collapsing the whole exponential tier; see <see cref="MaxSpinBudget" /> for why the upper bound
+	///   exists.
 	/// </param>
 	/// <param name="maxSpinIterations">
 	///   Cap on a single rung. Must be positive — zero or negative would make every rung <c>Spin(0)</c>,
@@ -43,6 +53,7 @@ public sealed class BackoffWaitPolicy : IWaitPolicy {
 	/// </param>
 	public BackoffWaitPolicy(int spinBudget = 256, int maxSpinIterations = 64, int blockMilliseconds = 20) {
 		ArgumentOutOfRangeException.ThrowIfNegativeOrZero(spinBudget);
+		ArgumentOutOfRangeException.ThrowIfGreaterThan(spinBudget, MaxSpinBudget);
 		ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSpinIterations);
 		ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockMilliseconds);
 
