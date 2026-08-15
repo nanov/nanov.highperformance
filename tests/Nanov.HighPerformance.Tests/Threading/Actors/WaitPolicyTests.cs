@@ -45,6 +45,78 @@ public class WaitPolicyTests {
 	}
 
 	/// <summary>
+	///   Pins the shape of the default ladder rung by rung: doubling from 1, capped at 64, then exactly
+	///   one yield, then unconditional blocks. A later edit that "simplifies" the doubling or drops the
+	///   yield tier would still compile and still drain — this is the test that would catch it.
+	/// </summary>
+	[Test]
+	public void Backoff_Ladder_Doubles_Then_Caps_Then_Yields_Once_Then_Blocks() {
+		var policy = new BackoffWaitPolicy();
+
+		var expectedRungs = new[] { 1, 2, 4, 8, 16, 32, 64, 64, 64, 64 };
+		for (var attempt = 0; attempt < expectedRungs.Length; attempt++) {
+			var step = policy.Next(attempt);
+			var expected = expectedRungs[attempt];
+			Assert.Multiple(() => {
+				Assert.That(step.Kind, Is.EqualTo(WaitStepKind.Spin), $"attempt {attempt}");
+				Assert.That(step.SpinIterations, Is.EqualTo(expected), $"attempt {attempt}");
+			});
+		}
+
+		var cumulativeSpin = 0;
+		for (var attempt = 0; attempt < expectedRungs.Length; attempt++)
+			cumulativeSpin += policy.Next(attempt).SpinIterations;
+		Assert.That(cumulativeSpin, Is.LessThanOrEqualTo(policy.SpinBudget + policy.MaxSpinIterations),
+			"cumulative spin overshot the budget by more than one rung");
+
+		var yieldStep = policy.Next(expectedRungs.Length);
+		Assert.Multiple(() => {
+			Assert.That(yieldStep.Kind, Is.EqualTo(WaitStepKind.Yield));
+			Assert.That(policy.Next(expectedRungs.Length - 1).Kind, Is.Not.EqualTo(WaitStepKind.Yield),
+				"the rung before the yield must still be a spin");
+			Assert.That(policy.Next(expectedRungs.Length + 1).Kind, Is.Not.EqualTo(WaitStepKind.Yield),
+				"exactly one yield rung, not a plateau");
+		});
+
+		foreach (var attempt in new[] { expectedRungs.Length + 1, expectedRungs.Length + 2, 100, 10_000 }) {
+			var step = policy.Next(attempt);
+			Assert.Multiple(() => {
+				Assert.That(step.Kind, Is.EqualTo(WaitStepKind.Block), $"attempt {attempt}");
+				Assert.That(step.BlockMilliseconds, Is.EqualTo(policy.BlockMilliseconds));
+			});
+		}
+	}
+
+	/// <summary>
+	///   The trap from Task 1's review: <c>WaitForWork</c> treats anything that is not <c>Spin</c> or
+	///   <c>Yield</c> as <c>Block</c>, and <c>default(WaitStep)</c> is <c>Kind = Spin, SpinIterations = 0</c>
+	///   — a tight, uninterruptible busy loop. Attempt values the ladder should never see in practice
+	///   (negative, <see cref="int.MaxValue" />) must still never produce that default.
+	/// </summary>
+	[Test]
+	public void Backoff_Never_Returns_A_Default_Step_For_Any_Attempt() {
+		var policy = new BackoffWaitPolicy();
+
+		foreach (var attempt in new[] { int.MinValue, -1000, -1, 0, int.MaxValue }) {
+			var step = policy.Next(attempt);
+			var isDefaultSpinZero = step.Kind == WaitStepKind.Spin && step.SpinIterations == 0;
+			Assert.That(isDefaultSpinZero, Is.False, $"attempt {attempt} produced a default Spin(0) step");
+		}
+	}
+
+	[Test]
+	public void Backoff_Constructor_Rejects_NonPositive_Arguments() {
+		Assert.Multiple(() => {
+			Assert.That(() => new BackoffWaitPolicy(spinBudget: 0), Throws.TypeOf<ArgumentOutOfRangeException>());
+			Assert.That(() => new BackoffWaitPolicy(spinBudget: -1), Throws.TypeOf<ArgumentOutOfRangeException>());
+			Assert.That(() => new BackoffWaitPolicy(maxSpinIterations: 0), Throws.TypeOf<ArgumentOutOfRangeException>());
+			Assert.That(() => new BackoffWaitPolicy(maxSpinIterations: -1), Throws.TypeOf<ArgumentOutOfRangeException>());
+			Assert.That(() => new BackoffWaitPolicy(blockMilliseconds: 0), Throws.TypeOf<ArgumentOutOfRangeException>());
+			Assert.That(() => new BackoffWaitPolicy(blockMilliseconds: -1), Throws.TypeOf<ArgumentOutOfRangeException>());
+		});
+	}
+
+	/// <summary>
 	///   The optional policy parameter did not break construction or the drain path.
 	///   <para>
 	///     <b>This does NOT observe which policy was chosen</b> — it would pass under any policy that
