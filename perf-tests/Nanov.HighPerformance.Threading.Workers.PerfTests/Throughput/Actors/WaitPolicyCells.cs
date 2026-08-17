@@ -92,7 +92,7 @@ public sealed class WaitBoundedSpin32ThroughputTest : WaitPolicyCellBase {
 ///     and yield tier on top of an already-bounded block", and Legacy→Backoff is just their combination.
 ///   </para>
 ///   <para>
-///     <b>Shape.</b> Each round is one full system build, a complete 10M-message drain, and a disposal, per
+///     <b>Shape.</b> Each round is one full system build, a complete 30M-message drain, and a disposal, per
 ///     arm. The three arms' EXECUTION ORDER cycles round to round — round <c>r</c> leads with arm
 ///     <c>r % 3</c> and follows with the other two in a fixed rotation — so across any <see cref="Rounds" />
 ///     rounds every arm spends an equal share of rounds leading, second, and trailing rather than one arm
@@ -158,7 +158,12 @@ public sealed class WaitBoundedSpin32ThroughputTest : WaitPolicyCellBase {
 public abstract class WaitPolicyPairedCellBase : IThroughputTest {
 	private const int Workers = 8;
 	private const int Cardinality = 1024;
-	private const long Iterations = 10L * 1000L * 1000L;
+	// 30M, not 10M. At 10M an arm drained in ~3 s, so the fixed per-arm overhead — and more to the
+	// point its RUN-TO-RUN VARIANCE — was a large fraction of every sample. Moving setup outside the
+	// timer removes most of that; tripling the drain amortises whatever is left, at ~9 s per arm and
+	// ~4.5 min per cell. Both changes were made together after two runs disagreed on the SIGN of the
+	// headline ratio.
+	private const long Iterations = 30L * 1000L * 1000L;
 
 	// A multiple of ArmCount so the round-robin leader rotation completes whole cycles: every arm leads,
 	// sits second, and trails exactly Rounds / ArmCount times. >= 8, per the brief's "at least 8 rounds
@@ -291,17 +296,29 @@ public abstract class WaitPolicyPairedCellBase : IThroughputTest {
 
 		var waitPolicy = CreateWaitPolicy(armIndex);
 		var state = new ActorPerfState { SpinPerMessage = SpinPerMessage };
-		var stopwatch = Stopwatch.StartNew();
-		var handled = Drive(waitPolicy, keys, state);
-		stopwatch.Stop();
+		var elapsed = Drive(waitPolicy, keys, state);
 
-		PerfTestUtil.FailIfNot(Iterations, handled,
-			$"{ArmCode(armIndex)}: expected {Iterations} handled, saw {handled}");
-		totalHandled += handled;
-		return Iterations / stopwatch.Elapsed.TotalSeconds;
+		PerfTestUtil.FailIfNot(Iterations, state.HandledCount,
+			$"{ArmCode(armIndex)}: expected {Iterations} handled, saw {state.HandledCount}");
+		totalHandled += state.HandledCount;
+		return Iterations / elapsed.TotalSeconds;
 	}
 
-	private long Drive(IWaitPolicy waitPolicy, int[] keys, ActorPerfState state) {
+	/// <summary>
+	///   Drives one arm and returns <b>only the drain's</b> elapsed time.
+	///   <para>
+	///     <b>Construction, eight thread starts and disposal are deliberately outside the timer.</b> The
+	///     first version of this cell bracketed all of it, following the house precedent set by the
+	///     single-scheduler cells — and at 10M messages an arm ran ~3 s, into which that setup injected a
+	///     large and *variable* fraction: a 2&#160;MB LOH slab allocation, eight <c>Thread.Start</c> calls
+	///     whose scheduling jitter alone is easily hundreds of milliseconds, and a disposal. Two runs of
+	///     the resulting ratios disagreed on the SIGN of the headline statistic
+	///     (<c>Bounded → Backoff</c> 0.813 then 1.066), which is the signature of noise rather than
+	///     signal. What this cell exists to compare is the ladder's effect on the DRAIN, so the drain is
+	///     what it times.
+	///   </para>
+	/// </summary>
+	private TimeSpan Drive(IWaitPolicy waitPolicy, int[] keys, ActorPerfState state) {
 		using var system = new ActorSystem<int, long, ActorPerfHandler, WorkStealingScheduler>(
 			new ActorPerfHandler(state), keyCapacity: Cardinality * 2, chunkCount: Cardinality,
 			chunkSize: 256, batchBound: 16, workers: Workers,
@@ -310,15 +327,16 @@ public abstract class WaitPolicyPairedCellBase : IThroughputTest {
 		system.Start();
 
 		using (ThreadAffinityUtil.SetThreadAffinity(_producerCpu)) {
+			var stopwatch = Stopwatch.StartNew();
 			var mask = keys.Length - 1;
 			for (var i = 0L; i < Iterations; i++)
 				system.Dispatch(keys[(int)(i & mask)], i);
 
 			system.TryComplete();
 			system.Completion.GetAwaiter().GetResult();
+			stopwatch.Stop();
+			return stopwatch.Elapsed;
 		}
-
-		return state.HandledCount;
 	}
 }
 
