@@ -5,6 +5,15 @@
 **This plan is complete.** Read this section first; the rest of the file is the executed plan, kept for
 provenance. Everything is on branch **`experiment/mini-actor-system`** (base `1075df1`).
 
+> **Superseded in part by Phase 4** (`docs/superpowers/plans/2026-08-15-mini-actor-system-phase4-wait-strategy.md`),
+> which put the idle-worker wait ladder — the 2.5–3× churn effect this plan's calibration exposed —
+> behind an `IWaitPolicy` seam and measured three ladders against each other under D at
+> `SpinPerMessage = 0` (spec §6.4, §10). **It did not re-run this matrix**, so the B-vs-D null below
+> stands exactly as measured. Two things it *did* find by reading the code belong beside these
+> numbers: **B runs one more thread than D** (its router), and the wait ladder covers all of D's idle
+> path but only part of B's. Start from Phase 4's "Where to pick up"; options (a)–(c) below are
+> unchanged and still the live ones.
+
 **Done, and where it lives**
 
 | Task | Commit | What it added |

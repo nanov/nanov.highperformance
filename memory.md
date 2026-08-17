@@ -9,6 +9,86 @@ implication ("so don't…"). If something becomes a permanent rule, move it into
 
 ---
 
+## 2026-08-17 — Mini actor system Phase 4: the wait ladder became a measured variable; the Helios-shaped ladder cost ~18% in the churn regime; 4b decided against
+
+**This is an experiment** (`src/experiments/mini-actor-system`), not a shipping decision, and the
+result below is **one converged run, one host, one operating point**. Branch
+`experiment/mini-actor-system`, commits `16ae9e1` (seam) → `0659083` (bounded block) → `1fedbf9` /
+`df0b44e` (backoff ladder + three-arm paired cell). Apple M4 Pro, 12 logical cores, macOS at load
+~4.5; scheduler D only; 8 workers, 1 producer; cardinality 1024, uniform; `SpinPerMessage = 0`; 30M
+messages per arm; 9 rounds, three arms interleaved with rotating lead; drain-only timer;
+`DOTNET_TieredPGO=0`, one cell per process. Detail: spec §6.4 (result) and §10 (configuration).
+
+- **The seam is a no-op by construction, which is the only reason the comparison means anything.**
+  `IWaitPolicy` is an interface-typed constructor parameter (deliberately *not* a devirtualised type
+  parameter like every other seam here — idle path only, and a fifth type parameter would churn every
+  call site for no measured gain). `LegacyWaitPolicy` reproduces the pre-phase ladder exactly and is
+  the default, so **no call site changed and the Phase 3 baseline did not move**.
+- **Bounding the idle block is a SAFETY change first.** It turns a lost wakeup from a permanent hang
+  into a latency hiccup — the two undefended lost-wakeup races are still there, only their cost
+  changes. Measured cost on this run: `Legacy → Bounded` median **1.001**, range 0.815–1.255, i.e. it
+  **spans 1.0** and nothing was measurable. **But the cost `BoundedWaitPolicy`'s own doc names was
+  never exercised**: every cell runs a saturated producer where the 20 ms timeout essentially never
+  fires. The idle-system wake cost needs a hold-N-workers-idle test that does not exist. **So: don't
+  quote "the bound is free" — the regime that would price it wasn't run.**
+- **The Helios-shaped ladder cost ~18% in the churn regime as measured here.** `Legacy → Backoff`
+  median 0.836 (0.657–0.928), `Bounded → Backoff` 0.824 (0.729–0.962) — the first ratios in the phase
+  whose range **excludes 1.0**, with Backoff slowest in **9 of 9 rounds** and same-arm spread down to
+  ~1.23×. Mechanism, explicable rather than an artifact: Legacy spins 32×64 = 2048 iterations (~2 µs)
+  before it ever blocks; Backoff's whole ladder is 319 iterations (~0.3 µs), then a yield, then a
+  block. At spin 0 the system is producer-bound — workers starve, hit the ladder constantly, and work
+  arrives frequently in small amounts, so spinning longer catches the next message without a kernel
+  round trip while blocking sooner pays that round trip repeatedly. **The same argument says the sign
+  is regime-dependent: this is not "exponential backoff is slower".**
+- **THE TRANSFERABLE ONE — a headline statistic that flips SIGN between runs has no signal in it, no
+  matter how tidy its median.** `Bounded → Backoff` came back 0.813, then 1.066, then 0.701 at spin
+  32. Three attempts, three tidy medians, two directions. **And measuring at a knee is measuring a
+  coin flip:** spin 32 is the calibration knee where the system flips producer-bound ↔ consumer-bound,
+  and Phase 3 had already recorded the knee *moving between passes* (16 → 32). That bistability is a
+  property of the operating point, not merely host noise. **So: pick a point on one side of the knee
+  and say which side; and treat sign-flipping as "no result", never as "average them".**
+- **A bias that counterbalancing is STRUCTURALLY unable to cancel: tiered-PGO devirtualisation.** The
+  policy field is a plain interface and `WaitForWork`'s call site is JITted once per process, so
+  whichever concrete policy that site sees *first* sets the class-profile guard every other policy
+  then fails — un-inlined — for the life of the process. Rotating the execution order cannot help,
+  because a process has only one "first ever" call. Fix is an invocation contract:
+  `DOTNET_TieredPGO=0`, one cell per process, `--runs 1`. **Generalises: A/B-ing two implementations
+  of an interface inside one process is confounded by PGO before you write a line of harness.**
+- **Three more harness traps, each of which produced a wrong or unusable answer first.** (1) The perf
+  selector sorts cells by type name ascending, so on a host whose load drifts, one arm systematically
+  gets the quieter window — **a confound with a known sign**; the fix is interleaving arms *within* a
+  round and comparing paired samples, not running them separately. (2) A two-arm comparison could not
+  attribute anything, because the new policy changed **three** things at once (rungs, yield tier,
+  bounded block) — a control arm was mandatory, and `Bounded → Backoff` is the ratio that answers the
+  question actually asked. (3) The timer bracketed system construction, eight thread starts and
+  disposal; at 10M/arm (~3 s) that variable overhead was a large share of every sample and two runs
+  disagreed on the sign. **Time the thing you are comparing, and make the measured window long enough
+  that fixed overhead's *variance* is small — not just its mean.**
+- **Two B-vs-D asymmetries, argued from the code and previously unrecorded.** B creates one thread of
+  its own (the router); D creates **zero**, so at 8 workers B is 10 threads to D's 9 — a bias against
+  B, which is why it does not explain Phase 3's null away, but it belongs beside those numbers. And
+  `IWaitPolicy` governs the **worker park path only**: all of D's idle path, but only part of B's,
+  whose router still parks unbounded on `InboxNotEmpty`. **So: a B-vs-D difference under a new wait
+  policy may be a coverage difference in what the policy reaches, not a scheduling difference.** The
+  B-vs-D re-test was not run in Phase 4, so Phase 3's null stands exactly as measured.
+- **Phase 4b (spinner/waiter preference) is decided against as the next step — a decision, not a
+  deferral, and contingent on what has been measured.** It is the reference design's most valuable
+  property and it cannot live behind this seam: the waker must know who is spinning, which means
+  changing `WakeOne`, the meaning of the `Parked[]` flag, or replacing per-worker events with a shared
+  unfair semaphore — **the same code as both undefended lost-wakeup races**, i.e. the most dangerous
+  edit in this tree. The ladder work did not pay in the one regime that converged, so there is no
+  measured basis for taking that risk next. **What would change it:** a regime where blocking sooner
+  wins (idle/bursty rather than saturated, or consumer-bound past the knee), or park/unpark counters
+  showing kernel wakes are a material share of the cost.
+- **Confirmed again, already promoted below (2026-08-14): a mutation must remove the defective
+  behaviour's *arbitrating effect*, not just its reported result** — override a return value while
+  leaving the atomic RMW in place and the defect narrows to an unsamplable window, yielding a false
+  "the test is blind here". Phase 4's Task 1 review re-derived it independently. Not restated at
+  length; see that entry.
+- **Still open, unchanged by this phase:** both external baselines (so §1's question is untouched),
+  p99 / latency, the worker-count sweep, handler-cost variance, and the park/unpark counters that
+  would make "how much of this is kernel wakes" directly measurable.
+
 ## 2026-08-14 — Mini actor system Phase 3: B vs D measured on throughput — no difference; skew costs 40%
 
 The head-to-head finally ran. Branch `experiment/mini-actor-system`, commits `27858ca` (deque empty-poll

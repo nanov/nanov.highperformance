@@ -1,5 +1,108 @@
 # Mini Actor System — Phase 4: the wait strategy as a measured variable
 
+## Where to pick up
+
+**This plan is complete except for Task 4, which was not run — see below.** Read this section first;
+the rest of the file is the executed plan, kept for provenance. Everything is on branch
+**`experiment/mini-actor-system`** (base `9b4c181`). **This is an experiment in `src/experiments/`;
+nothing here ships, and nothing here is a general claim about wait strategies.**
+
+**Done, and where it lives**
+
+| Task | Commit | What it added |
+| --- | --- | --- |
+| 1 | `16ae9e1` (+ a follow-up fix) | `IWaitPolicy` + `LegacyWaitPolicy`; `WaitForWork` rewritten to walk a ladder. Behaviourally identical to the pre-phase code, default, **no call site changed** |
+| 2 | `0659083` | `IKeyScheduler.Wait` gains a timeout + `bool` return across all three schedulers; `BoundedWaitPolicy` (20 ms); the first wait-policy cells |
+| 3 | `1fedbf9` → `df0b44e` → `8aed6df` | `BackoffWaitPolicy` (Helios-shaped ladder) + ladder-shape tests; the three-arm interleaved paired cell and its review fixes |
+| 4 | — | **Not run.** No record of it exists in the phase ledger |
+| 5 | this commit | Spec §6.3 / §6.4 / §10 / §11 / §13 and `memory.md` updated with the result |
+
+**The result, in two sentences.** On one converged run — scheduler D, `SpinPerMessage = 0`, 8 workers,
+cardinality 1024 uniform, 30M messages per arm, 9 rounds, Apple M4 Pro at load ~4.5 — **bounding the
+idle block cost nothing measurable** (`Legacy → Bounded` median 1.001, range 0.815–1.255, spanning
+1.0) while **the Helios-shaped ladder cost ~18% in that churn regime** (`Bounded → Backoff` median
+0.824, range 0.729–0.962, excluding 1.0, with Backoff slowest in 9 of 9 rounds). The mechanism is
+explicable rather than an artifact — at spin 0 the system is producer-bound, so Legacy's 2048 spin
+iterations catch the next message without a kernel round trip where Backoff's 319-iteration ladder
+blocks and pays that round trip repeatedly — **and by the same argument the sign is regime-dependent,
+so this is not a verdict on backoff ladders in general.** Full numbers, scope and configuration: spec
+§6.4 and §10.
+
+**Phase 4b (spinner/waiter preference) is decided against as the next step** — a decision about where
+effort goes, contingent on what has been measured so far, not a permanent judgement on the technique.
+It cannot live behind `IWaitPolicy` (the waker must know who is spinning → `WakeOne`, the `Parked[]`
+flag's meaning, or a shared unfair semaphore), which is the same code as both undefended lost-wakeup
+races, and the ladder work did not pay in the one regime that converged. Spec §6.4 records what would
+change the answer.
+
+**Task 4 (the B-vs-D re-test) was not run.** Its own Step 1 says to re-run the Phase 3 matrix under
+whichever policy won Task 3 — and none did; on this evidence that selects `Legacy`, i.e. a no-op
+control that re-runs Phase 3's matrix unchanged. **So Phase 3's null stands exactly as it was
+measured, neither re-confirmed nor disturbed**, and the question the phase was framed around ("was
+the crude ladder masking a B-vs-D difference?") is still open. Anyone taking it up must account for
+the two asymmetries recorded in spec §6.4: **B runs one more thread than D** (its router; D owns
+none), and **`IWaitPolicy` covers all of D's idle path but only part of B's** — B's router park is
+unbounded and outside the seam — so a difference appearing under a new policy may be a *coverage*
+difference rather than a scheduling one.
+
+**Next options, in the order they are worth doing**
+
+- **(a) The latency cut — still the strongest candidate,** and unchanged by this phase. Throughput at
+  8 saturated workers is structurally blind to what dynamic scheduling buys; the starved-key positions
+  (17 / 3000 / 0, spec §6.1) are where B and D demonstrably do differ. Needs p99 per-message latency
+  and the §10 dense-hot-key + placed-victim workload, at N > 1 under both schedulers.
+- **(b) The external baselines — the bigger question, still untouched.** N hash-sharded `SpWorker`s;
+  `Channel<T>` + `ConcurrentDictionary`. Neither exists, so §1's actual question — does N-way dynamic
+  balancing beat N static shards — is **unanswered**, and "B ≈ D" says nothing about it.
+- **(c) The sweeps.** Worker count (fixed at 8 throughout) and handler-cost variance (constant cost
+  only; §6.3's original prediction named variable cost as a regime D was expected to win). Cheapest to
+  add, weakest per unit of runtime.
+- **(d) Task 4 itself,** if it is worth a matrix re-run under a policy that is either the default or
+  known to be slower here. Read (a) and (b) first.
+
+**Debts not to trip over**
+
+- **The paired cell's harness change is uncommitted in the working tree** (`WaitPolicyCells.cs`:
+  drain-only timer, 30M per arm). **Every number above was produced by that version**, so the file as
+  committed does not describe the run. Commit it before trusting a re-run.
+- **The invocation contract is documentation, not a guard.** One cell per process,
+  `DOTNET_TieredPGO=0`, `--runs 1`, never sharing a process with the demoted single-policy cells
+  (which sort first under `--target Wait`). Violate it and tiered-PGO devirtualisation biases the arm
+  that happens to be JITted first — a bias that no amount of order rotation can cancel.
+- **Spin 32 is at the calibration knee and would not converge** — three attempts, headline ratio
+  flipping sign (0.813 / 1.066 / 0.701). Don't try to average past that; pick a side of the knee.
+- **`BoundedWaitPolicy`'s idle-system wake cost was never exercised** — every cell ran a saturated
+  producer where the timeout essentially never fires. Testing it needs a hold-N-workers-idle-and-
+  watch-CPU test that does not exist.
+- **The two undefended lost-wakeup races (spec §11) are untouched**, and the park/unpark counters
+  spec §7 asks for still do not exist, so "how much of this is kernel wakes" is not directly
+  measurable.
+- **`StarvationAsymmetryTests.Unbounded_Local_Draining_Starves_A_Ring_Queued_Key` flaked once** under
+  concurrent Testcontainers load and passed in isolation. Traced and adjudicated as contention — no
+  path in this phase's diff can reach it — but the flake means the producer fell >15× behind the
+  stable position, which is a note against that calibration's documented "20/20, zero variance"
+  headroom claim. Re-verify on a quiet host before calling it noise.
+- Carried from Phase 3, unchanged: `KeySequence.HotKey`'s out-of-range key at `cardinality == 1`
+  (dead code today; **fix before the latency cut uses it**); the perf-test project's name; the
+  depth-1 deque finding making `DequeCapacity` a near-dead knob.
+
+**How to re-run the wait-policy comparison**
+
+```bash
+# ONE cell per process. ~4.5 min for the spin-0 cell at 30M/arm on an M4 Pro.
+DOTNET_TieredPGO=0 dotnet run -c Release \
+  --project perf-tests/Nanov.HighPerformance.Threading.Workers.PerfTests -- \
+  --target WaitPairedSpin0 --report false --print-spec false
+# the spin-32 cell is --target WaitPairedSpin32 — see the knee caveat above before reading its output
+```
+
+**The host must be quiet or the numbers are noise**, and on macOS `ThreadAffinityUtil` is a **no-op**
+(no per-core pinning API), so a quiet host removes contention noise and never placement noise. Report
+any difference smaller than the observed spread as **absent** — and treat a statistic that changes
+sign between runs as no result at all.
+
+---
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Extract the idle-worker wait ladder into its own seam, then walk it from today's crude version toward the Helios / CLR `UnfairSemaphore` design **one step at a time, measuring immediately after each step**, so every change is either justified by a number or reverted.
@@ -520,17 +623,17 @@ Do **not** tune anything to produce a difference. If none appears, that is the a
 
 The governing rule from Phases 2b and 3 applies unchanged: **write only what was measured, and attribute every number to the configuration that produced it** — host, worker count, policy, spin value, cardinality, skew, pass.
 
-- [ ] **Step 1: Record the ladder measurements** — the three-way comparison at both spin points, with spreads, and the Legacy→Bounded safety cost.
+- [x] **Step 1: Record the ladder measurements** — spec §6.4. Recorded at **one** spin point, not two: spin 32 sits at the calibration knee and three attempts there flipped the headline ratio's sign, so it is recorded as unmeasurable at that operating point rather than reported.
 
-- [ ] **Step 2: Record the B-vs-D re-test** — and whether Phase 3's verdict survived.
+- [x] **Step 2: Record the B-vs-D re-test** — **nothing to record: Task 4 was not run.** Recorded as such (spec §6.4, §10, and "Where to pick up"), together with the two scheduler asymmetries anyone taking it up must account for. Phase 3's verdict stands exactly as measured, neither re-confirmed nor disturbed.
 
-- [ ] **Step 3: Make the Phase 4b call, explicitly.** The spinner/waiter distinction is the reference design's most valuable property and this phase deliberately did not attempt it. Decide from the data:
+- [x] **Step 3: Make the Phase 4b call, explicitly.** Made: **not pursued next** — spec §6.4 and §13 step 7, framed as a decision about where the next effort goes, contingent on what was measured, with what would change the answer stated. The spinner/waiter distinction is the reference design's most valuable property and this phase deliberately did not attempt it. Decide from the data:
   - If the ladder work moved throughput materially, the wake side is likely worth the risk — say so, and record what it needs (changing `WakeOne` and the `Parked[]` flag's meaning, or replacing per-worker events with a shared unfair semaphore) and that it lands in the same code as the two undefended lost-wakeup races.
   - If the ladder work changed nothing measurable, say that too, and record that the wake side is **not** justified by anything measured — which is a decision, not a deferral.
 
-- [ ] **Step 4: `memory.md`** — a new entry. The transferable lesson candidates: that the wait ladder was a 2.5–3× effect hiding in code neither scheduler owned; and whatever Task 4 concluded about whether it was confounding the scheduler comparison.
+- [x] **Step 4: `memory.md`** — a new entry. The transferable lesson candidates: that the wait ladder was a 2.5–3× effect hiding in code neither scheduler owned; and whatever Task 4 concluded about whether it was confounding the scheduler comparison.
 
-- [ ] **Step 5: Update the handoff** at the top of this plan and in the Phase 3 plan, so the next session starts from the current state.
+- [x] **Step 5: Update the handoff** at the top of this plan and in the Phase 3 plan, so the next session starts from the current state.
 
 ---
 
