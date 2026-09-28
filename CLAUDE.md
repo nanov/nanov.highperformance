@@ -36,3 +36,17 @@ or concurrency choices so we don't re-litigate settled ground. (Not auto-loaded;
 
 - C# style (tabs width 2, file-scoped namespaces, K&R, `var`, …) → follow the **code-style** skill.
 - Any hot-path / zero-alloc / lock-free work → follow the **high-performance-net** skill, and the worker-tree `CLAUDE.md` invariants take precedence in that subtree.
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked as GitHub Issues on `nanov/nanov.highperformance` via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default label vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root (created lazily by `/domain-modeling`). See `docs/agents/domain.md`.
