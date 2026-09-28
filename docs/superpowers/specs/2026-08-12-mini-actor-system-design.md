@@ -436,6 +436,14 @@ v1 per-key bound — the number that decides whether v2 chaining is worth buildi
 > per-32-message `Volatile.Write(ref cell.Head, …)` followed by a plain `_producerParked` read. Still
 > real, still bounded by the 20 ms poll, still deferred. See §11 known defect (a) for the fix that
 > narrowed it.
+>
+> **FIXED — the debt is closed; the two paragraphs above describe the pre-fix code.** `Activate`'s
+> mid-batch flush now issues `Interlocked.MemoryBarrier()` between its `Head`/processed publish and the
+> `_producerParked` read — the fence option above, the same shape `RoutedScheduler.Schedule` already
+> uses. Both worker wake sites are now StoreLoad-ordered against the producer's arm → fence → re-read.
+> Cost: one full fence per 32 messages. On Apple Silicon, `ActorsDUniformCard64` (5 runs each) measured
+> 4.75 Mops/s with the fence vs 4.78 without — inside the run-to-run spread (4.51–4.98). That cell is
+> consumer-bound, so it bounds the cost from above only for that regime; no x86-64 number was taken.
 
 A rejected `TryDispatch` does **not** increment `_dispatched` (§5.6).
 
@@ -1627,6 +1635,8 @@ concrete design so this limitation is not a vague gesture.
 > the per-32-message `Volatile.Write(cell.Head, …)` is followed by a plain `_producerParked` read with no
 > fence between them. That one is real, still bounded by the 20 ms poll, and deliberately unfixed
 > (out of scope for Phase 2b). Keep it recorded; drop the claim that it covers the release path too.
+>
+> **Since fixed** — the mid-batch flush now fences before its `_producerParked` read; see §5.4.
 
 `WaitForChunk` (§5.4 source: `ActorSystem.BindChunk`'s slab-exhaustion path) arms the producer's parked
 flag and blocks **without re-running `Harvest()` inside the armed window**. Its own comment argues no

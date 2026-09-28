@@ -254,21 +254,17 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 	///   that catches it. Returns false if the system stopped or completed while parked, so a dispatch
 	///   racing shutdown is rejected rather than committed into a ring whose consumer has exited.
 	///   <para>
-	///     <b>The recheck above does not cover every window — known debt, not silently relied upon.</b>
-	///     This side of the handshake IS fenced: <c>_producerParked = true</c> →
-	///     <c>Interlocked.MemoryBarrier()</c> → re-read <c>Head</c>. <c>ReleaseAndMaybeSchedule</c> is
-	///     fenced too: its <c>_producerParked</c> read sits after the <c>Interlocked.Exchange</c> on
-	///     <c>cell.State</c>, which is a full fence. The remaining debt is <c>Activate</c>'s mid-batch
-	///     flush alone — it publishes <c>Head</c> with a plain <c>Volatile.Write</c> and then reads
-	///     <c>_producerParked</c> — a release-store followed by an acquire-load of a <b>different</b>
-	///     location, which is not StoreLoad-ordered. So the worker can publish <c>Head</c>, read
-	///     <c>_producerParked</c> as false (we had not armed yet), and skip the <c>Set</c>, while we
-	///     arm, fence, and then read a <i>stale</i> <c>Head</c> — a wake can be missed entirely. It is
-	///     the bounded 20&#160;ms <c>_spaceAvailable.Wait(TimeSpan)</c> below — not the recheck — that
-	///     covers that case: nothing hangs, but a missed wake costs a full 20&#160;ms poll interval, a
-	///     tail-latency cliff on the backpressure path. The fix (a short spin before parking, matching
-	///     <c>SpRingCore.WaitForSpaceSlow</c>, or a fence before the <c>_producerParked</c> read in
-	///     <c>Activate</c>'s flush) is deferred pending measurement.
+	///     <b>Both sides of the handshake are fenced — keep it that way.</b> This side:
+	///     <c>_producerParked = true</c> → <c>Interlocked.MemoryBarrier()</c> → re-read <c>Head</c>.
+	///     The worker has two wake sites, each ordering its <c>Head</c> publish before its
+	///     <c>_producerParked</c> read with a full fence: <c>ReleaseAndMaybeSchedule</c> via the
+	///     <c>Interlocked.Exchange</c> on <c>cell.State</c>, and <c>Activate</c>'s mid-batch flush via an
+	///     explicit <c>Interlocked.MemoryBarrier()</c>. Drop either fence and a release-store followed by
+	///     an acquire-load of a <b>different</b> location is no longer StoreLoad-ordered: the worker can
+	///     read <c>_producerParked</c> as false (we had not armed yet) and skip the <c>Set</c>, while we
+	///     arm, fence, and read a <i>stale</i> <c>Head</c>. The wake is lost and only the bounded
+	///     20&#160;ms <c>_spaceAvailable.Wait(TimeSpan)</c> below recovers it — nothing hangs, but the
+	///     backpressure path takes a 20&#160;ms tail-latency cliff.
 	///   </para>
 	/// </summary>
 	private bool WaitForMailboxSpace(ref KeyCell<TKey> cell) {
@@ -489,6 +485,12 @@ public sealed class ActorSystem<TKey, T, THandler, TScheduler> : IDisposable
 			if ((n & 31) == 0) {
 				Volatile.Write(ref cell.Head, head);
 				PublishProcessed(w);
+				// StoreLoad fence between publishing Head and reading _producerParked — the worker's half of
+				// the Dekker pair whose other half is WaitForMailboxSpace's flag → fence → re-read Head.
+				// Without it the read can be satisfied before the Head store drains (x86-64 store buffer):
+				// we see the pre-arm false and skip the Set while the producer arms and reads a stale Head,
+				// and the wake is lost to the 20 ms poll. One fence per 32 messages, not per message.
+				Interlocked.MemoryBarrier();
 				if (_producerParked) {
 					w.ProducerWakes++;
 					_spaceAvailable.Set();

@@ -238,8 +238,8 @@ public struct RoutedScheduler : IKeyScheduler {
 		// never routed at all, quiescence is never reached, and the system hangs. Schedule runs once
 		// per activation, not per message, so the fence is cheap here.
 		//
-		// This is the same StoreLoad gap recorded as known debt on Activate's mid-batch flush — do not
-		// reproduce it here.
+		// Same StoreLoad pairing as Activate's mid-batch flush and ReleaseAndMaybeSchedule's
+		// _producerParked read — all three are publish → full fence → read the other side's parked flag.
 		Interlocked.MemoryBarrier();
 		if (_state.RouterParked) _state.InboxNotEmpty.Set();
 	}

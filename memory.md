@@ -9,6 +9,20 @@ implication ("so don't…"). If something becomes a permanent rule, move it into
 
 ---
 
+## 2026-09-28 — Mini actor system: the `Activate` mid-batch-flush StoreLoad debt is closed
+
+- **Fixed with a fence, not a spin-before-park.** `Interlocked.MemoryBarrier()` between the flush's
+  `Head` publish and its `_producerParked` read — same shape as `RoutedScheduler.Schedule`. A spin only
+  shrinks the lost-wakeup window; the fence closes it. Every worker wake site is now publish → full
+  fence → read the parked flag. **Don't remove any of them to "save a fence"** — the failure is a
+  silent 20 ms tail cliff, not a hang, so no test catches it.
+- **Cost: in the noise where it was measured.** One fence per 32 messages; `ActorsDUniformCard64`, 5
+  runs each, Apple Silicon: 4.75 vs 4.78 Mops/s, spread 4.51–4.98. Consumer-bound cell, arm64 only —
+  the defect is live mainly on x86-64 (store buffer), where no number was taken.
+- **No regression test, deliberately.** The race needs x86-64 StoreLoad reordering; on this host a
+  test would pass with or without the fence (see the Phase 2b "green mutation run is not coverage"
+  entry).
+
 ## 2026-08-17 — Mini actor system Phase 4: the wait ladder became a measured variable; the Helios-shaped ladder cost ~18% in the churn regime; 4b decided against
 
 **This is an experiment** (`src/experiments/mini-actor-system`), not a shipping decision, and the
