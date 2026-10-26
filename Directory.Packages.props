@@ -7,7 +7,7 @@
 
   <ItemGroup>
     <!-- Source linking / symbols -->
-    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="8.0.0" />
+    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.403" />
 
     <!-- Test stack -->
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
