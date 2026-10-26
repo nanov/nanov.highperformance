@@ -134,8 +134,8 @@ public sealed class CoalescingSpWorker<TKey, TValue, THandler> : IDisposable, IW
 	public bool TryComplete(Exception? exception = null) => _ring.TryComplete(exception);
 
 	public void Dispose() {
-		_ring.Dispose();
-		_map.Dispose();
+		// A consumer that didn't exit may still be reading the map — leave it to the GC then.
+		if (_ring.Shutdown(null)) _map.Dispose();
 	}
 
 	private void RunLoop() {

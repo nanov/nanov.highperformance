@@ -306,6 +306,35 @@ public class SpWorkerTests {
 		Assert.DoesNotThrow(() => w.Dispose());
 	}
 
+	[Test]
+	public void Dispose_Never_Started_Resolves_Completion() {
+		var w = new Rec(8);
+		w.Dispose();
+		Assert.That(w.Completion.Wait(2000), Is.True, "a never-started worker must not leave Completion pending");
+		Assert.That(w.Completion.IsCompletedSuccessfully, Is.True);
+	}
+
+	[Test]
+	public void Dispose_With_Stuck_Handler_Faults_Completion_With_Timeout() {
+		using var gate = new ManualResetEventSlim(false);
+		var w = new Rec(8, hook: _ => gate.Wait());
+		w.Start();
+		w.Dispatch(1);
+		w.Dispatch(2);
+		Assert.That(SpinWait.SpinUntil(() => w.Entered, 2000), Is.True, "handler never started");
+
+		w.Dispose(); // the handler is parked on the gate — the join times out
+
+		Assert.That(w.Completion.IsFaulted, Is.True, "a consumer that won't exit must not report success");
+		var ex = w.Completion.Exception!.InnerException;
+		Assert.That(ex, Is.InstanceOf<TimeoutException>());
+		Assert.That(ex!.Message, Does.Contain("did not exit").And.Contain("queued"));
+
+		gate.Set(); // unstick: the consumer exits on _stop without touching disposed handles
+		Assert.That(SpinWait.SpinUntil(() => w.CompletedWith.Count == 1, 2000), Is.True);
+		Assert.That(w.Errors, Is.Empty);
+	}
+
 	private static int CountOf(Rec w) {
 		lock (w.Processed) return w.Processed.Count;
 	}
@@ -350,7 +379,15 @@ public class SpWorkerTests {
 		private readonly RecordingState _state = new();
 
 		public Rec(int capacity, TimeSpan processDelay = default, Action<int>? hook = null) =>
-			_worker = new SpWorker<int, RecordingHandler>(new RecordingHandler(_state, processDelay, hook), capacity);
+			_worker = new SpWorker<int, RecordingHandler>(new RecordingHandler(_state, processDelay, hook is null
+				? null
+				: i => {
+					Volatile.Write(ref _entered, true);
+					hook(i);
+				}), capacity);
+
+		private bool _entered;
+		public bool Entered => Volatile.Read(ref _entered);
 
 		public List<int> Processed => _state.Processed;
 		public List<Exception?> CompletedWith => _state.CompletedWith;

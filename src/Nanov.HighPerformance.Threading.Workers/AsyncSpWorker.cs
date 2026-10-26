@@ -119,15 +119,5 @@ public sealed class AsyncSpWorker<T, THandler> : IDisposable, IWorkerQueue
 		}
 	}
 
-	public void Dispose() {
-		_core.SignalStop(); // wake the loop so it exits
-		try {
-			_loopTask?.Wait(1000);
-		}
-		catch {
-			/* ignore */
-		}
-
-		_core.Dispose(); // safe now — the loop has exited
-	}
+	public void Dispose() => _core.Shutdown(_loopTask);
 }

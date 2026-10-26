@@ -142,7 +142,7 @@ Regression net: `BatchedReleaseTests` (+ `SignalingStressTests` for the park chu
     pool — no thread parked per `await` — so it
     matches/beats `Channel<T>` for truly-async serial handlers. The scope worker reads + `Release()`s
     the `HandleScope` **synchronously before any await** (ref struct can't cross await); `Dispose`
-    `SignalStop()`s, `_loopTask?.Wait()`s, then `_core.Dispose()`. (We removed the old dedicated-thread
+    is `_core.Shutdown(_loopTask)` (see "Dispose / shutdown" below). (We removed the old dedicated-thread
     async workers and their `_processDoneEvt` rendezvous — don't reintroduce them.)
   - *EC suppression:* `Start` wraps the `Task.Run` in `ExecutionContext.SuppressFlow()` so the loop
     runs with a clean EC — the start-caller's `AsyncLocal`/`Activity.Current` is captured once at
@@ -183,6 +183,23 @@ Regression net: `BatchedReleaseTests` (+ `SignalingStressTests` for the park chu
       duplicate from a fresh concurrent latch). All transitions are `Interlocked.CompareExchange` —
       **no blind `Volatile.Write`** (weak-memory-safe). This fixes signal-*drop*; it does **not** fix a
       signal that's never *sent* — that's the StoreLoad fence work above, in `SpRingCore`.
+
+## Dispose / shutdown
+
+`SpRingCore.Shutdown(loopTask)` owns teardown for every worker (`Dispose()` = `Shutdown(null)`; the
+async workers pass their loop task). It signals stop, waits up to `ShutdownTimeoutMs` for the
+consumer (thread join or loop-task wait), and only then disposes the wait handles. Don't go back to
+ignoring the wait's result:
+
+- **Never started** → resolve `Completion` there (clean, or the `TryComplete` exception); no consumer
+  exists to do it, and joining an unstarted thread throws.
+- **Consumer didn't exit** (stuck handler) → fault `Completion` with a `TimeoutException` naming the
+  worker + queue depth, leave the handles to their finalizers, return false. The keyed workers skip
+  `_map.Dispose()` on false — the consumer may still read the map.
+- **Called on the consumer thread** (Dispose inside a sync handler) → no self-join, handles left
+  alone; the loop exits on `_stop` and completes normally.
+
+Regression net: the `Dispose_Never_Started_*` / `Dispose_With_Stuck_*` tests.
 
 ## DEBUG-only producer overlap guard
 

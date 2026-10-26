@@ -65,6 +65,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 	private CancellationToken _ct;
 	private CancellationTokenRegistration _ctRegistration;
 	private bool _disposed;
+	private bool _started;
 	private volatile bool _stop; // hard stop (Dispose / cancel) — drop remaining
 	// Consumer index (Head) and producer index (Tail) on separate cache lines: each is written every
 	// item by a different core, so co-locating them ping-pongs the line. 128-byte stride covers Apple
@@ -131,6 +132,7 @@ internal sealed class SpRingCore<T> : IDisposable {
 
 	internal void Start(CancellationToken ct) {
 		_ct = ct;
+		_started = true;
 		if (ct.CanBeCanceled)
 			_ctRegistration = ct.Register(static s => ((SpRingCore<T>)s!).OnCancel(), this);
 		_thread?.Start(); // ThreadPool-async workers launch their own loop after Start
@@ -171,24 +173,61 @@ internal sealed class SpRingCore<T> : IDisposable {
 		_ctRegistration.Dispose();
 	}
 
-	public void Dispose() {
-		if (_disposed) return;
+	public void Dispose() => Shutdown(null);
+
+	/// <summary>
+	///   Hard-stop the worker, wait up to <see cref="ShutdownTimeoutMs" /> for its consumer to exit, then
+	///   release the wait handles. <paramref name="loopTask" /> is the ThreadPool-async worker's loop
+	///   (null for dedicated-thread workers, which join their thread). Returns true when the consumer is
+	///   known to be gone and the caller may tear down state the consumer touches.
+	///   <list type="bullet">
+	///     <item>Never started: there's no consumer to run the completion hook, so resolve
+	///     <see cref="Completion" /> here (clean, or with the <see cref="TryComplete" /> exception).</item>
+	///     <item>Consumer didn't exit in time (a stuck handler): fault <see cref="Completion" /> with a
+	///     <see cref="TimeoutException" /> naming the worker and its queue depth, and leave the handles to
+	///     their finalizers — the consumer may still wait on them. Returns false. The consumer's own
+	///     <see cref="SetCompletion" /> is then a no-op.</item>
+	///     <item>Called on the consumer thread (Dispose from inside a handler): it can't wait for itself;
+	///     the loop exits on <c>_stop</c> once the handler returns and completes normally. The handles are
+	///     still in use, so they're left alone. Returns false.</item>
+	///   </list>
+	/// </summary>
+	internal bool Shutdown(Task? loopTask) {
+		if (_disposed) return false;
 		_disposed = true;
 		SignalStop(); // wake both sides so they observe _stop and exit
-		if (_thread is not null) {
-			try {
-				_thread.Join(1000);
-			}
-			catch {
-				/* ignore */
-			}
+
+		if (!_started) {
+			SetCompletion(CompletionException());
 		}
-		// ThreadPool-async workers await their loop Task before calling Dispose, so the events are
-		// no longer in use by the consumer here.
+		else if (_thread is not null && _thread == Thread.CurrentThread) {
+			return false;
+		}
+		else if (!ConsumerExited(loopTask)) {
+			var name = _thread?.Name ?? "async worker loop";
+			_completionTcs.TrySetException(new TimeoutException(
+				$"Worker '{name}' ({typeof(T).Name}) did not exit within {ShutdownTimeoutMs} ms of Dispose; " +
+				$"{QueuedApprox} item(s) still queued. A handler is likely stuck."));
+			return false;
+		}
 
 		_itemEvt.Dispose();
 		_spaceEvt.Dispose();
 		GC.SuppressFinalize(this);
+		return true;
+	}
+
+	internal const int ShutdownTimeoutMs = 1000;
+
+	private bool ConsumerExited(Task? loopTask) {
+		if (_thread is not null) return _thread.Join(ShutdownTimeoutMs);
+		if (loopTask is null) return true; // Start threw before the loop was launched
+		try {
+			return loopTask.Wait(ShutdownTimeoutMs);
+		}
+		catch (AggregateException) {
+			return true; // the loop faulted — it has exited
+		}
 	}
 
 	/// <summary>

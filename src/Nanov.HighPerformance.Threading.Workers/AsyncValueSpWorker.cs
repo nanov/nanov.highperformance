@@ -162,15 +162,5 @@ public sealed class AsyncValueSpWorker<T, THandler> : IDisposable, IWorkerQueue
 		}
 	}
 
-	public void Dispose() {
-		_core.SignalStop();
-		try {
-			_loopTask?.Wait(1000);
-		}
-		catch {
-			/* ignore */
-		}
-
-		_core.Dispose();
-	}
+	public void Dispose() => _core.Shutdown(_loopTask);
 }

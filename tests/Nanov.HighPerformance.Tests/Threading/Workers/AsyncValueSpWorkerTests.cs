@@ -438,6 +438,39 @@ public class AsyncValueSpWorkerTests {
 		public ValueTask OnCompletedAsync(Exception? error) => default;
 	}
 
+	// --- Dispose ------------------------------------------------------------------
+
+	[Test]
+	public void Dispose_Never_Started_Resolves_Completion() {
+		var w = new Rec(4);
+		w.Dispose();
+		Assert.That(w.Completion.Wait(2000), Is.True, "a never-started worker must not leave Completion pending");
+		Assert.That(w.Completion.IsCompletedSuccessfully, Is.True);
+	}
+
+	[Test]
+	public void Dispose_With_Stuck_Async_Tail_Faults_Completion_With_Timeout() {
+		using var entered = new ManualResetEventSlim(false);
+		var proceed = new TaskCompletionSource();
+		var w = new Rec(4, asyncTail: _ => {
+			entered.Set();
+			return proceed.Task;
+		});
+		w.Start();
+		using (var s = w.Publish()) s.Event() = 1;
+		Assert.That(entered.Wait(2000), Is.True, "handler never started");
+
+		w.Dispose(); // the loop is awaiting the stuck tail — the wait times out
+
+		Assert.That(w.Completion.IsFaulted, Is.True, "a loop that won't exit must not report success");
+		var ex = w.Completion.Exception!.InnerException;
+		Assert.That(ex, Is.InstanceOf<TimeoutException>());
+		Assert.That(ex!.Message, Does.Contain("did not exit"));
+
+		proceed.SetResult(); // unstick: the loop exits on _stop and runs its completion hook
+		Assert.That(SpinWait.SpinUntil(() => w.CompletedWith.Count == 1, 2000), Is.True);
+	}
+
 	// Mutable struct (NOT readonly) holding value-type state; the int[] sink only reads the final counters
 	// out of OnCompletedAsync — the state under test is _handleCount/_clearCount.
 	private struct AsyncStatefulHandler : IAsyncValueWorkerHandler<int> {
