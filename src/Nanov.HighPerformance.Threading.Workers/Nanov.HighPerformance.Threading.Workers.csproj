@@ -24,10 +24,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="all" />
-  </ItemGroup>
-
-  <ItemGroup>
     <InternalsVisibleTo Include="Nanov.HighPerformance.Tests" />
   </ItemGroup>
 
